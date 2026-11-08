@@ -373,7 +373,7 @@ class MainWindow(QWidget):
         self.brand_name.setFont(f)
         self.brand_ver = QLabel(f"v{core.APP_VERSION}")
         f2 = QFont("Microsoft YaHei UI")
-        f2.setPixelSize(10)
+        f2.setPixelSize(11)
         self.brand_ver.setFont(f2)
         bcol.addWidget(self.brand_name)
         bcol.addWidget(self.brand_ver)
@@ -396,7 +396,7 @@ class MainWindow(QWidget):
 
         self.side_status = QLabel("")
         fs = QFont("Microsoft YaHei UI")
-        fs.setPixelSize(10)
+        fs.setPixelSize(11)
         self.side_status.setFont(fs)
         self.side_status.setTextFormat(Qt.RichText)
         self.side_status.setWordWrap(True)
@@ -850,10 +850,10 @@ class MainWindow(QWidget):
 
     # ---------- 数据与扫描 ----------
     def _update_brand(self) -> None:
-        proxy = self.engine.proxy or "无代理"
+        proxy = self.engine.proxy or "未检测到本地代理"
         self.side_status.setText(
-            f'<p style="margin:0;line-height:165%">网络：{proxy}</p>'
-            f'<p style="margin:4px 0 0 0;line-height:165%">扫描目录 {len(self.cfg.get("roots", []))} 个</p>')
+            f'<p style="margin:0;line-height:160%">网络：{proxy}</p>'
+            f'<p style="margin:4px 0 0 0;line-height:160%">扫描目录 {len(self.cfg.get("roots", []))} 个</p>')
         self._refresh_net_info()
 
     def _refresh_net_info(self) -> None:

@@ -518,6 +518,7 @@ class ProgramRow(QFrame):
         # 右侧：版本变化
         self.ver_lbl = QLabel()
         self.ver_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.ver_lbl.setMinimumWidth(104)       # 避免被挤压成只剩一两个字符
         fv = QFont("Consolas")
         fv.setPixelSize(12)
         self.ver_lbl.setFont(fv)

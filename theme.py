@@ -210,7 +210,7 @@ def build_qss(p: Palette) -> str:
     }}
     QLabel {{ background: transparent; }}
     QToolTip {{
-        background: {p.card if p.dark else '#FFFFFF'};
+        background: {p.surface().name()};
         color: {p.text};
         border: 1px solid {rgba(p.border, 0.18)};
         border-radius: 8px;
@@ -237,7 +237,7 @@ def build_qss(p: Palette) -> str:
         padding: 9px 18px;
     }}
     QPushButton#primary:hover {{ background: {p.accent_hover}; }}
-    QPushButton#primary:disabled {{ background: {rgba(p.accent, 0.35)}; color: {rgba(p.accent_on, 0.6)}; }}
+    QPushButton#primary:disabled {{ background: {rgba(p.text, 0.09)}; color: {p.text_muted}; }}
 
     QPushButton#soft {{
         background: {rgba(p.accent, 0.14)};
