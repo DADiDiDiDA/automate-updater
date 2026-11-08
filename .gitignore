@@ -1,0 +1,13 @@
+__pycache__/
+build/
+*.pyc
+config.json
+records.json
+crash.log
+shot_*.png
+preview_*.png
+exe_shot.png
+exe_final.png
+*.log
+exe_v2.png
+moved_check.png
