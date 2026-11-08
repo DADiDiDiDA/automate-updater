@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,
                                QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
                                QStackedWidget, QVBoxLayout, QWidget)
 
-from backdrop import paint_glass
+from backdrop import BACKDROP, paint_glass
 from theme import GLYPH, PRESET_HINTS, PRESET_LABELS, PRESET_ORDER, THEME, qc, rgba
 from widgets import (Card, Chip, ExpandSetting, Glyph, NumberStepper, ProgramRow, ProgressLine,
                      SearchBox, SegmentedControl, SettingGroup, SettingRow, StatTile, TabButton,
@@ -446,7 +446,7 @@ class _DialogPanel(QFrame):
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         radius = max(10, min(p.radius_card, 20))       # 跟随皮肤圆角
         path = paint_glass(painter, rect, radius, self.mapToGlobal(QPoint(0, 0)), p,
-                           THEME.blur_active, 0.84 if not p.dark else 0.78)
+                           THEME.blur_active, 0.18 if p.dark else 0.24)
         painter.setPen(QPen(qc(p.border, 0.16), 1))
         painter.drawPath(path)
         painter.end()
@@ -496,6 +496,11 @@ class ThemedDialog(QDialog):
         close.clicked.connect(self.reject)
         head.addWidget(close)
         self.body.addLayout(head)
+
+    def exec(self) -> int:
+        # 弹出前截屏：对话框底板的毛玻璃要模糊「背后的真实窗口」
+        BACKDROP.snapshot(self.screen())
+        return super().exec()
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:

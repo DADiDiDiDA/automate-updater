@@ -10,7 +10,7 @@ from PySide6.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient, QPainte
 from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
                                QLineEdit, QMenu, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
 
-from backdrop import paint_glass
+from backdrop import BACKDROP, paint_glass
 from theme import GLYPH, THEME, card_color, qc, rgba
 
 
@@ -36,6 +36,8 @@ class ThemedMenu(QMenu):
         self.setWindowFlags(self.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setStyleSheet(menu_style())
+        # 弹出前先截屏，菜单才能模糊「背后的真实内容」（真毛玻璃）
+        self.aboutToShow.connect(lambda: BACKDROP.snapshot(self.screen()))
 
     def paintEvent(self, e):
         p = THEME.p
@@ -44,7 +46,7 @@ class ThemedMenu(QMenu):
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         radius = max(8, min(p.radius_btn + 2, 14))
         path = paint_glass(painter, rect, radius, self.mapToGlobal(QPoint(0, 0)), p,
-                           THEME.blur_active, 0.88 if not p.dark else 0.82)
+                           THEME.blur_active)
         painter.setPen(QPen(qc(p.border, 0.16), 1))
         painter.drawPath(path)
         painter.end()
@@ -1020,7 +1022,7 @@ class _MenuPanel(QFrame):
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         radius = max(8, min(p.radius_btn + 2, 14))
         path = paint_glass(painter, rect, radius, self.mapToGlobal(QPoint(0, 0)), p,
-                           THEME.blur_active, 0.88 if not p.dark else 0.82)
+                           THEME.blur_active)
         painter.setPen(QPen(qc(p.border, 0.20), 1))
         painter.drawPath(path)
         painter.end()
@@ -1073,6 +1075,7 @@ class _PopupCard(QWidget):
                 x = screen.right() - self.width() - 8
             if y + self.height() > screen.bottom():
                 y = anchor.mapToGlobal(QPoint(0, 0)).y() - self.height() - 6
+        BACKDROP.snapshot(anchor.screen())      # 先取样，弹层才透出背后画面
         self.move(x, y)
         self.show()
 

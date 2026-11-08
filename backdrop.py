@@ -10,9 +10,10 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import time
 
 from PIL import Image, ImageFilter
-from PySide6.QtCore import QPoint, QRect, QRectF, Qt
+from PySide6.QtCore import QPoint, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QImage, QLinearGradient, QPainter, QPainterPath, QPixmap
 
 from theme import Palette, qc
@@ -57,11 +58,82 @@ class Backdrop:
     """
 
     MAX_CACHE = 10
+    SNAP_TTL = 1.5          # 屏幕取样有效期：超过就退回壁纸模糊
 
     def __init__(self):
         self._cache: dict = {}
         self._wall = None
         self._wall_sig = None
+        self._snap = None          # (屏幕区域, 截屏, 时间戳)
+        self._snap_cache: dict = {}
+
+    # ---------- 真实屏幕取样 ----------
+    def snapshot(self, screen=None) -> None:
+        """弹层 / 右键菜单出现前截一张屏，作为亚克力的取样来源。
+
+        这样菜单模糊的是「它背后的真实内容」，而不是只贴一张壁纸，
+        毛玻璃开关打开时才有真正的透亮感。
+        """
+        try:
+            from PySide6.QtGui import QGuiApplication
+            scr = screen or QGuiApplication.primaryScreen()
+            if scr is None:
+                self._snap = None
+                return
+            pm = scr.grabWindow(0)
+            self._snap = None if pm.isNull() else (scr.geometry(), pm, time.time())
+            self._snap_cache.clear()
+        except Exception:
+            self._snap = None
+
+    def _snapshot_blur(self, p: Palette, w: int, h: int, pos: QPoint):
+        snap = self._snap
+        if snap is None:
+            return None
+        geo, shot, ts = snap
+        if time.time() - ts > self.SNAP_TTL:
+            return None
+        if not geo.contains(QRect(pos, QSize(w, h))):
+            return None
+        key = (w, h, pos.x(), pos.y(), p.id, p.dark, ts)
+        hit = self._snap_cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            dpr = shot.devicePixelRatio() or 1.0
+            x = int(round((pos.x() - geo.x()) * dpr))
+            y = int(round((pos.y() - geo.y()) * dpr))
+            cw, ch = max(1, int(round(w * dpr))), max(1, int(round(h * dpr)))
+            crop = shot.copy(x, y, cw, ch)
+            if crop.isNull() or crop.width() < cw or crop.height() < ch:
+                return None
+            img = crop.toImage().convertToFormat(QImage.Format_RGB888)
+            data = bytes(img.constBits())
+            pil = Image.frombytes("RGB", (img.width(), img.height()), data, "raw", "RGB",
+                                  img.bytesPerLine())
+            if pil.size != (w, h):
+                pil = pil.resize((w, h), Image.LANCZOS)
+            small = pil.resize((max(1, w // 8), max(1, h // 8)), Image.LANCZOS)
+            small = small.filter(ImageFilter.GaussianBlur(radius=6))
+            blur = small.resize((w, h), Image.BILINEAR)
+            # 根据背后画面的明暗自适应着色：底子越亮，深色主题压得越狠，
+            # 反过来浅色主题也一样，保证菜单文字永远读得清，又保留玻璃的透。
+            lum = blur.convert("L").resize((1, 1)).getpixel((0, 0))
+            if p.dark:
+                alpha = 0.30 + 0.52 * max(0.0, (lum - 64) / 120.0)
+            else:
+                alpha = 0.30 + 0.42 * max(0.0, (152 - lum) / 120.0)
+            overlay = Image.new("RGB", (w, h), QColor(p.bg).getRgb()[:3])
+            composed = Image.blend(blur, overlay, min(0.94, alpha))
+            raw = composed.tobytes("raw", "RGB")
+            out = QImage(raw, w, h, w * 3, QImage.Format_RGB888).copy()
+            pm = QPixmap.fromImage(out)
+        except Exception:
+            return None
+        if len(self._snap_cache) >= self.MAX_CACHE:
+            self._snap_cache.pop(next(iter(self._snap_cache)), None)
+        self._snap_cache[key] = pm
+        return pm
 
     # ---------- 壁纸 ----------
     def _load_wall(self):
@@ -121,6 +193,15 @@ class Backdrop:
         self._cache[key] = pm
         return pm
 
+    def render_glass(self, p: Palette, size, pos: QPoint) -> QPixmap:
+        """弹层专用的玻璃底：优先模糊「背后的真实画面」，取不到才退回壁纸。"""
+        w = max(1, int(size[0]))
+        h = max(1, int(size[1]))
+        pm = self._snapshot_blur(p, w, h, pos)
+        if pm is not None:
+            return pm
+        return self.render(p, size, pos, True)
+
     def _fill_solid(self, painter: QPainter, p: Palette, w: int, h: int) -> None:
         base = qc(p.bg)
         if p.dark:
@@ -175,6 +256,7 @@ def paint_glass(painter: QPainter, rect: QRectF, radius: float, global_pos: QPoi
     """在任意顶层窗口上画一块「毛玻璃」底板，返回它的圆角路径。
 
     对话框、下拉弹层、右键菜单都用它，保证和主窗口是同一种玻璃；
+    弹层会先用「背后真实画面」的模糊图，取不到才退回壁纸；
     关闭模糊时退回不透明表面色。
     """
     path = QPainterPath()
@@ -184,11 +266,17 @@ def paint_glass(painter: QPainter, rect: QRectF, radius: float, global_pos: QPoi
     painter.setRenderHint(QPainter.Antialiasing)
     painter.setClipPath(path)
     if blur:
-        pm = BACKDROP.render(p, (int(rect.width()), int(rect.height())), global_pos, True)
+        pm = BACKDROP.render_glass(p, (int(rect.width()), int(rect.height())), global_pos)
         painter.drawPixmap(rect.topLeft(), pm)
-        surf = p.surface()
-        surf.setAlphaF((0.92 if not p.dark else 0.86) if tint is None else tint)
-        painter.fillPath(path, surf)
+        if tint:
+            surf = p.surface()
+            surf.setAlphaF(tint)
+            painter.fillPath(path, surf)
+        # 顶部一道极淡的高光，让弹层有玻璃的厚度感
+        glow = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        glow.setColorAt(0.0, qc("#FFFFFF", 0.07 if p.dark else 0.30))
+        glow.setColorAt(0.35, qc("#FFFFFF", 0.0))
+        painter.fillPath(path, glow)
     else:
         painter.fillPath(path, p.surface())
     painter.restore()

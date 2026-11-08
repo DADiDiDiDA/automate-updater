@@ -25,7 +25,7 @@ def set_theme(preset: str, mode: str, blur: bool = True):
     json.dump(cfg, open(CFG, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
 
-def find_window(keyword="Automate"):
+def find_window(keyword="更新器"):
     found = []
 
     @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
