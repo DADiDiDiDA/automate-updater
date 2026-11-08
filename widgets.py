@@ -274,6 +274,7 @@ class Chip(QPushButton):
         self._active = False
         self.setCursor(Qt.PointingHandCursor)
         self.setCheckable(False)
+        self.setFixedHeight(32)          # 与搜索框、下拉框统一高度
         self._apply()
 
     def set_active(self, on: bool) -> None:
@@ -291,32 +292,62 @@ class Chip(QPushButton):
             label += f"  {self._count}"
         self.setText(label)
         # 圆角超过高度一半时 Qt 会画成直角，这里统一夹住
-        r = max(6, min(p.radius_chip, 13))
+        r = max(8, min(p.radius_chip, 16))
         if self._active:
             self.setStyleSheet(
-                f"background: {rgba(p.accent, 0.92)}; color: {p.accent_on};"
-                f"border: none; border-radius: {r}px; padding: 6px 13px;"
+                f"background: {rgba(p.accent, 0.95)}; color: {p.accent_on};"
+                f"border: none; border-radius: {r}px; padding: 0 14px;"
                 f"font-size: 12px; font-weight: 600;")
         else:
             self.setStyleSheet(
-                f"background: {rgba(p.text, 0.06)}; color: {p.text_dim};"
-                f"border: none; border-radius: {r}px; padding: 6px 13px;"
+                f"background: {rgba(p.text, 0.07)}; color: {p.text_dim};"
+                f"border: none; border-radius: {r}px; padding: 0 14px;"
                 f"font-size: 12px;")
             self.setCursor(Qt.PointingHandCursor)
 
 
 class SearchBox(QLineEdit):
+    """搜索框：图标 + 自绘占位文字（保证占位文字和图标同一深浅、同一中线）。"""
+
     def __init__(self, placeholder: str = "搜索程序…", parent=None):
         super().__init__(parent)
         self.setObjectName("search")
-        self.setPlaceholderText(placeholder)
-        self.setFixedHeight(34)
+        self._ph = placeholder
+        self.setPlaceholderText("")
+        self.setFixedHeight(32)
+        self.setFont(self._font())
         self._icon = Glyph("search", 14, THEME.p.text_muted, self)
-        self._icon.move(9, 9)
+        self._icon.setFixedSize(16, 16)
+        self._icon.move(12, 8)
+        self._icon.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    @staticmethod
+    def _font() -> QFont:
+        f = QFont("Microsoft YaHei UI")
+        f.setPixelSize(13)
+        return f
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if self.text() or not self._ph:
+            return
+        p = THEME.p
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.TextAntialiasing)
+        painter.setFont(self.font())
+        painter.setPen(QPen(qc(p.text_muted, 0.95)))
+        painter.drawText(self.rect().adjusted(34, 0, -12, 0),
+                         Qt.AlignLeft | Qt.AlignVCenter, self._ph)
+        painter.end()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        self._icon.move(9, (self.height() - self._icon.height()) // 2)
+        self._icon.setFixedSize(16, 16)
+        self._icon.move(12, (self.height() - 16) // 2)
+
+    def refresh_theme(self) -> None:
+        self._icon.set_color(THEME.p.text_muted)
+        self.update()
 
 
 class StatTile(QWidget):
@@ -430,6 +461,7 @@ class ProgramRow(QFrame):
     bind_requested = Signal(str)
     repo_requested = Signal(str)
     exclude_requested = Signal(str)
+    mark_requested = Signal(str)
 
     def __init__(self, item, parent=None):
         super().__init__(parent)
@@ -687,6 +719,7 @@ class ProgramRow(QFrame):
         act_repo = m.addAction("在浏览器里打开 GitHub 仓库" if it.repo
                                else "打开 GitHub 仓库（未绑定）")
         act_repo.setEnabled(bool(it.repo))
+        act_mark = m.addAction("手动标记本地版本…")
         m.addSeparator()
         act_open = m.addAction("打开所在文件夹")
         act_copy = m.addAction("复制文件夹路径")
@@ -704,6 +737,8 @@ class ProgramRow(QFrame):
             self.toggle_expand()
         elif act is act_repo:
             self.repo_requested.emit(it.key)
+        elif act is act_mark:
+            self.mark_requested.emit(it.key)
         elif act is act_open:
             self.open_requested.emit(it.key)
         elif act is act_copy:
@@ -801,9 +836,10 @@ class SectionHead(QWidget):
 
 
 class SegmentedControl(QFrame):
-    """分段选择器：整组只有外侧四角是圆角，内部按钮相连。"""
+    """分段选择器：选中项整块填满（无内圈底色），仅整组外侧四角圆角。"""
 
     changed = Signal(str)
+    HEIGHT = 32
 
     def __init__(self, items, current: str = "", parent=None):
         super().__init__(parent)
@@ -811,7 +847,7 @@ class SegmentedControl(QFrame):
         self.buttons: list[QPushButton] = []
         self.keys: list[str] = []
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setContentsMargins(0, 0, 0, 0)      # 不留内边距，选中色才能填满
         lay.setSpacing(0)
         for key, text in items:
             b = QPushButton(text)
@@ -856,16 +892,16 @@ class SegmentedControl(QFrame):
 
     def restyle(self) -> None:
         p = THEME.p
-        r = max(6, min(p.radius_btn, 12))
+        r = max(8, min(p.radius_btn + 2, 14))
         n = len(self.buttons)
         total = 0
         for b in self.buttons:
             b.setFont(self._btn_font(False))
             fm = QFontMetrics(b.font())
-            w = max(56, fm.horizontalAdvance(b.text()) + 32)
-            b.setFixedSize(w, 26)          # 尺寸固定，切换皮肤不会跳动
+            w = max(60, fm.horizontalAdvance(b.text()) + 34)
+            b.setFixedSize(w, self.HEIGHT)   # 尺寸固定，切换皮肤不会跳动
             total += w
-        self.setFixedSize(total + 6, 32)
+        self.setFixedSize(total, self.HEIGHT)
         for i, b in enumerate(self.buttons):
             active = b.isChecked()
             left = (f"border-top-left-radius:{r}px;border-bottom-left-radius:{r}px;"
@@ -873,13 +909,13 @@ class SegmentedControl(QFrame):
             right = (f"border-top-right-radius:{r}px;border-bottom-right-radius:{r}px;"
                      if i == n - 1 else "border-top-right-radius:0;border-bottom-right-radius:0;")
             if active:
-                bg, fg, fw = rgba(p.accent, 0.95), p.accent_on, "600"
+                bg, fg, fw = rgba(p.accent, 0.98), p.accent_on, "600"
             else:
                 bg, fg, fw = "transparent", p.text_dim, "400"
-            hover = rgba(p.text, 0.09) if not active else rgba(p.accent_hover, 1.0)
+            hover = rgba(p.text, 0.10) if not active else rgba(p.accent_hover, 1.0)
             b.setStyleSheet(
                 f"QPushButton{{background:{bg};color:{fg};border:none;{left}{right}"
-                f"padding:0 15px;font-size:12px;font-weight:{fw};}}"
+                f"padding:0;font-size:12px;font-weight:{fw};}}"
                 f"QPushButton:hover{{background:{hover};}}")
         self.update()
 
@@ -888,11 +924,11 @@ class SegmentedControl(QFrame):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        r = max(9, min(p.radius_btn, 12) + 3)
+        r = max(8, min(p.radius_btn + 2, 14))
         path = QPainterPath()
         path.addRoundedRect(rect, r, r)
-        painter.fillPath(path, qc(p.text, 0.055))
-        painter.setPen(QPen(qc(p.border, 0.10 if p.dark else 0.08), 1))
+        painter.fillPath(path, qc(p.text, 0.06))
+        painter.setPen(QPen(qc(p.border, 0.12 if p.dark else 0.09), 1))
         painter.drawPath(path)
         painter.end()
 
@@ -976,7 +1012,7 @@ class ThemedCombo(QPushButton):
         self._key = current if current in self._map else (self._items[0][0] if self._items else "")
         self._w = width
         self._popup = None
-        self.setFixedSize(width, 30)
+        self.setFixedSize(width, 32)
         self.setCursor(Qt.PointingHandCursor)
         self.clicked.connect(self._open)
         self._restyle()
@@ -1003,10 +1039,10 @@ class ThemedCombo(QPushButton):
         p = THEME.p
         self.setText(self._map.get(self._key, ""))
         self.setStyleSheet(
-            f"QPushButton{{background:{rgba(p.text, 0.06)};border:1px solid {rgba(p.border, 0.12)};"
+            f"QPushButton{{background:{rgba(p.text, 0.07)};border:1px solid {rgba(p.border, 0.13)};"
             f"border-radius:8px;color:{p.text_dim};font-family:'Microsoft YaHei UI';"
             f"font-size:12px;text-align:left;padding-left:11px;padding-right:24px;}}"
-            f"QPushButton:hover{{background:{rgba(p.text, 0.10)};color:{p.text};}}")
+            f"QPushButton:hover{{background:{rgba(p.text, 0.11)};color:{p.text};}}")
 
     def paintEvent(self, e):
         super().paintEvent(e)
@@ -1031,6 +1067,136 @@ class ThemedCombo(QPushButton):
         self._key = key
         self._restyle()
         self.changed.emit(key)
+
+
+class NumberStepper(QWidget):
+    """主题化数值步进器：右侧上下两个小箭头（竖向排列），替代原生 QSpinBox。"""
+
+    valueChanged = Signal(int)
+    BTN_W = 24
+
+    def __init__(self, value: int = 0, minimum: int = 0, maximum: int = 100,
+                 step: int = 1, suffix: str = "", width: int = 104, parent=None):
+        super().__init__(parent)
+        self._min, self._max, self._step = int(minimum), int(maximum), max(1, int(step))
+        self._suffix = suffix
+        self._value = max(self._min, min(self._max, int(value)))
+        self._zone = 0                      # 0 无 / 1 加 / -1 减
+        self.setFixedSize(width, 32)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    # ---------- 值 ----------
+    def value(self) -> int:
+        return self._value
+
+    def setValue(self, v: int, emit: bool = False) -> None:
+        v = max(self._min, min(self._max, int(v)))
+        if v == self._value:
+            return
+        self._value = v
+        self.update()
+        if emit:
+            self.valueChanged.emit(v)
+
+    def setRange(self, lo: int, hi: int) -> None:
+        self._min, self._max = int(lo), int(hi)
+        self.setValue(self._value)
+
+    # ---------- 几何 ----------
+    def _rects(self):
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        bw = self.BTN_W
+        up = QRectF(r.right() - bw, r.top(), bw, r.height() / 2)
+        down = QRectF(r.right() - bw, r.center().y(), bw, r.height() / 2)
+        return r, up, down
+
+    def _hit(self, pos) -> int:
+        _, up, down = self._rects()
+        if up.contains(pos):
+            return 1
+        if down.contains(pos):
+            return -1
+        return 0
+
+    # ---------- 交互 ----------
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            z = self._hit(e.position())
+            if z:
+                self.setValue(self._value + z * self._step, emit=True)
+                return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        z = self._hit(e.position())
+        if z != self._zone:
+            self._zone = z
+            self.update()
+        super().mouseMoveEvent(e)
+
+    def leaveEvent(self, e):
+        self._zone = 0
+        self.update()
+        super().leaveEvent(e)
+
+    def wheelEvent(self, e):
+        self.setValue(self._value + (self._step if e.angleDelta().y() > 0 else -self._step),
+                      emit=True)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Up, Qt.Key_Right):
+            self.setValue(self._value + self._step, emit=True)
+        elif e.key() in (Qt.Key_Down, Qt.Key_Left):
+            self.setValue(self._value - self._step, emit=True)
+        else:
+            super().keyPressEvent(e)
+
+    # ---------- 绘制 ----------
+    def paintEvent(self, e):
+        p = THEME.p
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        r, up, down = self._rects()
+        radius = 8
+        path = QPainterPath()
+        path.addRoundedRect(r, radius, radius)
+        painter.fillPath(path, qc(p.text, 0.07))
+        painter.setPen(QPen(qc(p.border, 0.13), 1))
+        painter.drawPath(path)
+
+        # 两个箭头的悬停底色
+        painter.setPen(Qt.NoPen)
+        for zone, rect in ((1, up), (-1, down)):
+            if self._zone == zone:
+                hl = QPainterPath()
+                hl.addRoundedRect(rect.adjusted(1, 1, -1, -1), radius - 3, radius - 3)
+                painter.fillPath(hl, qc(p.accent, 0.16))
+
+        # 分隔线
+        painter.setPen(QPen(qc(p.border, 0.12), 1))
+        painter.drawLine(QPointF(r.right() - self.BTN_W, r.top() + 4),
+                         QPointF(r.right() - self.BTN_W, r.bottom() - 4))
+
+        # 数值
+        f = QFont("Microsoft YaHei UI")
+        f.setPixelSize(12)
+        painter.setFont(f)
+        painter.setPen(QPen(qc(p.text)))
+        painter.drawText(QRectF(r.left() + 11, r.top(), r.width() - self.BTN_W - 14, r.height()),
+                         Qt.AlignLeft | Qt.AlignVCenter, f"{self._value}{self._suffix}")
+
+        # 上下箭头
+        cx = up.center().x()
+        for sign, rect in ((1, up), (-1, down)):
+            col = qc(p.accent if self._zone == sign else p.text_dim, 0.95)
+            painter.setPen(QPen(col, 1.4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            cy = rect.center().y()
+            tip = cy - 3.4 * sign
+            painter.drawLine(QPointF(cx - 3.6, cy + 1.6 * sign), QPointF(cx, tip))
+            painter.drawLine(QPointF(cx, tip), QPointF(cx + 3.6, cy + 1.6 * sign))
+        painter.end()
 
 
 class ChevronButton(QPushButton):

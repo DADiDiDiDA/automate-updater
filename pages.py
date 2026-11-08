@@ -7,15 +7,15 @@ import os
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QComboBox, QDialog, QFileDialog,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QFileDialog,
                                QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QLineEdit,
                                QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
-                               QSpinBox, QStackedWidget, QVBoxLayout, QWidget)
+                               QStackedWidget, QVBoxLayout, QWidget)
 
 from theme import GLYPH, PRESET_HINTS, PRESET_LABELS, PRESET_ORDER, THEME, qc, rgba
-from widgets import (Badge, Card, Chip, ExpandSetting, Glyph, ProgramRow, ProgressLine, SearchBox,
-                     SectionHead, SegmentedControl, SettingGroup, SettingRow, StatTile, TabButton,
-                     ThemedCombo, ToggleSwitch, hline, vspace)
+from widgets import (Badge, Card, Chip, ExpandSetting, Glyph, NumberStepper, ProgramRow,
+                     ProgressLine, SearchBox, SectionHead, SegmentedControl, SettingGroup,
+                     SettingRow, StatTile, TabButton, ThemedCombo, ToggleSwitch, hline, vspace)
 
 import autostart
 import core
@@ -43,6 +43,7 @@ class ItemListView(QWidget):
     row_bind = Signal(str)
     row_exclude = Signal(str)
     row_repo = Signal(str)
+    row_mark = Signal(str)
     sort_changed = Signal(str)
     prior_changed = Signal(str)
 
@@ -87,15 +88,15 @@ class ItemListView(QWidget):
             bar.addWidget(chip)
         bar.addStretch(1)
         self.search = SearchBox()
-        self.search.setFixedWidth(210)
+        self.search.setFixedWidth(184)
         self.search.textChanged.connect(self._on_search)
         bar.addWidget(self.search)
-        self.base_combo = ThemedCombo(self.BASES, self.sort_key, 118)
+        self.base_combo = ThemedCombo(self.BASES, self.sort_key, 122)
         self.base_combo.setToolTip("基础排序：名称 / 体积 / 发布时间")
         self.base_combo.changed.connect(self._on_sort)
         bar.addWidget(self.base_combo)
 
-        self.prior_combo = ThemedCombo(self.PRIORS, self.prior, 124)
+        self.prior_combo = ThemedCombo(self.PRIORS, self.prior, 128)
         self.prior_combo.setToolTip("特殊规则：把某一类程序提到列表最前")
         self.prior_combo.changed.connect(self._on_prior)
         bar.addWidget(self.prior_combo)
@@ -136,6 +137,7 @@ class ItemListView(QWidget):
             row.bind_requested.connect(self.row_bind)
             row.exclude_requested.connect(self.row_exclude)
             row.repo_requested.connect(self.row_repo)
+            row.mark_requested.connect(self.row_mark)
             self.rows[it.key] = row
             self.list_lay.insertWidget(self.list_lay.count() - 1, row)
         self._update_counts()
@@ -266,6 +268,9 @@ class ItemListView(QWidget):
         for chip in self.chips.values():
             chip.set_active(chip is self.chips.get(self.filter))
             chip._apply()
+        self.search.refresh_theme()
+        self.base_combo._restyle()
+        self.prior_combo._restyle()
         self.empty.setStyleSheet(f"color: {THEME.p.text_muted}; background: transparent;")
 
 
@@ -278,6 +283,7 @@ class HomePage(QWidget):
     row_bind = Signal(str)
     row_exclude = Signal(str)
     row_repo = Signal(str)
+    row_mark = Signal(str)
     sort_changed = Signal(str)
     prior_changed = Signal(str)
 
@@ -346,6 +352,7 @@ class HomePage(QWidget):
         self.list.row_bind.connect(self.row_bind)
         self.list.row_exclude.connect(self.row_exclude)
         self.list.row_repo.connect(self.row_repo)
+        self.list.row_mark.connect(self.row_mark)
         self.list.sort_changed.connect(self.sort_changed)
         self.list.prior_changed.connect(self.prior_changed)
         lay.addWidget(self.list, 1)
@@ -541,6 +548,53 @@ class ExcludeDialog(ThemedDialog):
         return [l.strip() for l in self.edit.toPlainText().splitlines() if l.strip()]
 
 
+class VersionDialog(ThemedDialog):
+    """手动标记本地版本：程序目录里读不到版本号时用它兜底比对。"""
+
+    def __init__(self, parent, name: str, current: str = "", remote: str = ""):
+        super().__init__(parent, "手动标记本地版本", 460)
+        self.cleared = False
+        self.body.addWidget(_label(f"「{name}」当前安装的是哪个版本？", 13, "text", bold=True))
+        self.body.addWidget(_label("填好后会和仓库最新版比对，并作为可更新候选参与排序与批量更新。",
+                                   11, "text_muted", wrap=True))
+        if remote:
+            self.body.addWidget(_label(f"仓库最新版本：{remote}", 11, "text_dim"))
+        self.edit = QLineEdit(current)
+        self.edit.setPlaceholderText("例如 1.2.3 或 v2.0.0")
+        self.edit.setMinimumHeight(32)
+        self.edit.returnPressed.connect(self.accept)
+        self.body.addWidget(self.edit)
+        row = QHBoxLayout()
+        if current:
+            clr = QPushButton("清除标记")
+            clr.setObjectName("danger")
+            clr.setCursor(Qt.PointingHandCursor)
+            clr.setFixedHeight(32)
+            clr.clicked.connect(self._clear)
+            row.addWidget(clr)
+        row.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.setObjectName("ghost")
+        cancel.setCursor(Qt.PointingHandCursor)
+        cancel.setFixedHeight(32)
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("保存")
+        ok.setObjectName("primary")
+        ok.setCursor(Qt.PointingHandCursor)
+        ok.setFixedHeight(32)
+        ok.clicked.connect(self.accept)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        self.body.addLayout(row)
+
+    def _clear(self) -> None:
+        self.cleared = True
+        self.accept()
+
+    def value(self) -> str:
+        return "" if self.cleared else self.edit.text().strip()
+
+
 class RootRow(QWidget):
     changed = Signal()
     removed = Signal(str)
@@ -633,6 +687,7 @@ class SettingsPage(QWidget):
     mirrors_changed = Signal()
     mirror_probe_requested = Signal()
     autostart_requested = Signal(bool)
+    proxy_changed = Signal()
 
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
@@ -788,16 +843,12 @@ class SettingsPage(QWidget):
                   "开机后在后台静默运行，不弹出主界面；移动文件夹后重新打开本开关即可",
                   self.startup_toggle)
 
-        self.interval_combo = QComboBox()
-        for label, mins in (("15 分钟", 15), ("30 分钟", 30), ("1 小时", 60), ("3 小时", 180),
-                            ("6 小时", 360), ("12 小时", 720), ("24 小时", 1440)):
-            self.interval_combo.addItem(label, mins)
+        mins_opts = [(15, "15 分钟"), (30, "30 分钟"), (60, "1 小时"), (180, "3 小时"),
+                     (360, "6 小时"), (720, "12 小时"), (1440, "24 小时")]
         cur = int(bg.get("interval_min", 60) or 60)
-        self.interval_combo.setCurrentIndex(min(
-            range(self.interval_combo.count()),
-            key=lambda i: abs(int(self.interval_combo.itemData(i)) - cur)))
-        self.interval_combo.setFixedWidth(112)
-        self.interval_combo.currentIndexChanged.connect(self._save_background)
+        near = min(mins_opts, key=lambda kv: abs(kv[0] - cur))[0]
+        self.interval_combo = ThemedCombo([(str(m), t) for m, t in mins_opts], str(near), 118)
+        self.interval_combo.changed.connect(self._save_background)
 
         box = QWidget()
         box.setStyleSheet("background: transparent;")
@@ -811,16 +862,11 @@ class SettingsPage(QWidget):
         self.sched_row = self._row(lay, "clock", "定时检查更新",
                                    "按间隔自动检查所有程序的新版本", box)
 
-        self.auto_combo = QComboBox()
-        for label, key in (("只通知，不自动更新", "off"),
-                           ("静默更新，完成后提示", "notify"),
-                           ("完全静默更新（不打扰）", "silent")):
-            self.auto_combo.addItem(label, key)
-        keys = [self.auto_combo.itemData(i) for i in range(self.auto_combo.count())]
-        cur_mode = bg.get("auto_mode", "off")
-        self.auto_combo.setCurrentIndex(keys.index(cur_mode) if cur_mode in keys else 0)
-        self.auto_combo.setFixedWidth(196)
-        self.auto_combo.currentIndexChanged.connect(self._save_background)
+        self.auto_combo = ThemedCombo(
+            [("off", "只通知，不自动更新"), ("notify", "静默更新，完成后提示"),
+             ("silent", "完全静默更新（不打扰）")],
+            bg.get("auto_mode", "off"), 196)
+        self.auto_combo.changed.connect(self._save_background)
         self._row(lay, "download", "发现新版本时",
                   "静默更新会在后台直接替换文件（覆盖前仍会备份）", self.auto_combo)
 
@@ -847,7 +893,7 @@ class SettingsPage(QWidget):
             self.notify_chips[key] = c
             self._notify_state[key] = on
             il.addWidget(c)
-        bl2.addWidget(self._sub_line("通知方式", "可多选；都不选时只用系统通知", chips_box))
+        bl2.addWidget(self._sub_line("推送渠道", "可多选；都不选时只用系统通知", chips_box))
 
 
         self.webhook_edit = QLineEdit(self.cfg.get("dingtalk", {}).get("webhook", ""))
@@ -902,7 +948,7 @@ class SettingsPage(QWidget):
             return
         mins = int(bg.get("interval_min", 60) or 60)
         span = f"{mins} 分钟" if mins < 60 else f"{mins // 60} 小时"
-        self.sched_row.set_desc(f"每 {span} 自动检查一次；关闭主窗口不会退出程序")
+        self.sched_row.set_desc(f"每 {span}自动检查一次；关闭主窗口不会退出程序")
 
     def _toggle_notify(self, key: str, chip) -> None:
         on = not self._notify_state.get(key, False)
@@ -943,8 +989,11 @@ class SettingsPage(QWidget):
         bg = self.cfg.setdefault("background", {})
         bg["close_to_tray"] = self.tray_toggle.isChecked()
         bg["check_enabled"] = self.sched_toggle.isChecked()
-        bg["interval_min"] = int(self.interval_combo.currentData() or 60)
-        bg["auto_mode"] = self.auto_combo.currentData() or "off"
+        try:
+            bg["interval_min"] = int(self.interval_combo.value() or 60)
+        except Exception:
+            bg["interval_min"] = 60
+        bg["auto_mode"] = self.auto_combo.value() or "off"
         bg["notify_methods"] = [k for k, on in self._notify_state.items() if on] or ["tray"]
         self.interval_combo.setEnabled(bg["check_enabled"])
         self._refresh_bg_hint()
@@ -985,11 +1034,8 @@ class SettingsPage(QWidget):
         self._row(lay, "folder", "保留哪些文件夹",
                   "只保留勾选的用户数据文件夹，其余旧文件删除后再解压新版", None, chips_box)
 
-        self.timeout_spin = QSpinBox()
-        self.timeout_spin.setRange(1, 180)
-        self.timeout_spin.setSuffix(" 分钟")
-        self.timeout_spin.setValue(int(self.cfg.get("update", {}).get("timeout_min", 10)))
-        self.timeout_spin.setFixedWidth(104)
+        self.timeout_spin = NumberStepper(
+            int(self.cfg.get("update", {}).get("timeout_min", 10)), 1, 180, 5, " 分钟", 108)
         self.timeout_spin.valueChanged.connect(self._save_timeout)
         self._row(lay, "timer", "单个程序更新超时",
                   "下载 + 解压总时长超过该值即中止，避免卡死", self.timeout_spin)
@@ -1001,11 +1047,8 @@ class SettingsPage(QWidget):
         bkl.setSpacing(10)
         self.backup_toggle = ToggleSwitch(bool(self.cfg.get("backup", {}).get("enabled", True)))
         self.backup_toggle.toggled.connect(self._save_backup)
-        self.keep_spin = QSpinBox()
-        self.keep_spin.setRange(1, 10)
-        self.keep_spin.setSuffix(" 份")
-        self.keep_spin.setValue(int(self.cfg.get("backup", {}).get("keep", 2)))
-        self.keep_spin.setFixedWidth(88)
+        self.keep_spin = NumberStepper(
+            int(self.cfg.get("backup", {}).get("keep", 2)), 1, 10, 1, " 份", 96)
         self.keep_spin.valueChanged.connect(self._save_backup)
         bkl.addWidget(self.backup_toggle)
         bkl.addWidget(self.keep_spin)
@@ -1120,9 +1163,31 @@ class SettingsPage(QWidget):
 
     def _build_network(self, lay: QVBoxLayout) -> None:
         self._group(lay, "网络")
-        self.net_lbl = _label("检测中…", 11, "text_muted")
-        self._row(lay, "link", "本地代理", "自动探测常见代理端口（7890 / 1080 / 10809…）",
-                  self.net_lbl)
+
+        # ---- 代理：自动探测 / 手动指定 / 不使用 ----
+        pcfg = self.cfg.setdefault("proxy", {})
+        mode = pcfg.get("mode", "auto")
+        self.proxy_mode = ThemedCombo(
+            [("auto", "自动探测"), ("manual", "手动指定"), ("off", "不使用代理")],
+            mode if mode in ("auto", "manual", "off") else "auto", 128)
+        self.proxy_mode.changed.connect(self._save_proxy)
+
+        self.net_lbl = _label("检测中…", 11, "text_muted", wrap=True)
+        self.proxy_row = self._row(
+            lay, "link", "本地代理",
+            "自动探测本机常见代理端口（7890 / 1080 / 10809…），也可以手动指定或完全不用",
+            self.proxy_mode, self.net_lbl)
+
+        self.proxy_edit = QLineEdit((pcfg.get("url") or ""))
+        self.proxy_edit.setPlaceholderText("http://127.0.0.1:7890")
+        self.proxy_edit.setMinimumHeight(32)
+        self.proxy_edit.setMinimumWidth(320)
+        self.proxy_edit.editingFinished.connect(self._save_proxy)
+        self.proxy_addr_row = self._row(
+            lay, "settings", "代理地址",
+            "支持 http:// 与 socks5://；带密码写成 http://用户名:密码@主机:端口",
+            self.proxy_edit)
+        self.proxy_addr_row.setVisible(mode == "manual")
 
         mcfg = self.cfg.setdefault("mirrors", {})
         self.mirror_toggle = ToggleSwitch(bool(mcfg.get("enabled", True)))
@@ -1164,6 +1229,15 @@ class SettingsPage(QWidget):
         self.config_changed.emit()
         self.mirrors_changed.emit()
 
+    def _save_proxy(self, *_):
+        pc = self.cfg.setdefault("proxy", {})
+        mode = self.proxy_mode.value() or "auto"
+        pc["mode"] = mode
+        pc["url"] = self.proxy_edit.text().strip()
+        self.proxy_addr_row.setVisible(mode == "manual")
+        self.config_changed.emit()
+        self.proxy_changed.emit()
+
     def _on_probe_mirrors(self) -> None:
         self.probe_btn.setEnabled(False)
         self.probe_btn.setText("测速中…")
@@ -1196,7 +1270,8 @@ class SettingsPage(QWidget):
         self._row(lay, "save", "备份目录", "覆盖前的旧版本都留在这里",
                   self._small_btn("打开", self._open_backup))
         self._row(lay, "check", "便携模式", "配置与备份都在 exe 同目录，整个文件夹可随意移动")
-        self._row(lay, "apps", "快捷键", "Ctrl+1/2/3 切换页面　F5 重新检查　右键程序行可排除文件夹")
+        self._row(lay, "apps", "快捷键",
+                  "Ctrl+1/2/3 切换页面　F5 重新检查　右键程序行可绑定仓库、标记版本、排除文件夹")
 
     def _small_btn(self, text: str, slot) -> QPushButton:
         b = QPushButton(text)

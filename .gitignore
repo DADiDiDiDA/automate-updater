@@ -11,3 +11,11 @@ exe_final.png
 *.log
 exe_v2.png
 moved_check.png
+
+# 开发产物
+*.spec
+*.bak
+diag_*.png
+zoom_*.png
+v12_*.png
+tools/diag_*.py

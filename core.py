@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -134,6 +134,8 @@ def default_config() -> dict:
                    "depth": 4, "enabled": True}],
         "preserve": list(DEFAULT_PRESERVE),
         "proxy_ports": list(DEFAULT_PROXY_PORTS),
+        "proxy": {"mode": "auto", "url": ""},   # auto 自动探测 | manual 手动指定 | off 不用
+        "manual_versions": {},                  # 程序名(小写) → 手动标记的本地版本
         "mirrors": {
             "enabled": True,                 # 默认开启镜像加速
             "list": list(DEFAULT_MIRRORS),
@@ -194,6 +196,19 @@ def _normalize(cfg: dict) -> dict:
         cfg["update"]["timeout_min"] = 10
     if not isinstance(cfg.get("preserve"), list):
         cfg["preserve"] = list(DEFAULT_PRESERVE)
+    pc = cfg.get("proxy")
+    base_pc = default_config()["proxy"]
+    if isinstance(pc, dict):
+        base_pc.update({k: v for k, v in pc.items() if k in base_pc})
+    cfg["proxy"] = base_pc
+    if base_pc.get("mode") not in ("auto", "manual", "off"):
+        base_pc["mode"] = "auto"
+    base_pc["url"] = str(base_pc.get("url") or "").strip()
+    if not isinstance(cfg.get("manual_versions"), dict):
+        cfg["manual_versions"] = {}
+    else:
+        cfg["manual_versions"] = {str(k).lower(): str(v) for k, v in cfg["manual_versions"].items()
+                                  if str(v).strip()}
     if not isinstance(cfg.get("background"), dict):
         cfg["background"] = default_config()["background"]
     else:
@@ -227,6 +242,13 @@ def _normalize(cfg: dict) -> dict:
         cfg["ui"]["sort"] = "name"
     if cfg["ui"].get("prior") not in ("update", "none", "git", "release"):
         cfg["ui"]["prior"] = "update"
+    # 规范化检查目录路径（避免 D://Automate 这类写法导致显示与去重异常）
+    for r in cfg.get("roots") or []:
+        if isinstance(r, dict) and r.get("path"):
+            try:
+                r["path"] = os.path.normpath(str(r["path"]))
+            except Exception:
+                pass
     return cfg
 
 
@@ -494,6 +516,7 @@ class Item:
     notes_url: str = ""
     published: str = ""
     local_size: int = 0            # 本地目录体积（排序用）
+    local_manual: bool = False           # 版本号是否由用户手动标记
     asset: str = ""
     asset_size: int = 0
     asset_regex: str = ""
@@ -519,13 +542,55 @@ class Engine:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.proxy = detect_proxy(cfg.get("proxy_ports", []))
+        self.proxy = self.resolve_proxy()
         self.mirror = None
         self._mirror_lock = threading.Lock()
         self.cancel = threading.Event()
         self._deadline = 0.0
         self._timed_out = False
         self.records = self._load_records()
+
+    # ---------- 代理 ----------
+    def resolve_proxy(self) -> str | None:
+        """按设置返回代理地址：自动探测 / 手动填写 / 不使用。"""
+        pc = self.cfg.get("proxy") or {}
+        if not isinstance(pc, dict):
+            pc = {}
+        mode = pc.get("mode", "auto")
+        if mode == "off":
+            return None
+        if mode == "manual":
+            url = (pc.get("url") or "").strip()
+            if not url:
+                return None
+            if "://" not in url:
+                url = "http://" + url
+            return url
+        return detect_proxy(self.cfg.get("proxy_ports", []))
+
+    def refresh_proxy(self) -> str | None:
+        """设置页改了代理配置后重新计算。"""
+        self.proxy = self.resolve_proxy()
+        return self.proxy
+
+    # ---------- 手动标记的本地版本 ----------
+    def manual_version(self, name: str) -> str:
+        mv = self.cfg.get("manual_versions") or {}
+        return str(mv.get((name or "").lower(), "") or "")
+
+    def set_manual_version(self, name: str, ver: str) -> None:
+        mv = self.cfg.setdefault("manual_versions", {})
+        key = (name or "").lower()
+        if not key:
+            return
+        if str(ver or "").strip():
+            mv[key] = str(ver).strip()
+        else:
+            mv.pop(key, None)
+        try:
+            save_config(self.cfg)
+        except Exception:
+            pass
 
     # ---------- 记录 ----------
     @property
@@ -809,8 +874,14 @@ class Engine:
             it.asset_size = int(asset.get("size") or 0)
             it.download_url = asset.get("browser_download_url", "")
         it.local = read_local_version(it.path, it.version_spec, it.name, self.records)
+        it.local_manual = False
+        if not it.local:
+            mv = self.manual_version(it.name)
+            if mv:
+                it.local, it.local_manual = mv, True
         if not it.local:
             it.local = self.records["versions"].get(it.name, "")
+        mark = "　· 手动标记" if it.local_manual else ""
         if not tag:
             it.status = "error"
             it.detail = "该仓库没有发布版本"
@@ -825,10 +896,10 @@ class Engine:
             return it
         if ver_gt(tag, it.local):
             it.status = "update"
-            it.detail = f"{it.local} → {tag}"
+            it.detail = f"{it.local} → {tag}{mark}"
         else:
             it.status = "latest"
-            it.detail = f"{it.local}（最新 {tag}）"
+            it.detail = f"{it.local}（最新 {tag}）{mark}"
         return it
 
     def _git_fetch(self, repo: str):

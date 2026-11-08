@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QFrame, QHBo
 import core
 import autostart
 from backdrop import BACKDROP
-from pages import HomePage, ItemListView, SettingsPage, ThemedDialog, _label
+from pages import (HomePage, ItemListView, SettingsPage, ThemedDialog, VersionDialog, _label)
 from theme import (GLYPH, PRESET_LABELS, PRESET_ORDER, THEME, build_qss, qc, rgba)
 from tray import TrayIcon
 from widgets import Card, Glyph, NavButton, Toast
@@ -314,7 +314,8 @@ class MainWindow(QWidget):
         if os.environ.get("AM_TOPMOST") == "1":
             self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setMinimumSize(1000, 660)
+        # 最小宽度要容纳「筛选胶囊 + 搜索框 + 两个排序下拉」一整行，否则会被裁掉
+        self.setMinimumSize(1120, 690)
         geo = (self.cfg.get("ui") or {}).get("geometry") or []
         if len(geo) == 4:
             self.setGeometry(int(geo[0]), int(geo[1]), int(geo[2]), int(geo[3]))
@@ -426,7 +427,7 @@ class MainWindow(QWidget):
         hl.setSpacing(6)
         self.page_title = QLabel("首页")
         fpt = QFont("Microsoft YaHei UI")
-        fpt.setPixelSize(13)
+        fpt.setPixelSize(15)
         fpt.setWeight(QFont.DemiBold)
         self.page_title.setFont(fpt)
         hl.addWidget(self.page_title)
@@ -459,13 +460,14 @@ class MainWindow(QWidget):
         self.page_home.row_bind.connect(self.bind_repo)
         self.page_home.row_exclude.connect(self.exclude_item)
         self.page_home.row_repo.connect(self.open_item_repo)
+        self.page_home.row_mark.connect(self.mark_version)
 
         self.page_progs = QWidget()
         pl = QVBoxLayout(self.page_progs)
         pl.setContentsMargins(22, 4, 22, 18)
-        self.progs_header = _label("所有程序", 15, "text", bold=True)
+        self.progs_header = _label("所有程序", 17, "text", bold=True)
         pl.addWidget(self.progs_header)
-        pl.addWidget(_label("双击一行可打开所在文件夹；列表可按来源筛选", 11, "text_muted"))
+        pl.addWidget(_label("双击一行可打开所在文件夹；右键可绑定仓库、标记版本或排除", 12, "text_muted"))
         pl.addSpacing(8)
         self.progs_list = ItemListView()
         self.progs_list.row_update.connect(self.update_one)
@@ -473,6 +475,7 @@ class MainWindow(QWidget):
         self.progs_list.row_bind.connect(self.bind_repo)
         self.progs_list.row_exclude.connect(self.exclude_item)
         self.progs_list.row_repo.connect(self.open_item_repo)
+        self.progs_list.row_mark.connect(self.mark_version)
         pl.addWidget(self.progs_list, 1)
 
         ui = self.cfg.get("ui") or {}
@@ -509,6 +512,7 @@ class MainWindow(QWidget):
         page.config_changed.connect(self._save_cfg)
         page.autostart_requested.connect(self._set_autostart)
         page.mirror_probe_requested.connect(self._probe_mirrors)
+        page.proxy_changed.connect(self._on_proxy_changed)
 
     def _probe_mirrors(self) -> None:
         """设置页「立即测速」：后台线程并发测速所有镜像。"""
@@ -530,6 +534,15 @@ class MainWindow(QWidget):
                                       if i.status == "update"
                                       or (i.status == "unknown" and i.scanned)))
         self._refresh_net_info()
+
+    def _on_proxy_changed(self) -> None:
+        """设置页改了代理方式 / 地址后立刻生效。"""
+        proxy = self.engine.refresh_proxy()
+        self._update_brand()
+        if proxy:
+            self.toast.show_text(f"代理已切换为 {proxy}")
+        else:
+            self.toast.show_text("当前不使用代理，走直连 / 镜像加速")
 
     # ---------- 主题 ----------
     def _sync_system_theme(self) -> None:
@@ -844,10 +857,12 @@ class MainWindow(QWidget):
         self._refresh_net_info()
 
     def _refresh_net_info(self) -> None:
-        proxy = self.engine.proxy or "未检测到本地代理（走直连 / 镜像）"
+        mode = (self.cfg.get("proxy") or {}).get("mode", "auto")
+        tag = {"auto": "自动探测", "manual": "手动指定", "off": "不使用"}.get(mode, "自动探测")
+        proxy = self.engine.proxy or "未检测到"
         mirror = self.engine.mirror
         mirror_txt = "检测中…" if mirror is None else (mirror or "无可用镜像")
-        self._net_text = f"代理：{proxy}\n镜像：{mirror_txt}"
+        self._net_text = f"代理：{proxy}（{tag}）\n镜像：{mirror_txt}"
         if hasattr(self, "page_settings"):
             self.page_settings.set_network_info(self._net_text.replace("\n", "　|　"))
 
@@ -1036,6 +1051,26 @@ class MainWindow(QWidget):
             return
         core.open_url(f"https://github.com/{it.repo}")
         self.toast.show_text(f"已在浏览器打开 {it.repo}")
+
+    def mark_version(self, key: str) -> None:
+        """右键「手动标记本地版本」：给读不到版本号的目录补一个版本，参与正常比对。"""
+        it = next((i for i in self.items if i.key == key), None)
+        if not it:
+            return
+        if it.kind == "git":
+            self.toast.show_text("Git 仓库按提交号比对，不需要手动标记版本", ok=False)
+            return
+        cur = self.engine.manual_version(it.name) or it.local
+        dlg = VersionDialog(self, it.name, cur, it.remote)
+        if not dlg.exec():
+            return
+        ver = dlg.value()
+        self.engine.set_manual_version(it.name, ver)
+        if ver:
+            self.toast.show_text(f"已把「{it.name}」标记为 {ver}，重新检查…")
+        else:
+            self.toast.show_text(f"已清除「{it.name}」的版本标记，重新检查…")
+        QTimer.singleShot(200, self.start_scan)
 
     def bind_repo(self, key: str) -> None:
         it = next((i for i in self.items if i.key == key), None)

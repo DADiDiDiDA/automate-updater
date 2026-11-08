@@ -65,7 +65,7 @@ class Palette:
 ACRYLIC_DARK = Palette(
     id="acrylic", label="亚克力", dark=True,
     bg="#15171C", card="#FFFFFF", card_alt="#FFFFFF", sidebar="#FFFFFF",
-    border="#FFFFFF", text="#EEF1F7", text_dim="#A5AEC0", text_muted="#6D7585",
+    border="#FFFFFF", text="#EEF1F7", text_dim="#BCC4D2", text_muted="#929AA9",
     accent="#5B8CFF", accent_hover="#7AA2FF", accent_on="#08101F",
     accent_soft="#5B8CFF", success="#43C58A", warning="#F2B23E", danger="#F0655A",
     radius_card=14, radius_btn=9, radius_chip=9,
@@ -75,7 +75,7 @@ ACRYLIC_DARK = Palette(
 ACRYLIC_LIGHT = Palette(
     id="acrylic", label="亚克力", dark=False,
     bg="#F5F7FB", card="#FFFFFF", card_alt="#FFFFFF", sidebar="#FFFFFF",
-    border="#0D1B2A", text="#14181F", text_dim="#59616F", text_muted="#8B93A2",
+    border="#0D1B2A", text="#14181F", text_dim="#49515F", text_muted="#6B7381",
     accent="#2F6BFF", accent_hover="#1E5AF0", accent_on="#FFFFFF",
     accent_soft="#2F6BFF", success="#12996A", warning="#C77C10", danger="#D8453A",
     radius_card=14, radius_btn=9, radius_chip=9,
@@ -85,7 +85,7 @@ ACRYLIC_LIGHT = Palette(
 MONET_DARK = Palette(
     id="monet", label="莫奈", dark=True,
     bg="#141218", card="#211F26", card_alt="#2B2830", sidebar="#1B1920",
-    border="#CAC4D0", text="#E9E3EC", text_dim="#C7C1D0", text_muted="#928D9C",
+    border="#CAC4D0", text="#E9E3EC", text_dim="#D2CCDB", text_muted="#A8A2B1",
     accent="#D0BCFF", accent_hover="#E4D6FF", accent_on="#2A1B4E",
     accent_soft="#D0BCFF", success="#8DD6A3", warning="#F2C86B", danger="#FFB4A9",
     radius_card=26, radius_btn=22, radius_chip=18,
@@ -95,7 +95,7 @@ MONET_DARK = Palette(
 MONET_LIGHT = Palette(
     id="monet", label="莫奈", dark=False,
     bg="#FDF7FF", card="#FFFFFF", card_alt="#F3EDF7", sidebar="#F7F1FB",
-    border="#79747E", text="#1D1B20", text_dim="#4A454F", text_muted="#79747E",
+    border="#79747E", text="#1D1B20", text_dim="#443F49", text_muted="#605A64",
     accent="#6750A4", accent_hover="#7B62BD", accent_on="#FFFFFF",
     accent_soft="#E8DEF8", success="#2E7D46", warning="#8A6100", danger="#B3261E",
     radius_card=26, radius_btn=22, radius_chip=18,
@@ -105,7 +105,7 @@ MONET_LIGHT = Palette(
 MIUIX_DARK = Palette(
     id="miuix", label="Miuix", dark=True,
     bg="#101012", card="#1D1D20", card_alt="#26262A", sidebar="#17171A",
-    border="#FFFFFF", text="#F0F0F2", text_dim="#A8A8AE", text_muted="#77777E",
+    border="#FFFFFF", text="#F0F0F2", text_dim="#BCBCC4", text_muted="#95959D",
     accent="#3482FF", accent_hover="#4E93FF", accent_on="#FFFFFF",
     accent_soft="#3482FF", success="#37C46B", warning="#FFB020", danger="#FF5B4E",
     radius_card=20, radius_btn=16, radius_chip=14,
@@ -115,7 +115,7 @@ MIUIX_DARK = Palette(
 MIUIX_LIGHT = Palette(
     id="miuix", label="Miuix", dark=False,
     bg="#F1F1F5", card="#FFFFFF", card_alt="#F7F7FA", sidebar="#F7F7FA",
-    border="#000000", text="#0D0D0F", text_dim="#5E5E66", text_muted="#96969E",
+    border="#000000", text="#0D0D0F", text_dim="#54545C", text_muted="#6C6C75",
     accent="#0B6CFF", accent_hover="#0A5FD8", accent_on="#FFFFFF",
     accent_soft="#0B6CFF", success="#15A854", warning="#C77A00", danger="#E23B2E",
     radius_card=20, radius_btn=16, radius_chip=14,
@@ -280,7 +280,9 @@ def build_qss(p: Palette) -> str:
     QLineEdit#search {{
         background: {rgba(p.text, 0.05) if p.dark else rgba(p.text, 0.04)};
         border-radius: {_px_radius(field_radius(p))};
-        padding-left: 32px;
+        /* 上下内边距必须为 0，否则文字会被顶到偏下的位置，和左侧图标不居中 */
+        padding: 0px 12px 0px 34px;
+        font-size: 13px;
     }}
 
     QComboBox {{
