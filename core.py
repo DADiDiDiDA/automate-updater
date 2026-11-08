@@ -29,7 +29,6 @@ import sys
 import tempfile
 import threading
 import time
-import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,15 +37,15 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
 SILENT = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
 
-# 常见用户数据目录（默认保留名单，可在设置里改）
-DEFAULT_PRESERVE = ["User", "user", "config", "configs", "Config", "data", "Data",
-                    "saves", "save", "logs", "Logs", "profiles", "3rdparty"]
+# 常见用户数据目录（默认保留名单，可在设置里改；匹配时不区分大小写，无需重复写变体）
+DEFAULT_PRESERVE = ["User", "config", "configs", "data", "saves", "save", "logs",
+                    "profiles", "3rdparty"]
 
 # 设置页里做成「一键开关」的常见保留项（默认全部开启）
 COMMON_PRESERVE = [
@@ -133,6 +132,7 @@ def default_config() -> dict:
         "roots": [{"path": "D:\\Automate", "exclude": ["My-maawork", "Cache", "_updater", "_backup", ".git"],
                    "depth": 4, "enabled": True}],
         "preserve": list(DEFAULT_PRESERVE),
+        "preserve_map": {},                    # 程序名(小写) → {"custom": True, "list": [...]}
         "proxy_ports": list(DEFAULT_PROXY_PORTS),
         "proxy": {"mode": "auto", "url": ""},   # auto 自动探测 | manual 手动指定 | off 不用
         "manual_versions": {},                  # 程序名(小写) → 手动标记的本地版本
@@ -144,7 +144,7 @@ def default_config() -> dict:
             "last_check": "",
             "chosen": "",
         },
-        "update": {"timeout_min": 10},       # 单个程序更新超时（分钟）
+        "update": {"timeout_min": 10, "install_mode": "clean"},   # clean 保留指定文件夹 | overwrite 直接覆盖
         "background": {
             "close_to_tray": True,           # 关闭窗口时最小化到托盘
             "run_at_startup": False,         # 开机自启（后台静默）
@@ -189,13 +189,36 @@ def _normalize(cfg: dict) -> dict:
                 mm["list"].append(url)
         mm["seeded"] = len(DEFAULT_MIRRORS)
     if not isinstance(cfg.get("update"), dict):
-        cfg["update"] = {"timeout_min": 10}
+        cfg["update"] = {"timeout_min": 10, "install_mode": "clean"}
+    if cfg["update"].get("install_mode") not in ("clean", "overwrite"):
+        cfg["update"]["install_mode"] = "clean"
     try:
         cfg["update"]["timeout_min"] = max(1, int(cfg["update"].get("timeout_min") or 10))
     except Exception:
         cfg["update"]["timeout_min"] = 10
     if not isinstance(cfg.get("preserve"), list):
         cfg["preserve"] = list(DEFAULT_PRESERVE)
+    seen, cleaned = set(), []
+    for name in cfg["preserve"]:
+        name = str(name).strip()
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            cleaned.append(name)
+    cfg["preserve"] = cleaned
+    # 单个程序的独立保留列表
+    pm = cfg.get("preserve_map")
+    clean_pm = {}
+    if isinstance(pm, dict):
+        for k, v in pm.items():
+            key = str(k or "").lower()
+            if not key:
+                continue
+            if isinstance(v, dict):
+                lst = [str(x) for x in (v.get("list") or []) if str(x).strip()]
+                clean_pm[key] = {"custom": bool(v.get("custom", True)), "list": lst}
+            elif isinstance(v, list):
+                clean_pm[key] = {"custom": True, "list": [str(x) for x in v if str(x).strip()]}
+    cfg["preserve_map"] = clean_pm
     pc = cfg.get("proxy")
     base_pc = default_config()["proxy"]
     if isinstance(pc, dict):
@@ -721,11 +744,31 @@ class Engine:
         return items
 
     def preserve_for(self, name: str, spec: dict) -> list:
-        base = list(self.cfg.get("preserve", DEFAULT_PRESERVE))
+        """某程序更新时要保留的文件夹名：单程序自定义优先，否则用全局列表。"""
+        custom = (self.cfg.get("preserve_map") or {}).get((name or "").lower())
+        if custom and custom.get("custom"):
+            base = list(custom.get("list") or [])
+        else:
+            base = list(self.cfg.get("preserve", DEFAULT_PRESERVE))
         for extra in (spec.get("preserve") or []):
             if extra not in base:
                 base.append(extra)
         return base
+
+    def set_preserve_map(self, name: str, names: list | None) -> None:
+        """写入单程序的保留列表；names 为 None 表示改回跟随全局。"""
+        pm = self.cfg.setdefault("preserve_map", {})
+        key = (name or "").lower()
+        if not key:
+            return
+        if names is None:
+            pm.pop(key, None)
+        else:
+            pm[key] = {"custom": True, "list": [str(x) for x in names if str(x).strip()]}
+        try:
+            save_config(self.cfg)
+        except Exception:
+            pass
 
     # ---------- 排除文件夹 ----------
     def owner_root(self, path: str) -> dict | None:
@@ -1072,10 +1115,15 @@ class Engine:
                     it.archived = ""
 
             pr(0.8, "替换文件")
-            removed, copied = clean_replace(src_root, it.path, it.preserve)
+            if self.cfg.get("update", {}).get("install_mode", "clean") == "overwrite":
+                # 直接覆盖：旧文件全部保留，只用新版同名内容替换
+                copied = copy_over(src_root, it.path, [])
+                it.detail = f"已覆盖安装 {it.remote}（写入 {copied} 项）"
+            else:
+                removed, copied = clean_replace(src_root, it.path, it.preserve)
+                it.detail = f"已更新到 {it.remote}（清理旧文件 {removed} 项，写入 {copied} 项）"
             it.state, it.status = "done", "latest"
             it.local = it.remote or it.local
-            it.detail = f"已更新到 {it.remote}（清理旧文件 {removed} 项，写入 {copied} 项）"
             self.records["versions"][it.name] = it.remote
             pr(1.0, "完成")
             return it

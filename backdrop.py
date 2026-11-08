@@ -12,8 +12,8 @@ import os
 import sys
 
 from PIL import Image, ImageFilter
-from PySide6.QtCore import QPoint, QRect, Qt
-from PySide6.QtGui import QColor, QImage, QLinearGradient, QPainter, QPixmap
+from PySide6.QtCore import QPoint, QRect, QRectF, Qt
+from PySide6.QtGui import QColor, QImage, QLinearGradient, QPainter, QPainterPath, QPixmap
 
 from theme import Palette, qc
 
@@ -50,11 +50,16 @@ def virtual_screen() -> QRect:
 
 
 class Backdrop:
-    """缓存并生成窗口背景图。"""
+    """缓存并生成窗口背景图。
+
+    主窗口、对话框、弹层、右键菜单都从这里取同一张模糊壁纸，
+    所以各处玻璃质感是一致且连续（按各自在屏幕上的位置裁剪）。
+    """
+
+    MAX_CACHE = 10
 
     def __init__(self):
-        self._key = None
-        self._pm: QPixmap | None = None
+        self._cache: dict = {}
         self._wall = None
         self._wall_sig = None
 
@@ -85,8 +90,9 @@ class Backdrop:
         w = max(1, int(size[0]))
         h = max(1, int(size[1]))
         key = (w, h, pos.x(), pos.y(), p.id, p.dark, blur)
-        if self._pm is not None and key == self._key:
-            return self._pm
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
 
         pm = QPixmap(w, h)
         pm.fill(Qt.transparent)
@@ -109,8 +115,10 @@ class Backdrop:
             self._fill_solid(painter, p, w, h)
 
         painter.end()
-        self._pm = pm
-        self._key = key
+        if len(self._cache) >= self.MAX_CACHE:
+            # 简单的 FIFO 淘汰，足够覆盖「主窗口 + 若干弹层」
+            self._cache.pop(next(iter(self._cache)), None)
+        self._cache[key] = pm
         return pm
 
     def _fill_solid(self, painter: QPainter, p: Palette, w: int, h: int) -> None:
@@ -160,3 +168,28 @@ class Backdrop:
 
 
 BACKDROP = Backdrop()
+
+
+def paint_glass(painter: QPainter, rect: QRectF, radius: float, global_pos: QPoint,
+                p: Palette, blur: bool, tint: float | None = None) -> QPainterPath:
+    """在任意顶层窗口上画一块「毛玻璃」底板，返回它的圆角路径。
+
+    对话框、下拉弹层、右键菜单都用它，保证和主窗口是同一种玻璃；
+    关闭模糊时退回不透明表面色。
+    """
+    path = QPainterPath()
+    path.addRoundedRect(rect, radius, radius)
+
+    painter.save()
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setClipPath(path)
+    if blur:
+        pm = BACKDROP.render(p, (int(rect.width()), int(rect.height())), global_pos, True)
+        painter.drawPixmap(rect.topLeft(), pm)
+        surf = p.surface()
+        surf.setAlphaF((0.92 if not p.dark else 0.86) if tint is None else tint)
+        painter.fillPath(path, surf)
+    else:
+        painter.fillPath(path, p.surface())
+    painter.restore()
+    return path

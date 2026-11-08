@@ -10,12 +10,11 @@ from __future__ import annotations
 import time
 
 from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import QSystemTrayIcon
 
 import core
-from theme import THEME
-from widgets import menu_style
+from widgets import ThemedMenu, menu_style
 
 
 def _elapsed_text(stamp: str) -> str:
@@ -96,7 +95,7 @@ class TrayIcon(QSystemTrayIcon):
         self._updates = 0
         self._busy = False
         self._last_check = ""
-        self._menu = QMenu()
+        self._menu = ThemedMenu()
         self._build_menu()
         self.setContextMenu(self._menu)
         self.activated.connect(self._on_activated)

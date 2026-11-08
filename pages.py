@@ -5,17 +5,19 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QFileDialog,
-                               QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QLineEdit,
-                               QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,
+                               QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect,
+                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+                               QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
                                QStackedWidget, QVBoxLayout, QWidget)
 
+from backdrop import paint_glass
 from theme import GLYPH, PRESET_HINTS, PRESET_LABELS, PRESET_ORDER, THEME, qc, rgba
-from widgets import (Badge, Card, Chip, ExpandSetting, Glyph, NumberStepper, ProgramRow,
-                     ProgressLine, SearchBox, SectionHead, SegmentedControl, SettingGroup,
-                     SettingRow, StatTile, TabButton, ThemedCombo, ToggleSwitch, hline, vspace)
+from widgets import (Card, Chip, ExpandSetting, Glyph, NumberStepper, ProgramRow, ProgressLine,
+                     SearchBox, SegmentedControl, SettingGroup, SettingRow, StatTile, TabButton,
+                     ThemedCombo, ToggleSwitch)
 
 import autostart
 import core
@@ -44,6 +46,7 @@ class ItemListView(QWidget):
     row_exclude = Signal(str)
     row_repo = Signal(str)
     row_mark = Signal(str)
+    row_preserve = Signal(str)
     sort_changed = Signal(str)
     prior_changed = Signal(str)
 
@@ -138,6 +141,7 @@ class ItemListView(QWidget):
             row.exclude_requested.connect(self.row_exclude)
             row.repo_requested.connect(self.row_repo)
             row.mark_requested.connect(self.row_mark)
+            row.preserve_requested.connect(self.row_preserve)
             self.rows[it.key] = row
             self.list_lay.insertWidget(self.list_lay.count() - 1, row)
         self._update_counts()
@@ -284,6 +288,7 @@ class HomePage(QWidget):
     row_exclude = Signal(str)
     row_repo = Signal(str)
     row_mark = Signal(str)
+    row_preserve = Signal(str)
     sort_changed = Signal(str)
     prior_changed = Signal(str)
 
@@ -432,16 +437,16 @@ class HomePage(QWidget):
 
 
 class _DialogPanel(QFrame):
-    """对话框的圆角底板（自绘，跟随主题）。"""
+    """对话框的圆角底板（玻璃质感，跟随主题）。"""
 
     def paintEvent(self, e):
         p = THEME.p
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        path = QPainterPath()
-        path.addRoundedRect(rect, 14, 14)
-        painter.fillPath(path, qc(p.surface(), 1.0))
+        radius = max(10, min(p.radius_card, 20))       # 跟随皮肤圆角
+        path = paint_glass(painter, rect, radius, self.mapToGlobal(QPoint(0, 0)), p,
+                           THEME.blur_active, 0.84 if not p.dark else 0.78)
         painter.setPen(QPen(qc(p.border, 0.16), 1))
         painter.drawPath(path)
         painter.end()
@@ -509,6 +514,32 @@ class ThemedDialog(QDialog):
     def add_widget(self, w) -> None:
         self.body.addWidget(w)
 
+    # ---------- 通用底部按钮 ----------
+    def add_footer(self, extra: QPushButton | None = None, ok_text: str = "保存") -> QPushButton:
+        """底部操作行：左侧可选的附加按钮 + 右侧「取消 / 保存」。"""
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        if extra is not None:
+            extra.setCursor(Qt.PointingHandCursor)
+            extra.setFixedHeight(32)
+            row.addWidget(extra)
+        row.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.setObjectName("ghost")
+        cancel.setCursor(Qt.PointingHandCursor)
+        cancel.setFixedHeight(32)
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton(ok_text)
+        ok.setObjectName("primary")
+        ok.setCursor(Qt.PointingHandCursor)
+        ok.setFixedHeight(32)
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        self.body.addLayout(row)
+        return ok
+
 
 class ExcludeDialog(ThemedDialog):
     """编辑某个检查文件夹的排除项。"""
@@ -528,21 +559,7 @@ class ExcludeDialog(ThemedDialog):
             f"font-family:'Consolas','Microsoft YaHei UI';font-size:12px;padding:8px 10px;}}"
             f"QPlainTextEdit:focus{{border:1px solid {rgba(tp.accent, 0.55)};}}")
         self.body.addWidget(self.edit)
-        row = QHBoxLayout()
-        row.addStretch(1)
-        cancel = QPushButton("取消")
-        cancel.setObjectName("ghost")
-        cancel.setCursor(Qt.PointingHandCursor)
-        cancel.setFixedHeight(32)
-        cancel.clicked.connect(self.reject)
-        ok = QPushButton("保存")
-        ok.setObjectName("primary")
-        ok.setCursor(Qt.PointingHandCursor)
-        ok.setFixedHeight(32)
-        ok.clicked.connect(self.accept)
-        row.addWidget(cancel)
-        row.addWidget(ok)
-        self.body.addLayout(row)
+        self.add_footer()
 
     def values(self) -> list[str]:
         return [l.strip() for l in self.edit.toPlainText().splitlines() if l.strip()]
@@ -564,28 +581,12 @@ class VersionDialog(ThemedDialog):
         self.edit.setMinimumHeight(32)
         self.edit.returnPressed.connect(self.accept)
         self.body.addWidget(self.edit)
-        row = QHBoxLayout()
+        extra = None
         if current:
-            clr = QPushButton("清除标记")
-            clr.setObjectName("danger")
-            clr.setCursor(Qt.PointingHandCursor)
-            clr.setFixedHeight(32)
-            clr.clicked.connect(self._clear)
-            row.addWidget(clr)
-        row.addStretch(1)
-        cancel = QPushButton("取消")
-        cancel.setObjectName("ghost")
-        cancel.setCursor(Qt.PointingHandCursor)
-        cancel.setFixedHeight(32)
-        cancel.clicked.connect(self.reject)
-        ok = QPushButton("保存")
-        ok.setObjectName("primary")
-        ok.setCursor(Qt.PointingHandCursor)
-        ok.setFixedHeight(32)
-        ok.clicked.connect(self.accept)
-        row.addWidget(cancel)
-        row.addWidget(ok)
-        self.body.addLayout(row)
+            extra = QPushButton("清除标记")
+            extra.setObjectName("danger")
+            extra.clicked.connect(self._clear)
+        self.add_footer(extra)
 
     def _clear(self) -> None:
         self.cleared = True
@@ -593,6 +594,105 @@ class VersionDialog(ThemedDialog):
 
     def value(self) -> str:
         return "" if self.cleared else self.edit.text().strip()
+
+
+class PreserveDialog(ThemedDialog):
+    """单个程序：更新时保留哪些文件夹（覆盖安装才不会冲掉存档/配置）。"""
+
+    COLS = 4
+
+    def __init__(self, parent, name: str, path: str, current: list[str], custom: bool):
+        super().__init__(parent, "更新时保留的文件夹", 540)
+        self.chosen: list[str] | None = None      # None 表示跟随全局设置
+        self._follow = False
+
+        self.body.addWidget(_label(f"「{name}」", 13, "text", bold=True))
+        self.body.addWidget(_label(
+            "勾选的文件夹在更新时原样保留（不删除、也不被新版覆盖）；"
+            "未勾选的按设定的安装方式处理。", 11, "text_muted", wrap=True))
+
+        names = self._candidates(path, current)
+        self.chips: dict[str, Chip] = {}
+        box = QWidget()
+        box.setStyleSheet("background: transparent;")
+        grid = QGridLayout(box)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(7)
+        grid.setVerticalSpacing(7)
+        for i, nm in enumerate(names):
+            c = Chip(nm)
+            c.set_active(any(nm.lower() == x.lower() for x in current))
+            c.clicked.connect(lambda _=False, cc=c: cc.set_active(not cc.is_active()))
+            self.chips[nm] = c
+            grid.addWidget(c, i // self.COLS, i % self.COLS, Qt.AlignLeft)
+        grid.setColumnStretch(self.COLS, 1)
+
+        if names:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.setStyleSheet("background: transparent;")
+            scroll.viewport().setStyleSheet("background: transparent;")
+            scroll.setWidget(box)
+            scroll.setFixedHeight(min(230, 39 * ((len(names) + self.COLS - 1) // self.COLS) + 6))
+            self.body.addWidget(scroll)
+        else:
+            self.body.addWidget(_label("这个程序目录里还没有子文件夹。", 11, "text_muted"))
+
+        self.extra = QLineEdit("")
+        self.extra.setPlaceholderText("还可以补充文件夹名，用逗号分隔（如 mods, plugins）")
+        self.extra.setMinimumHeight(32)
+        self.body.addWidget(self.extra)
+
+        self.hint = _label("" if custom else "当前沿用「设置 → 更新策略」里的全局保留列表。",
+                           11, "text_muted", wrap=True)
+        self.hint.setVisible(not custom)
+        self.body.addWidget(self.hint)
+
+        extra_btn = QPushButton("跟随全局")
+        extra_btn.setObjectName("ghost")
+        extra_btn.setToolTip("清除本程序的单独设置，改回设置页里的全局保留列表")
+        extra_btn.clicked.connect(self._follow_global)
+        self.add_footer(extra_btn)
+
+    # ---------- 数据 ----------
+    @staticmethod
+    def _candidates(path: str, current: list[str]) -> list[str]:
+        found = []
+        try:
+            for nm in os.listdir(path):
+                full = os.path.join(path, nm)
+                if not os.path.isdir(full) or nm.startswith("."):
+                    continue
+                if nm.lower() in ("cache", "_backup", "_updater", "__pycache__"):
+                    continue
+                found.append(nm)
+        except Exception:
+            pass
+        seen = {x.lower() for x in found}
+        for nm in current:                     # 配置里有、但目录里已经不在的也保留，方便取消勾选
+            if nm.lower() not in seen:
+                found.append(nm)
+                seen.add(nm.lower())
+        return sorted(found, key=lambda s: (s.lower(), s))
+
+    def values(self) -> list[str]:
+        out = [nm for nm, c in self.chips.items() if c.is_active()]
+        for raw in self.extra.text().replace("，", ",").split(","):
+            raw = raw.strip()
+            if raw and all(raw.lower() != v.lower() for v in out):
+                out.append(raw)
+        return out
+
+    def _follow_global(self) -> None:
+        self._follow = True
+        self.accept()
+
+    def accept(self) -> None:
+        if not self._follow:
+            self.chosen = self.values()
+        super().accept()
 
 
 class RootRow(QWidget):
@@ -680,6 +780,8 @@ class RootRow(QWidget):
 
 class SettingsPage(QWidget):
     """设置页：顶部分页 + 「分组标题 / 设置行」列表。"""
+
+    PROXY_DESC = "自动探测（7890 / 1080 / 10809…）或手动指定，也可以完全不用"
 
     theme_changed = Signal()
     roots_changed = Signal()
@@ -1008,6 +1110,12 @@ class SettingsPage(QWidget):
     def _build_strategy(self, lay: QVBoxLayout) -> None:
         self._group(lay, "更新策略")
 
+        self.install_seg = self._segmented(
+            [("clean", "只保留指定文件夹"), ("overwrite", "直接覆盖")],
+            self.cfg.get("update", {}).get("install_mode", "clean"),
+            self._on_install_mode)
+        self.install_row = self._row(lay, "restore", "安装方式", "", self.install_seg)
+
         chips_box = QWidget()
         chips_box.setStyleSheet("background: transparent;")
         cl = QVBoxLayout(chips_box)
@@ -1031,8 +1139,13 @@ class SettingsPage(QWidget):
         self.extra_edit.setMinimumHeight(32)
         self.extra_edit.editingFinished.connect(self._save_extras)
         cl.addWidget(self.extra_edit)
-        self._row(lay, "folder", "保留哪些文件夹",
-                  "只保留勾选的用户数据文件夹，其余旧文件删除后再解压新版", None, chips_box)
+        self.preserve_row = self._row(lay, "folder", "默认保留的文件夹",
+                                      "更新时这些文件夹原样保留，其余按安装方式处理", None, chips_box)
+        self.preserve_box = chips_box
+        self._preserve_fx = QGraphicsOpacityEffect(chips_box)
+        self._preserve_fx.setOpacity(1.0)
+        chips_box.setGraphicsEffect(self._preserve_fx)
+        self._sync_install_desc()
 
         self.timeout_spin = NumberStepper(
             int(self.cfg.get("update", {}).get("timeout_min", 10)), 1, 180, 5, " 分钟", 108)
@@ -1053,6 +1166,23 @@ class SettingsPage(QWidget):
         bkl.addWidget(self.backup_toggle)
         bkl.addWidget(self.keep_spin)
         self._row(lay, "save", "覆盖前自动备份", "备份存放在根目录 Cache\\_backup 下", bk)
+
+    def _on_install_mode(self, mode: str) -> None:
+        self.cfg.setdefault("update", {})["install_mode"] = mode
+        self._sync_install_desc()
+        self.config_changed.emit()
+
+    def _sync_install_desc(self) -> None:
+        """安装方式与「默认保留的文件夹」联动：直接覆盖时保留列表不生效。"""
+        clean = (self.cfg.get("update", {}).get("install_mode", "clean") != "overwrite")
+        self.install_row.set_desc(
+            "只保留指定文件夹：删除旧的无关文件后再解压新版" if clean
+            else "直接覆盖：保留全部已有文件，只用新版同名内容替换")
+        self.preserve_row.set_desc(
+            "更新时这些文件夹原样保留，其余按安装方式处理" if clean
+            else "直接覆盖模式下不生效；需要精细控制时可右键单个程序单独设置")
+        self.preserve_box.setEnabled(clean)
+        self._preserve_fx.setOpacity(1.0 if clean else 0.42)
 
     def _preserve_on(self, name: str) -> bool:
         low = name.lower()
@@ -1172,11 +1302,10 @@ class SettingsPage(QWidget):
             mode if mode in ("auto", "manual", "off") else "auto", 128)
         self.proxy_mode.changed.connect(self._save_proxy)
 
-        self.net_lbl = _label("检测中…", 11, "text_muted", wrap=True)
+        self.net_lbl = None
         self.proxy_row = self._row(
-            lay, "link", "本地代理",
-            "自动探测本机常见代理端口（7890 / 1080 / 10809…），也可以手动指定或完全不用",
-            self.proxy_mode, self.net_lbl)
+            lay, "link", "本地代理", self.PROXY_DESC,
+            self.proxy_mode)
 
         self.proxy_edit = QLineEdit((pcfg.get("url") or ""))
         self.proxy_edit.setPlaceholderText("http://127.0.0.1:7890")
@@ -1258,8 +1387,8 @@ class SettingsPage(QWidget):
         self.mirror_lbl.setText(f"测速完成，可用 {len(ranked)} 个：{top}")
 
     def set_network_info(self, text: str) -> None:
-        if getattr(self, "net_lbl", None) is not None:
-            self.net_lbl.setText(text)
+        """把当前代理与镜像状态接在「本地代理」行的说明后面。"""
+        self.proxy_row.set_desc(f"{self.PROXY_DESC}　·　{text}" if text else self.PROXY_DESC)
 
     # ---------- 关于 ----------
     def _build_about(self, lay: QVBoxLayout) -> None:

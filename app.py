@@ -8,22 +8,21 @@ import math
 import os
 import sys
 
-from PySide6.QtCore import (QEasingCurve, QEvent, QPoint, QPointF, QPropertyAnimation, QRectF,
-                            QSize, Qt, QThread, QTimer, Signal)
-from PySide6.QtGui import (QColor, QCursor, QFont, QGuiApplication, QIcon, QLinearGradient, QPainter,
-                           QPainterPath, QPen, QPixmap, QRadialGradient)
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import (QColor, QFont, QGuiApplication, QIcon, QLinearGradient, QPainter,
+                           QPainterPath, QPen, QPixmap)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QFrame, QHBoxLayout, QLabel,
-                               QLineEdit, QMessageBox, QPushButton, QSizePolicy, QStackedWidget,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+                               QStackedWidget, QVBoxLayout, QWidget)
 
 import core
 import autostart
 from backdrop import BACKDROP
-from pages import (HomePage, ItemListView, SettingsPage, ThemedDialog, VersionDialog, _label)
-from theme import (GLYPH, PRESET_LABELS, PRESET_ORDER, THEME, build_qss, qc, rgba)
+from pages import (HomePage, ItemListView, PreserveDialog, SettingsPage, ThemedDialog,
+                   VersionDialog, _label)
+from theme import GLYPH, THEME, build_qss, qc
 from tray import TrayIcon
-from widgets import Card, Glyph, NavButton, Toast
+from widgets import NavButton, Toast
 
 def mode_icon(to_dark: bool) -> QIcon:
     """自绘太阳 / 月亮图标：图标字体缺字时也不会变成怪字符。"""
@@ -195,7 +194,7 @@ class WinBtn(QPushButton):
         self.kind = kind
         self.setToolTip(tip)
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(34, 26)
+        self.setFixedSize(38, 28)
         self.setFlat(True)
         self.setFocusPolicy(Qt.NoFocus)
         self._hover = False
@@ -420,11 +419,11 @@ class MainWindow(QWidget):
         rl.setSpacing(0)
 
         self.header = QWidget()
-        self.header.setFixedHeight(50)
+        self.header.setFixedHeight(46)
         self.header.setMouseTracking(True)
         hl = QHBoxLayout(self.header)
-        hl.setContentsMargins(22, 12, 12, 0)
-        hl.setSpacing(6)
+        hl.setContentsMargins(22, 6, 6, 0)      # 右侧只留 6px，按钮贴住右上角
+        hl.setSpacing(2)
         self.page_title = QLabel("首页")
         fpt = QFont("Microsoft YaHei UI")
         fpt.setPixelSize(15)
@@ -437,7 +436,7 @@ class MainWindow(QWidget):
         self.btn_max = WinBtn("max", "最大化")
         self.btn_close = WinBtn("close", "关闭")
         for b in (self.btn_min, self.btn_max, self.btn_close):
-            hl.addWidget(b)
+            hl.addWidget(b, 0, Qt.AlignTop)
         self.btn_min.clicked.connect(self.showMinimized)
         self.btn_max.clicked.connect(self._toggle_max)
         self.btn_close.clicked.connect(self.close)
@@ -461,6 +460,7 @@ class MainWindow(QWidget):
         self.page_home.row_exclude.connect(self.exclude_item)
         self.page_home.row_repo.connect(self.open_item_repo)
         self.page_home.row_mark.connect(self.mark_version)
+        self.page_home.row_preserve.connect(self.edit_preserve)
 
         self.page_progs = QWidget()
         pl = QVBoxLayout(self.page_progs)
@@ -476,6 +476,7 @@ class MainWindow(QWidget):
         self.progs_list.row_exclude.connect(self.exclude_item)
         self.progs_list.row_repo.connect(self.open_item_repo)
         self.progs_list.row_mark.connect(self.mark_version)
+        self.progs_list.row_preserve.connect(self.edit_preserve)
         pl.addWidget(self.progs_list, 1)
 
         ui = self.cfg.get("ui") or {}
@@ -1071,6 +1072,30 @@ class MainWindow(QWidget):
         else:
             self.toast.show_text(f"已清除「{it.name}」的版本标记，重新检查…")
         QTimer.singleShot(200, self.start_scan)
+
+    def edit_preserve(self, key: str) -> None:
+        """右键「更新时保留的文件夹」：按程序单独指定覆盖安装时保留的目录。"""
+        it = next((i for i in self.items if i.key == key), None)
+        if not it:
+            return
+        if it.kind == "git":
+            self.toast.show_text("Git 仓库按提交拉取更新，不涉及文件覆盖", ok=False)
+            return
+        custom = (self.cfg.get("preserve_map") or {}).get(it.name.lower())
+        dlg = PreserveDialog(self, it.name, it.path, list(it.preserve),
+                             bool(custom and custom.get("custom")))
+        if not dlg.exec():
+            return
+        self.engine.set_preserve_map(it.name, dlg.chosen)
+        it.preserve = self.engine.preserve_for(it.name, {})
+        for view in (self.page_home.list, self.progs_list):
+            row = view.rows.get(it.key)
+            if row is not None:
+                row.refresh()
+        if dlg.chosen is None:
+            self.toast.show_text(f"「{it.name}」已改为跟随全局保留列表")
+        else:
+            self.toast.show_text(f"「{it.name}」将保留 {len(dlg.chosen)} 个文件夹")
 
     def bind_repo(self, key: str) -> None:
         it = next((i for i in self.items if i.key == key), None)

@@ -5,20 +5,20 @@ from __future__ import annotations
 
 from PySide6.QtCore import (QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt,
                             QTimer, Property, Signal)
-from PySide6.QtGui import (QColor, QCursor, QFont, QFontMetrics, QLinearGradient, QPainter,
-                           QPainterPath, QPen)
+from PySide6.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath,
+                           QPen)
 from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
                                QLineEdit, QMenu, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
 
+from backdrop import paint_glass
 from theme import GLYPH, THEME, card_color, qc, rgba
 
 
 def menu_style() -> str:
-    """右键菜单样式（跟随当前主题，用不透明表面色）。"""
+    """右键菜单样式：底板由 ThemedMenu 自绘玻璃，这里只管菜单项。"""
     p = THEME.p
     return (
-        f"QMenu{{background:{p.surface().name()}; color:{p.text};"
-        f" border:1px solid {rgba(p.border, 0.16)}; border-radius:10px; padding:6px;}}"
+        f"QMenu{{background:transparent; color:{p.text}; border:none; padding:6px;}}"
         f"QMenu::item{{padding:7px 24px 7px 10px; border-radius:6px; font-size:12px;}}"
         f"QMenu::item:selected{{background:{rgba(p.accent, 0.18)}; color:{p.accent};}}"
         f"QMenu::item:disabled{{color:{p.text_muted};}}"
@@ -26,6 +26,29 @@ def menu_style() -> str:
         f" margin:5px 8px;}}"
         f"QMenu::icon{{padding-left:6px;}}"
     )
+
+
+class ThemedMenu(QMenu):
+    """玻璃质感的右键菜单：模糊壁纸底板 + 主题色柔化，和主窗口一致。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setStyleSheet(menu_style())
+
+    def paintEvent(self, e):
+        p = THEME.p
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = max(8, min(p.radius_btn + 2, 14))
+        path = paint_glass(painter, rect, radius, self.mapToGlobal(QPoint(0, 0)), p,
+                           THEME.blur_active, 0.88 if not p.dark else 0.82)
+        painter.setPen(QPen(qc(p.border, 0.16), 1))
+        painter.drawPath(path)
+        painter.end()
+        super().paintEvent(e)
 
 
 class Glyph(QLabel):
@@ -241,27 +264,73 @@ class ToggleSwitch(QWidget):
         painter.end()
 
 
-class Badge(QLabel):
-    """小标签：来源、状态。"""
+class Badge(QWidget):
+    """小标签：来源、状态。
 
-    def __init__(self, text: str, color: str = "dim", parent=None):
-        super().__init__(text, parent)
-        self.set_color(color)
-        self.setAlignment(Qt.AlignCenter)
-        self.setFixedHeight(20)
+    自绘而不是靠 QLabel 的 padding —— 布局挤压时 QLabel 的底色会被裁掉，
+    出现「背景没包住文字」；这里按字体度量算宽度，底色必定精确包裹。
+    """
+
+    H = 20
+    PAD_X = 8
+
+    def __init__(self, text: str = "", color: str = "dim", parent=None):
+        super().__init__(parent)
+        self._text = ""
+        self._color = color
         f = QFont("Microsoft YaHei UI")
         f.setPixelSize(11)
         f.setWeight(QFont.DemiBold)
         self.setFont(f)
-        self.setContentsMargins(0, 0, 0, 0)
+        self.setFixedHeight(self.H)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._sync(text)
+
+    # ---------- 属性 ----------
+    def text(self) -> str:
+        return self._text
+
+    def setText(self, text: str) -> None:
+        self._sync(text or "")
 
     def set_color(self, color: str) -> None:
+        self._color = color
+        self.update()
+
+    def _resolved(self) -> str:
         p = THEME.p
-        col = {"dim": p.text_muted, "accent": p.accent, "success": p.success,
-               "warning": p.warning, "danger": p.danger, "text": p.text_dim}.get(color, color)
-        self.setStyleSheet(
-            f"background: {rgba(col, 0.16)}; color: {col};"
-            f"border-radius: 7px; padding: 2px 8px;")
+        return {"dim": p.text_muted, "accent": p.accent, "success": p.success,
+                "warning": p.warning, "danger": p.danger, "text": p.text_dim}.get(self._color,
+                                                                                  self._color)
+
+    def _sync(self, text: str) -> None:
+        self._text = text
+        fm = QFontMetrics(self.font())
+        w = fm.horizontalAdvance(text) + self.PAD_X * 2 if text else 0
+        self.setFixedWidth(w)
+        self.setVisible(bool(text))
+        self.updateGeometry()
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        return QSize(self.width(), self.H)
+
+    # ---------- 绘制 ----------
+    def paintEvent(self, e):
+        if not self._text:
+            return
+        col = QColor(self._resolved())
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 6, 6)
+        bg = QColor(col)
+        bg.setAlphaF(0.16)
+        painter.fillPath(path, bg)
+        painter.setFont(self.font())
+        painter.setPen(qc(col.name(), 0.95))
+        painter.drawText(self.rect(), Qt.AlignCenter, self._text)
+        painter.end()
 
 
 class Chip(QPushButton):
@@ -280,6 +349,9 @@ class Chip(QPushButton):
     def set_active(self, on: bool) -> None:
         self._active = on
         self._apply()
+
+    def is_active(self) -> bool:
+        return self._active
 
     def set_count(self, n: int) -> None:
         self._count = n
@@ -462,6 +534,7 @@ class ProgramRow(QFrame):
     repo_requested = Signal(str)
     exclude_requested = Signal(str)
     mark_requested = Signal(str)
+    preserve_requested = Signal(str)
 
     def __init__(self, item, parent=None):
         super().__init__(parent)
@@ -705,8 +778,7 @@ class ProgramRow(QFrame):
     # ---------- 右键菜单 ----------
     def contextMenuEvent(self, e):
         it = self.item
-        m = QMenu(self)
-        m.setStyleSheet(menu_style())
+        m = ThemedMenu(self)
         busy = it.state == "running"
         act_update = m.addAction("立即更新")
         act_update.setEnabled(not busy and it.status in ("update", "unknown", "error")
@@ -721,6 +793,8 @@ class ProgramRow(QFrame):
                                else "打开 GitHub 仓库（未绑定）")
         act_repo.setEnabled(bool(it.repo))
         act_mark = m.addAction("手动标记本地版本…")
+        act_preserve = m.addAction("更新时保留的文件夹…")
+        act_preserve.setEnabled(it.kind != "git")
         m.addSeparator()
         act_open = m.addAction("打开所在文件夹")
         act_copy = m.addAction("复制文件夹路径")
@@ -740,6 +814,8 @@ class ProgramRow(QFrame):
             self.repo_requested.emit(it.key)
         elif act is act_mark:
             self.mark_requested.emit(it.key)
+        elif act is act_preserve:
+            self.preserve_requested.emit(it.key)
         elif act is act_open:
             self.open_requested.emit(it.key)
         elif act is act_copy:
@@ -935,16 +1011,16 @@ class SegmentedControl(QFrame):
 
 
 class _MenuPanel(QFrame):
-    """弹出面板的圆角底板（自绘，跟随主题）。"""
+    """弹出面板的圆角底板（玻璃质感，跟随主题）。"""
 
     def paintEvent(self, e):
         p = THEME.p
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        path = QPainterPath()
-        path.addRoundedRect(rect, 10, 10)
-        painter.fillPath(path, qc(p.surface(), 1.0))
+        radius = max(8, min(p.radius_btn + 2, 14))
+        path = paint_glass(painter, rect, radius, self.mapToGlobal(QPoint(0, 0)), p,
+                           THEME.blur_active, 0.88 if not p.dark else 0.82)
         painter.setPen(QPen(qc(p.border, 0.20), 1))
         painter.drawPath(path)
         painter.end()
@@ -1364,15 +1440,14 @@ class SettingRow(Card):
         self.title_lbl.setFont(ft)
         self.title_lbl.setStyleSheet(f"color: {THEME.p.text}; background: transparent;")
         col.addWidget(self.title_lbl)
-        self.desc_lbl = None
-        if desc:
-            self.desc_lbl = QLabel(desc)
-            fd = QFont("Microsoft YaHei UI")
-            fd.setPixelSize(11)
-            self.desc_lbl.setFont(fd)
-            self.desc_lbl.setWordWrap(True)
-            self.desc_lbl.setStyleSheet(f"color: {THEME.p.text_muted}; background: transparent;")
-            col.addWidget(self.desc_lbl)
+        self.desc_lbl = QLabel(desc)
+        fd = QFont("Microsoft YaHei UI")
+        fd.setPixelSize(11)
+        self.desc_lbl.setFont(fd)
+        self.desc_lbl.setWordWrap(True)
+        self.desc_lbl.setStyleSheet(f"color: {THEME.p.text_muted}; background: transparent;")
+        self.desc_lbl.setVisible(bool(desc))
+        col.addWidget(self.desc_lbl)
         line.addLayout(col, 1)
 
         if control is not None:
@@ -1384,8 +1459,8 @@ class SettingRow(Card):
         self.setMinimumHeight(58)
 
     def set_desc(self, text: str) -> None:
-        if self.desc_lbl is not None:
-            self.desc_lbl.setText(text)
+        self.desc_lbl.setText(text)
+        self.desc_lbl.setVisible(bool(text))
 
 
 class SettingGroup(QLabel):
