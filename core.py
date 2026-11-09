@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.3.4"
+APP_VERSION = "1.3.5"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -428,6 +428,13 @@ def http_json(url: str, proxy: str | None, mirrors=None, retries: int = 2):
 
 def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
              deadline: float = 0) -> bool:
+    """下载到 dest，支持断点续传。
+
+    实际写入 dest.part：下载中断时保留已传字节，下一次（或换下一个候选源）
+    带 Range 头从断点继续；服务器不支持 Range（返回非 206）时自动从头重下。
+    只有所有候选源都失败才返回 False，.part 仍保留待续传。
+    """
+    part = dest + ".part"
     cands = []
     if proxy:
         cands.append((proxy, url))
@@ -438,22 +445,35 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
         if deadline and time.time() > deadline:
             return False
         try:
-            with http_get(u, proxy=px, timeout=180) as r, open(dest, "wb") as f:
-                total = int(r.headers.get("Content-Length") or 0)
-                done = 0
-                while True:
-                    if cancel is not None and cancel.is_set():
-                        return False
-                    if deadline and time.time() > deadline:
-                        raise UpdateTimeout("下载超时")
-                    chunk = r.read(256 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    done += len(chunk)
-                    if progress_cb and total:
-                        progress_cb(done / total)
-            if os.path.getsize(dest) > 1024:
+            have = os.path.getsize(part) if os.path.exists(part) else 0
+            headers = {"Range": f"bytes={have}-"} if have > 0 else None
+            with http_get(u, proxy=px, timeout=180, headers=headers) as r:
+                code = int(getattr(r, "status", 0) or 200)
+                if have > 0 and code != 206:
+                    # 服务器不支持续传：丢弃旧数据从头下
+                    have = 0
+                cl = int(r.headers.get("Content-Length") or 0)
+                total = have + cl if code == 206 else cl
+                done = have
+                mode = "ab" if have > 0 else "wb"
+                with open(part, mode) as f:
+                    while True:
+                        if cancel is not None and cancel.is_set():
+                            return False          # 保留 .part，下次继续
+                        if deadline and time.time() > deadline:
+                            raise UpdateTimeout("下载超时")
+                        chunk = r.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        if progress_cb and total:
+                            progress_cb(min(1.0, done / total))
+                if total and done < total:
+                    # 连接提前中断：抛错换下一个候选源（.part 保留，下次续传）
+                    raise IOError(f"连接中断于 {done}/{total}")
+            if os.path.getsize(part) > 1024:
+                shutil.move(part, dest)
                 return True
         except UpdateTimeout:
             return False
@@ -1084,8 +1104,15 @@ class Engine:
 
         tmp = tempfile.mkdtemp(prefix="autoupd_")
         try:
-            archive = os.path.join(tmp, it.asset or "package.zip")
-            pr(0.02, "下载中")
+            # 下载放进持久缓存：中断后下次从断点继续，而不是从头再来
+            cache_dir = os.path.join(config_dir(), "dlcache")
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+            except Exception:
+                cache_dir = tmp
+            safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{it.name}_{it.asset or 'package.zip'}")
+            archive = os.path.join(cache_dir, safe)
+            pr(0.02, "下载中（支持断点续传）")
             ok = download(it.download_url, archive, self.proxy, self.mirrors(),
                           progress_cb=lambda p: pr(0.02 + p * 0.6, "下载中"),
                           cancel=self.cancel, deadline=self._deadline)
@@ -1139,6 +1166,12 @@ class Engine:
             it.local = it.remote or it.local
             self.records["versions"][it.name] = it.remote
             self._stamp_update(it)
+            # 更新成功：清掉下载缓存（本次压缩包 + 其它历史残留）
+            for f in glob.glob(os.path.join(cache_dir, "*")):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
             pr(1.0, "完成")
             return it
         finally:

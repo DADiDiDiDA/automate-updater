@@ -7,6 +7,7 @@ import ctypes
 import math
 import os
 import sys
+import winreg
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (QColor, QFont, QGuiApplication, QIcon, QLinearGradient, QPainter,
@@ -319,7 +320,6 @@ class MainWindow(QWidget):
         self._undo_worker = None
         self._background_update = start_hidden
         self._quitting = False
-        self._tray_hint_shown = False
         self._dragging = False
         self._drag_pos = QPoint()
         self._bg = None
@@ -1258,13 +1258,9 @@ class MainWindow(QWidget):
         bg = self.cfg.get("background", {})
         if (not self._quitting and bg.get("close_to_tray", True)
                 and self.tray is not None and self.tray.isVisible()):
+            # 静默驻留托盘，不弹任何提示（托盘图标本身已说明程序在后台）
             e.ignore()
             self.hide()
-            if not self._tray_hint_shown:
-                self._tray_hint_shown = True
-                self.tray.notify("已最小化到托盘",
-                                 "程序仍在后台运行，会按设置定时检查更新。\n右键托盘图标可静默更新或退出。",
-                                 5000)
             return
         self._save_cfg()
         if self.scan_worker and self.scan_worker.isRunning():
@@ -1300,9 +1296,19 @@ def main() -> int:
     f.setPixelSize(13)
     app.setFont(f)
 
-    # Windows 通知需要显式的 AppUserModelID，否则托盘消息不一定弹出
+    # Windows 通知需要显式的 AppUserModelID；同时在注册表里登记显示名，
+    # 否则通知横幅标题直接显示 AUMID 字符串（之前是硬编码的 GitHub 用户名）
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("DADiDiDiDA.AutomateUpdater")
+        aumid = f"{core.APP_ID}.Tray"
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(aumid)
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, rf"Software\Classes\AppUserModelId\{aumid}",
+            0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
+        winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, core.APP_NAME)
+        ico = resource_path("assets/icon.ico")
+        if os.path.exists(ico):
+            winreg.SetValueEx(key, "IconUri", 0, winreg.REG_SZ, os.path.abspath(ico))
+        winreg.CloseKey(key)
     except Exception:
         pass
 
