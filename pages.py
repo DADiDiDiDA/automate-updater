@@ -46,6 +46,7 @@ class ItemListView(QWidget):
     row_exclude = Signal(str)
     row_repo = Signal(str)
     row_mark = Signal(str)
+    row_undo = Signal(str)
     row_preserve = Signal(str)
     sort_changed = Signal(str)
     prior_changed = Signal(str)
@@ -56,7 +57,8 @@ class ItemListView(QWidget):
     # 基础排序（决定整体顺序）
     BASES = [("name", "名称 A→Z"), ("name_desc", "名称 Z→A"),
              ("size_desc", "体积 大→小"), ("size_asc", "体积 小→大"),
-             ("recent", "最近发布"), ("old", "最早发布")]
+             ("recent", "最近发布"), ("old", "最早发布"),
+             ("updated_desc", "最近更新"), ("updated_asc", "最早更新")]
     # 特殊规则（在基础顺序上把一类项提到最前）
     PRIORS = [("update", "有更新最先"), ("none", "不额外排序"),
               ("git", "Git 优先"), ("release", "Release 优先")]
@@ -95,7 +97,7 @@ class ItemListView(QWidget):
         self.search.textChanged.connect(self._on_search)
         bar.addWidget(self.search)
         self.base_combo = ThemedCombo(self.BASES, self.sort_key, 122)
-        self.base_combo.setToolTip("基础排序：名称 / 体积 / 发布时间")
+        self.base_combo.setToolTip("基础排序：名称 / 体积 / 发布时间 / 上次更新时间")
         self.base_combo.changed.connect(self._on_sort)
         bar.addWidget(self.base_combo)
 
@@ -141,6 +143,7 @@ class ItemListView(QWidget):
             row.exclude_requested.connect(self.row_exclude)
             row.repo_requested.connect(self.row_repo)
             row.mark_requested.connect(self.row_mark)
+            row.undo_requested.connect(self.row_undo)
             row.preserve_requested.connect(self.row_preserve)
             self.rows[it.key] = row
             self.list_lay.insertWidget(self.list_lay.count() - 1, row)
@@ -162,6 +165,12 @@ class ItemListView(QWidget):
         elif k == "old":
             items = sorted(self.items, key=lambda i: (i.published or "9999-99-99",
                                                       i.name.lower()))
+        elif k == "updated_desc":
+            # 没记录更新时间的排在最后（"0" 最小，反向后落在尾部）
+            items = sorted(self.items, key=lambda i: (i.updated_at or "0", i.name.lower()),
+                           reverse=True)
+        elif k == "updated_asc":
+            items = sorted(self.items, key=lambda i: (i.updated_at or "9999", i.name.lower()))
         else:
             items = sorted(self.items, key=lambda i: i.name.lower())
         pri = self.prior
@@ -288,6 +297,7 @@ class HomePage(QWidget):
     row_exclude = Signal(str)
     row_repo = Signal(str)
     row_mark = Signal(str)
+    row_undo = Signal(str)
     row_preserve = Signal(str)
     sort_changed = Signal(str)
     prior_changed = Signal(str)
@@ -358,6 +368,8 @@ class HomePage(QWidget):
         self.list.row_exclude.connect(self.row_exclude)
         self.list.row_repo.connect(self.row_repo)
         self.list.row_mark.connect(self.row_mark)
+        self.list.row_undo.connect(self.row_undo)
+        self.list.row_preserve.connect(self.row_preserve)
         self.list.sort_changed.connect(self.sort_changed)
         self.list.prior_changed.connect(self.prior_changed)
         lay.addWidget(self.list, 1)

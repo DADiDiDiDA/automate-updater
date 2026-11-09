@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -549,6 +549,7 @@ class Item:
     version_spec: dict = field(default_factory=dict)
     state: str = "idle"            # idle | queued | running | done | failed
     scanned: bool = False          # 是否已完成本次检查
+    updated_at: str = ""           # 上次通过本程序更新成功的时间（排序用）
     progress: float = 0.0
     message: str = ""
     error: str = ""
@@ -625,7 +626,7 @@ class Engine:
             with open(self.records_path, encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            return {"versions": {}, "last_scan": ""}
+            return {"versions": {}, "update_times": {}, "last_scan": ""}
 
     def save_records(self) -> None:
         try:
@@ -838,6 +839,7 @@ class Engine:
 
     # ---------- 扫描单个对象 ----------
     def scan_item(self, it: Item) -> Item:
+        it.updated_at = (self.records.get("update_times") or {}).get(it.name, "")
         if not it.local_size:
             it.local_size = dir_size(it.path)
         try:
@@ -1028,6 +1030,11 @@ class Engine:
             it.detail = short(str(e), 120)
             return it
 
+    def _stamp_update(self, it: Item) -> None:
+        """记录「上次更新时间」，供排序使用。"""
+        self.records.setdefault("update_times", {})[it.name] = time.strftime("%Y-%m-%d %H:%M:%S")
+        it.updated_at = self.records["update_times"][it.name]
+
     def _update_git(self, it: Item, on_progress=None) -> Item:
         repo = it.path
         ok, how, err = self._git_fetch(repo)
@@ -1049,6 +1056,7 @@ class Engine:
             it.local = (git(repo, ["rev-parse", "--short", "HEAD"]).stdout or "").strip()
             it.detail = f"已更新到 {it.local}"
             it.remote = it.local
+            self._stamp_update(it)
             return it
         it.state, it.status = "failed", "error"
         it.detail = short((r.stderr or r.stdout), 120)
@@ -1111,6 +1119,11 @@ class Engine:
                 try:
                     it.archived = backup_dir(it.path, it.name,
                                              int(self.cfg.get("backup", {}).get("keep", 2)))
+                    # 备份里记下旧版本号，供「撤销上次更新」还原
+                    with open(os.path.join(it.archived, "_updater_undo.json"), "w",
+                              encoding="utf-8") as f:
+                        json.dump({"version": it.local, "time": time.strftime("%Y-%m-%d %H:%M:%S")},
+                                  f, ensure_ascii=False)
                 except Exception:
                     it.archived = ""
 
@@ -1125,10 +1138,57 @@ class Engine:
             it.state, it.status = "done", "latest"
             it.local = it.remote or it.local
             self.records["versions"][it.name] = it.remote
+            self._stamp_update(it)
             pr(1.0, "完成")
             return it
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def undo_update(self, it: Item, on_progress=None) -> Item:
+        """撤销上次更新：把最近一次备份还原回程序目录。"""
+        def pr(p, msg=""):
+            it.progress = p
+            if msg:
+                it.message = msg
+            if on_progress:
+                on_progress(it, p, msg)
+
+        it.state = "running"
+        pr(0.1, "查找备份")
+        cands = []
+        if it.archived and os.path.isdir(it.archived):
+            cands.append(it.archived)
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", it.name)
+        cache = os.path.join(os.path.dirname(it.path.rstrip(os.sep)), "Cache", "_backup")
+        cands += sorted(glob.glob(os.path.join(cache, safe + "_*")),
+                        key=os.path.getmtime, reverse=True)
+        bk = next((c for c in cands if os.path.isdir(c)), "")
+        if not bk:
+            it.state, it.status = "failed", "error"
+            it.detail = "没有可用的备份，无法撤销（备份关闭或从未更新过）"
+            return it
+        ver = ""
+        try:
+            with open(os.path.join(bk, "_updater_undo.json"), encoding="utf-8") as f:
+                ver = (json.load(f).get("version") or "").strip()
+        except Exception:
+            pass
+        pr(0.5, "还原备份")
+        try:
+            removed, copied = clean_replace(bk, it.path, it.preserve)
+        except Exception as e:
+            it.state, it.status = "failed", "error"
+            it.detail = f"还原失败：{short(str(e), 90)}"
+            return it
+        if ver:
+            self.records["versions"][it.name] = ver
+            self.save_records()
+        it.local = ver or it.local
+        it.state = "done"
+        it.status = "update" if (it.remote and ver and it.remote != ver) else "latest"
+        it.detail = f"已撤销更新，恢复到 {ver or '备份版本'}（清理 {removed} 项，还原 {copied} 项）"
+        pr(1.0, "完成")
+        return it
 
     # ---------- 通知 ----------
     def send_dingtalk(self, text: str, title: str = APP_NAME) -> bool:

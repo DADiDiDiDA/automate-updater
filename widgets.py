@@ -713,6 +713,7 @@ class ProgramRow(QFrame):
     repo_requested = Signal(str)
     exclude_requested = Signal(str)
     mark_requested = Signal(str)
+    undo_requested = Signal(str)
     preserve_requested = Signal(str)
 
     def __init__(self, item, parent=None):
@@ -962,6 +963,9 @@ class ProgramRow(QFrame):
         act_update = m.addAction("立即更新")
         act_update.setEnabled(not busy and it.status in ("update", "unknown", "error")
                               and it.status != "unbound")
+        act_undo = m.addAction("撤销上次更新")
+        act_undo.setEnabled(not busy and it.kind != "git")   # git 仓库无备份，无法还原
+        act_undo.setToolTip("把程序目录还原到最近一次更新前的备份")
         act_bind = None
         if it.status == "unbound" or not it.repo:
             act_bind = m.addAction("绑定 GitHub 仓库…")
@@ -985,6 +989,8 @@ class ProgramRow(QFrame):
             return
         if act is act_update:
             self.update_requested.emit(it.key)
+        elif act is act_undo:
+            self.undo_requested.emit(it.key)
         elif act_bind is not None and act is act_bind:
             self.bind_requested.emit(it.key)
         elif act_log is not None and act is act_log:

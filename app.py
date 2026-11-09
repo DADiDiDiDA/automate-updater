@@ -149,6 +149,22 @@ class UpdateWorker(QThread):
             self.finished_all.emit(self.items)
 
 
+class UndoWorker(QThread):
+    """撤销上次更新：把最近一次备份还原回程序目录。"""
+
+    done = Signal(object)
+
+    def __init__(self, engine: core.Engine, item):
+        super().__init__()
+        self.engine = engine
+        self.item = item
+
+    def run(self):
+        res = self.engine.undo_update(
+            self.item, on_progress=lambda i, p, m=None: None)
+        self.done.emit(res)
+
+
 class PrepareWorker(QThread):
     """扫描前的准备工作：探测代理、测速镜像。"""
 
@@ -299,6 +315,8 @@ class MainWindow(QWidget):
         self.tray: TrayIcon | None = None
         self._silent_scan = start_hidden
         self._last_upd_sig = None   # 上次弹过通知的待更新名单，避免重复弹窗
+        self._pending_updates: list = []   # 更新任务运行中点「更新」的待更新队列
+        self._undo_worker = None
         self._background_update = start_hidden
         self._quitting = False
         self._tray_hint_shown = False
@@ -461,6 +479,7 @@ class MainWindow(QWidget):
         self.page_home.row_exclude.connect(self.exclude_item)
         self.page_home.row_repo.connect(self.open_item_repo)
         self.page_home.row_mark.connect(self.mark_version)
+        self.page_home.row_undo.connect(self.undo_update)
         self.page_home.row_preserve.connect(self.edit_preserve)
 
         self.page_progs = QWidget()
@@ -477,6 +496,7 @@ class MainWindow(QWidget):
         self.progs_list.row_exclude.connect(self.exclude_item)
         self.progs_list.row_repo.connect(self.open_item_repo)
         self.progs_list.row_mark.connect(self.mark_version)
+        self.progs_list.row_undo.connect(self.undo_update)
         self.progs_list.row_preserve.connect(self.edit_preserve)
         pl.addWidget(self.progs_list, 1)
 
@@ -930,6 +950,10 @@ class MainWindow(QWidget):
         self._last_upd_sig = sig
         bg = self.cfg.get("background", {})
         mode = bg.get("auto_mode", "off")
+        if mode == "off":
+            # 用户选了「不自动处理」：不弹任何托盘通知（图标角标已展示数量），
+            # 打开主界面即可看到详情
+            return
         names = "、".join(i.name for i in upd[:6]) + ("…" if len(upd) > 6 else "")
         if mode in ("silent", "notify"):
             if mode == "notify":
@@ -979,8 +1003,23 @@ class MainWindow(QWidget):
 
     def _start_update(self, targets, background: bool = False) -> None:
         if self.update_worker and self.update_worker.isRunning():
-            self.toast.show_text("已有更新任务在进行中")
+            # 已有任务在跑：不丢弃请求，加入待更新队列，本轮结束后自动继续
+            run = {t.key for t in targets}
+            run |= {t.key for t in getattr(self, "_running_targets", [])}
+            queued = {t.key for t in self._pending_updates}
+            fresh = [t for t in targets
+                     if t.key not in queued and t.key not in run]
+            if fresh:
+                self._pending_updates.extend(fresh)
+                self.toast.show_text(
+                    f"更新任务进行中，已把 {len(fresh)} 个程序加入队列")
+            else:
+                self.toast.show_text("所选程序已在更新队列里")
             return
+        self._launch_update(targets, background)
+
+    def _launch_update(self, targets, background: bool = False) -> None:
+        self._running_targets = list(targets)
         self._background_update = background
         self.engine.cancel.clear()
         if not background:
@@ -1032,6 +1071,12 @@ class MainWindow(QWidget):
         if self.tray is not None:
             self.tray.set_busy(False)
             self.tray.set_tooltip(self.engine.records.get("last_scan", ""), left)
+        # 队列里还有待更新程序：稍等上一个 worker 退出后自动开跑
+        self._running_targets = []
+        if self._pending_updates:
+            nxt = self._pending_updates[:]
+            self._pending_updates = []
+            QTimer.singleShot(300, lambda: self._launch_update(nxt, background))
         # 后台模式：静默更新时不打扰；「更新后提示」才发通知
         mode = self.cfg.get("background", {}).get("auto_mode", "off")
         if background:
@@ -1080,6 +1125,35 @@ class MainWindow(QWidget):
         else:
             self.toast.show_text(f"已清除「{it.name}」的版本标记，重新检查…")
         QTimer.singleShot(200, self.start_scan)
+
+    def undo_update(self, key: str) -> None:
+        """右键「撤销上次更新」：把最近一次备份还原回程序目录。"""
+        it = next((i for i in self.items if i.key == key), None)
+        if not it:
+            return
+        if it.kind == "git":
+            self.toast.show_text("Git 仓库按提交拉取，没有备份可还原", ok=False)
+            return
+        if it.state == "running":
+            self.toast.show_text(f"{it.name} 正在更新，等结束后再撤销", ok=False)
+            return
+        if self._undo_worker and self._undo_worker.isRunning():
+            self.toast.show_text("已有一个撤销任务在进行中", ok=False)
+            return
+        self.toast.show_text(f"正在把 {it.name} 还原到更新前的备份…")
+        self._undo_worker = UndoWorker(self.engine, it)
+        self._undo_worker.done.connect(self._on_undo_done)
+        self._undo_worker.start()
+
+    def _on_undo_done(self, it) -> None:
+        ok = it.state == "done"
+        self.toast.show_text(f"{it.name}：{it.detail}", ok=ok)
+        for i, old in enumerate(self.items):
+            if old.key == it.key:
+                self.items[i] = it
+        self.page_home.update_item(it)
+        self.progs_list.update_item(it)
+        self.page_home.refresh_stats()
 
     def edit_preserve(self, key: str) -> None:
         """右键「更新时保留的文件夹」：按程序单独指定覆盖安装时保留的目录。"""
