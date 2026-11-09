@@ -8,7 +8,8 @@ from PySide6.QtCore import (QEasingCurve, QEvent, QEventLoop, QPoint, QPointF,
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath,
                            QPen)
 from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
-                               QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
+                               QLineEdit, QPlainTextEdit, QPushButton, QSizePolicy, QVBoxLayout,
+                               QWidget)
 
 from backdrop import BACKDROP, paint_glass
 from theme import GLYPH, THEME, card_color, flat, qc, rgba, scoped, tint
@@ -342,7 +343,7 @@ class Card(QFrame):
             g.setColorAt(1.0, QColor(255, 255, 255, 0))
             painter.fillPath(path, g)
 
-        painter.setPen(QPen(qc(p.border, p.border_alpha if not p.dark else p.border_alpha * 1.0), 1))
+        painter.setPen(QPen(qc(p.border, p.border_alpha), 1))
         painter.drawPath(path)
         painter.end()
 
@@ -856,9 +857,12 @@ class ProgramRow(QFrame):
         ft.setPixelSize(11)
         ft.setWeight(QFont.DemiBold)
         self.notes_title.setFont(ft)
-        self.notes_text = QLabel()
-        self.notes_text.setWordWrap(True)
-        self.notes_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # 用可滚动的只读文本框：长 release notes 直接塞 QLabel 会把列表行撑成巨型卡片
+        self.notes_text = QPlainTextEdit()
+        self.notes_text.setObjectName("notesText")
+        self.notes_text.setReadOnly(True)
+        self.notes_text.setMaximumHeight(180)
+        self.notes_text.setFrameShape(QFrame.NoFrame)
         fnt = QFont("Microsoft YaHei UI")
         fnt.setPixelSize(12)
         self.notes_text.setFont(fnt)
@@ -877,6 +881,9 @@ class ProgramRow(QFrame):
     def refresh(self) -> None:
         p = THEME.p
         it = self.item
+        # 作用域样式：别让 QPlainTextEdit 的白色视口在深色主题里变成一块白板
+        self.notes_text.setStyleSheet(
+            f"#notesText{{background: transparent; border: none; color: {p.text};}}")
         self.name_lbl.setText(it.name)
         tint(self.name_lbl, p.text)
         if it.state == "running":
@@ -942,7 +949,7 @@ class ProgramRow(QFrame):
             self.notes_title.setText(
                 f"更新日志 · {it.published}" if it.published and it.kind != "git"
                 else ("提交记录" if it.kind == "git" else "更新日志"))
-            self.notes_text.setText(it.notes[:4000])
+            self.notes_text.setPlainText(it.notes or "")
 
         # 按钮状态
         if it.status == "unbound":
@@ -1089,12 +1096,16 @@ class Toast(QWidget):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._fade_out)
+        # 可取消的隐藏定时器，避免残留回调把下一条 Toast 一起隐藏
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(lambda: self.setVisible(False))
 
     def show_text(self, text: str, ok: bool = True) -> None:
         p = THEME.p
         self.lbl.setText(text)
         tint(self.lbl, p.text)
-        border = qc(p.danger, 0.45).name() if not ok else rgba(p.border, 0.22)
+        border = rgba(p.danger, 0.45) if not ok else rgba(p.border, 0.22)
         # 带 #toast 选择器：无选择器的规则会级联到子 QLabel，给文字画出一圈多余边框
         self.setStyleSheet(
             f"#toast{{background: {rgba(p.surface(), 0.97)};"
@@ -1105,6 +1116,7 @@ class Toast(QWidget):
         self.raise_()                 # 页面重建后可能盖住 Toast，置顶再显示
         self.effect.setOpacity(0.0)
         self.setVisible(True)
+        self._hide_timer.stop()
         self._anim.stop()
         self._anim.setDuration(160)
         self._anim.setStartValue(0.0)
@@ -1118,32 +1130,9 @@ class Toast(QWidget):
         self._anim.setStartValue(1.0)
         self._anim.setEndValue(0.0)
         self._anim.start()
-        QTimer.singleShot(280, lambda: self.setVisible(False))
+        self._hide_timer.start(280)
 
 
-class SectionHead(QWidget):
-    """设置页分组标题。"""
-
-    def __init__(self, title: str, desc: str = "", parent=None):
-        super().__init__(parent)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(2)
-        t = QLabel(title)
-        f = QFont("Microsoft YaHei UI")
-        f.setPixelSize(14)
-        f.setWeight(QFont.DemiBold)
-        t.setFont(f)
-        tint(t, THEME.p.text)
-        lay.addWidget(t)
-        if desc:
-            d = QLabel(desc)
-            fd = QFont("Microsoft YaHei UI")
-            fd.setPixelSize(11)
-            d.setFont(fd)
-            d.setWordWrap(True)
-            tint(d, THEME.p.text_muted)
-            lay.addWidget(d)
 
 
 class SegmentedControl(QFrame):
@@ -1588,11 +1577,11 @@ class ExpandSetting(Card):
         self.title_lbl.setFont(ft)
         tint(self.title_lbl, THEME.p.text)
         col.addWidget(self.title_lbl)
-        self.desc_lbl = QLabel(desc, self)
+        # WrapLabel：窗口变窄折行时不会被裁掉半行（普通 QLabel 只按单行高度分配）
+        self.desc_lbl = WrapLabel(desc, self)
         fd = QFont("Microsoft YaHei UI")
         fd.setPixelSize(11)
         self.desc_lbl.setFont(fd)
-        self.desc_lbl.setWordWrap(True)
         tint(self.desc_lbl, THEME.p.text_muted)
         col.addWidget(self.desc_lbl)
         self.desc_lbl.setVisible(bool(desc))    # 有父级之后再显示，否则会变成顶层小窗
@@ -1675,11 +1664,11 @@ class SettingRow(Card):
         self.title_lbl.setFont(ft)
         tint(self.title_lbl, THEME.p.text)
         col.addWidget(self.title_lbl)
-        self.desc_lbl = QLabel(desc, self)
+        # WrapLabel：窗口变窄折行时不会被裁掉半行（普通 QLabel 只按单行高度分配）
+        self.desc_lbl = WrapLabel(desc, self)
         fd = QFont("Microsoft YaHei UI")
         fd.setPixelSize(11)
         self.desc_lbl.setFont(fd)
-        self.desc_lbl.setWordWrap(True)
         tint(self.desc_lbl, THEME.p.text_muted)
         col.addWidget(self.desc_lbl)
         self.desc_lbl.setVisible(bool(desc))    # 有父级之后再显示，否则会变成顶层小窗

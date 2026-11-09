@@ -150,10 +150,13 @@ class Backdrop:
                 img = None
         if img is None:
             # 无壁纸（纯色桌面）时造一个柔和的渐变图
-            img = Image.new("RGB", (1600, 900), (32, 40, 60))
+            # 一列像素做竖向渐变再横向拉伸，避免 18 万次空循环
+            grad = Image.new("RGB", (1, 900))
+            gp = grad.load()
             for y in range(900):
-                for x in range(0, 1600, 8):
-                    pass
+                t = y / 899.0
+                gp[0, y] = (int(32 + 16 * t), int(40 + 18 * t), int(60 + 26 * t))
+            img = grad.resize((1600, 900), Image.BILINEAR)
         self._wall = img
         return img
 

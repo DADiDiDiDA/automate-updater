@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -261,7 +261,8 @@ def _normalize(cfg: dict) -> dict:
     if s in ("update", "git", "release"):
         cfg["ui"]["prior"] = s
         cfg["ui"]["sort"] = "name"
-    elif s not in ("name", "name_desc", "size_desc", "size_asc", "recent", "old"):
+    elif s not in ("name", "name_desc", "size_desc", "size_asc", "recent", "old",
+                   "updated_desc", "updated_asc"):
         cfg["ui"]["sort"] = "name"
     if cfg["ui"].get("prior") not in ("update", "none", "git", "release"):
         cfg["ui"]["prior"] = "update"
@@ -421,6 +422,9 @@ class UpdateTimeout(Exception):
 
 def detect_proxy(ports) -> str | None:
     for p in ports or []:
+        # 1080/1081 是常见的 SOCKS 端口，ProxyHandler 根本用不了，别误判成 HTTP 代理
+        if int(p) in (1080, 1081):
+            continue
         s = socket.socket()
         s.settimeout(0.2)
         try:
@@ -448,7 +452,8 @@ def _probe(session_url: str) -> float | None:
     t0 = time.time()
     try:
         with http_get(session_url, timeout=5) as r:
-            r.read(128)
+            # 读 64KB 才是「测速」；只读 128 字节测的其实是首字节延迟
+            r.read(65536)
         return time.time() - t0
     except Exception:
         return None
@@ -477,37 +482,44 @@ def probe_mirrors(mirrors, wait: float = 12) -> list:
     return out
 
 
-def pick_mirror(mirrors, proxy: str | None = None) -> str | None:
-    """并行竞速测试镜像，返回最快的；都不可用返回 None。"""
-    ranked = probe_mirrors(mirrors)
-    return ranked[0][1] if ranked else None
 
 
-def http_json(url: str, proxy: str | None, mirrors=None, retries: int = 2):
-    """请求 JSON：代理 → 直连 → 镜像转发，依次尝试。"""
+def http_json(url: str, proxy: str | None, mirrors=None, retries: int = 1,
+              deadline: float = 0):
+    """请求 JSON：代理 → 最快镜像 → 直连 → 其余镜像，带总时限。
+
+    以前是「直连 + 12 个镜像 × 20s × 2 次重试」串行回退，最坏要 8 分钟，
+    而且完全没有用上测速结果。现在 mirrors 已由 Engine.mirrors() 把 chosen
+    排到首位，并对整条回退链加一个总 deadline。
+    """
+    ms = [m for m in (mirrors or []) if m]
+    preferred = ms[0] if ms else None
     cands = []
     if proxy:
         cands.append((proxy, url))
+    if preferred:
+        cands.append((None, preferred.rstrip("/") + "/" + url))
     cands.append((None, url))
-    for m in mirrors or []:
-        cands.append((None, m + url))
+    for m in (ms[1:] if preferred else []):
+        cands.append((None, m.rstrip("/") + "/" + url))
     for px, u in cands:
-        for _ in range(retries):
+        if deadline and time.time() > deadline:
+            return None
+        for _ in range(max(1, retries)):
             try:
-                with http_get(u, proxy=px, timeout=20,
+                with http_get(u, proxy=px, timeout=10,
                               headers={"Accept": "application/vnd.github+json"}) as r:
                     return json.load(r)
             except urllib.error.HTTPError as e:
                 if e.code == 404:
                     return None
-                time.sleep(1)
             except Exception:
-                time.sleep(1)
+                pass
     return None
 
 
 def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
-             deadline: float = 0) -> bool:
+             deadline: float = 0, expect_size: int = 0) -> bool:
     """下载到 dest，支持断点续传。
 
     实际写入 dest.part：下载中断时保留已传字节，下一次（或换下一个候选源）
@@ -552,7 +564,12 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
                 if total and done < total:
                     # 连接提前中断：抛错换下一个候选源（.part 保留，下次续传）
                     raise IOError(f"连接中断于 {done}/{total}")
-            if os.path.getsize(part) > 1024:
+            got = os.path.getsize(part) if os.path.exists(part) else 0
+            if expect_size and got != expect_size:
+                # GitHub API 给了 asset.size，用来挡住「无 Content-Length 时断连也当成功」
+                os.remove(part)
+                raise IOError(f"文件大小不符：{got}/{expect_size}")
+            if got > 1024:
                 shutil.move(part, dest)
                 return True
         except UpdateTimeout:
@@ -569,6 +586,10 @@ def ver_tuple(s: str):
 
 
 def ver_gt(a: str, b: str) -> bool:
+    # 稳定版不该被 beta / rc / nightly 之类的预发布 tag 顶掉
+    pre = re.compile(r"(?i)(alpha|beta|rc\d*|pre|dev|nightly|snapshot)")
+    if pre.search(a or "") and not pre.search(b or ""):
+        return False
     ta, tb = ver_tuple(a), ver_tuple(b)
     if not ta or not tb:
         return bool(ta) and not tb
@@ -578,12 +599,6 @@ def ver_gt(a: str, b: str) -> bool:
     return ta > tb
 
 
-def fmt_size(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} GB"
 
 
 def short(s: str, n: int = 160) -> str:
@@ -614,14 +629,6 @@ def dir_size(path: str, max_files: int = 30000) -> int:
     return total
 
 
-def human_size(n: int) -> str:
-    step = 1024.0
-    v = float(n or 0)
-    for unit in ("B", "KB", "MB", "GB"):
-        if v < step or unit == "GB":
-            return (f"{v:.0f} {unit}" if unit == "B" else f"{v:.1f} {unit}")
-        v /= step
-    return f"{v:.1f} GB"
 
 
 @dataclass
@@ -722,11 +729,19 @@ class Engine:
         return os.path.join(config_dir(), "records.json")
 
     def _load_records(self) -> dict:
+        out = {"versions": {}, "update_times": {}, "last_scan": ""}
         try:
             with open(self.records_path, encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            if isinstance(data, dict):
+                out.update(data)
         except Exception:
-            return {"versions": {}, "update_times": {}, "last_scan": ""}
+            pass
+        # 旧文件可能缺键，后面都是直接 self.records["versions"][name] 索引
+        for k, v in (("versions", {}), ("update_times", {}), ("last_scan", "")):
+            if not isinstance(out.get(k), type(v)):
+                out[k] = v
+        return out
 
     def save_records(self) -> None:
         try:
@@ -738,8 +753,12 @@ class Engine:
 
     # ---------- 镜像 ----------
     def mirrors(self) -> list:
-        """当前生效的镜像列表（总开关关闭时为空）。"""
-        return mirror_list(self.cfg)
+        """当前生效的镜像列表；把测速选出的最快镜像排到首位，让下载/查询真用上。"""
+        out = mirror_list(self.cfg)
+        chosen = str((self.cfg.get("mirrors") or {}).get("chosen") or "").strip()
+        if chosen and chosen in out:
+            out = [chosen] + [m for m in out if m != chosen]
+        return out
 
     def ensure_mirror(self, force: bool = False) -> str | None:
         """返回可用镜像：优先用上次测速记录的最快项，并按需每天重新测速一次。"""
@@ -1002,7 +1021,7 @@ class Engine:
             return it
         prox = self.proxy
         latest = http_json(f"https://api.github.com/repos/{it.repo}/releases/latest", prox,
-                           self.mirrors())
+                           self.mirrors(), deadline=time.time() + 45)
         if not latest:
             it.status = "error"
             it.detail = f"查询 {it.repo} 失败（网络或限流）"
@@ -1075,7 +1094,7 @@ class Engine:
 
     # ---------- 并发扫描 ----------
     def scan_all(self, items: list[Item], on_item=None, on_progress=None, workers: int = 6) -> list[Item]:
-        self.cancel.clear()
+        # cancel 由 GUI 在启动 worker 前清理；这里再 clear 会吞掉刚点下的「停止」
         done = 0
         total = len(items)
         results: list[Item] = []
@@ -1195,18 +1214,19 @@ class Engine:
             pr(0.02, "下载中（支持断点续传）")
             ok = download(it.download_url, archive, self.proxy, self.mirrors(),
                           progress_cb=lambda p: pr(0.02 + p * 0.6, "下载中"),
-                          cancel=self.cancel, deadline=self._deadline)
+                          cancel=self.cancel, deadline=self._deadline,
+                          expect_size=int(it.asset_size or 0))
+            if self.cancel.is_set():
+                it.state, it.status = "failed", "error"
+                it.detail = "已取消"
+                return it
             if not ok:
                 it.state, it.status = "failed", "error"
                 if self.expired():
                     self._timed_out = True
                     it.detail = f"更新超时（超过 {mins} 分钟），已中止"
                 else:
-                    it.detail = "下载失败（网络/镜像均不可用）"
-                return it
-            if self.cancel.is_set():
-                it.state, it.status = "failed", "error"
-                it.detail = "已取消"
+                    it.detail = "下载失败（网络/镜像均不可用或文件不完整）"
                 return it
             if self.expired():
                 it.state, it.status = "failed", "error"
@@ -1235,13 +1255,28 @@ class Engine:
                     it.archived = ""
 
             pr(0.8, "替换文件")
-            if self.cfg.get("update", {}).get("install_mode", "clean") == "overwrite":
-                # 直接覆盖：旧文件全部保留，只用新版同名内容替换
-                copied = copy_over(src_root, it.path, [])
-                it.detail = f"已覆盖安装 {it.remote}（写入 {copied} 项）"
-            else:
-                removed, copied = clean_replace(src_root, it.path, it.preserve)
-                it.detail = f"已更新到 {it.remote}（清理旧文件 {removed} 项，写入 {copied} 项）"
+            try:
+                if self.cfg.get("update", {}).get("install_mode", "clean") == "overwrite":
+                    # 直接覆盖：旧文件全部保留，只用新版同名内容替换
+                    copied = copy_over(src_root, it.path, [])
+                    it.detail = f"已覆盖安装 {it.remote}（写入 {copied} 项）"
+                else:
+                    removed, copied = clean_replace(src_root, it.path, it.preserve)
+                    it.detail = f"已更新到 {it.remote}（清理旧文件 {removed} 项，写入 {copied} 项）"
+            except Exception as e:
+                # 绝对不能标 latest / 写 records，否则用户目录残了却再也不会提示更新
+                rolled = ""
+                if it.archived and os.path.isdir(it.archived):
+                    try:
+                        clean_replace(it.archived, it.path, it.preserve)
+                        rolled = "，已自动回滚到更新前备份"
+                    except Exception:
+                        rolled = "，回滚也失败，请手动点「撤销上次更新」"
+                else:
+                    rolled = "（未开启备份，无法自动回滚）"
+                it.state, it.status = "failed", "error"
+                it.detail = f"更新失败：{short(str(e), 90)}{rolled}"
+                return it
             it.state, it.status = "done", "latest"
             it.local = it.remote or it.local
             self.records["versions"][it.name] = it.remote
@@ -1308,11 +1343,6 @@ class Engine:
         """直接推送钉钉（不再检查 enabled，供「通知方式」里勾选钉钉时使用）。"""
         return send_dingtalk_raw(self.cfg.get("dingtalk", {}), text, title)
 
-    def notify(self, title: str, text: str) -> None:
-        cfg = self.cfg.get("dingtalk", {})
-        if not cfg.get("enabled"):
-            return
-        self.send_dingtalk(text, title)
 
 
 def send_dingtalk_raw(ding_cfg: dict, text: str, title: str = APP_NAME) -> bool:
@@ -1433,8 +1463,6 @@ def guess_version_spec(path: str) -> dict:
     return {"type": "record"}
 
 
-def guess_asset_regex(path: str) -> str:
-    return ""
 
 
 def read_local_version(target: str, spec: dict, name: str, records: dict) -> str:
@@ -1546,10 +1574,13 @@ def _force_remove(func, path, _):
 
 
 def copy_over(src_root: str, dst: str, preserve) -> int:
+    """写入失败必须抛错：旧版这里静默吞异常，调用方却照样报「更新成功」。"""
     keep = {p.lower() for p in (preserve or [])}
+    failures = []
     n = 0
     for name in os.listdir(src_root):
-        if name.lower() in keep or name in ("__MACOSX", ".DS_Store"):
+        # _updater_undo.json 是备份目录里的内部元数据，不能随撤销拷回程序目录
+        if name.lower() in keep or name in ("__MACOSX", ".DS_Store", "_updater_undo.json"):
             continue
         s, d = os.path.join(src_root, name), os.path.join(dst, name)
         try:
@@ -1558,8 +1589,10 @@ def copy_over(src_root: str, dst: str, preserve) -> int:
             else:
                 shutil.copy2(s, d)
             n += 1
-        except Exception:
-            pass
+        except Exception as e:
+            failures.append(f"{name}: {e}")
+    if failures:
+        raise RuntimeError("写入失败 " + "；".join(failures[:3]))
     return n
 
 
@@ -1567,6 +1600,7 @@ def clean_replace(src_root: str, dst: str, preserve) -> tuple[int, int]:
     """净化覆盖：保留名单之外的全部删除，再写入新版内容。绝不改动目标目录名。"""
     keep = {p.lower() for p in (preserve or [])}
     removed = 0
+    failed = []
     for name in list(os.listdir(dst)):
         if name.lower() in keep:
             continue
@@ -1577,9 +1611,12 @@ def clean_replace(src_root: str, dst: str, preserve) -> tuple[int, int]:
             else:
                 os.remove(p)
             removed += 1
-        except Exception:
-            pass
-    return removed, copy_over(src_root, dst, preserve)
+        except Exception as e:
+            failed.append(f"{name}: {e}")
+    copied = copy_over(src_root, dst, preserve)
+    if failed:
+        raise RuntimeError("旧文件清理失败 " + "；".join(failed[:3]))
+    return removed, copied
 
 
 def backup_dir(target: str, app_name: str, keep: int) -> str:

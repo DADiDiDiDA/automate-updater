@@ -266,7 +266,7 @@ def build_qss(p: Palette) -> str:
 
     QPushButton#soft {{
         background: {rgba(p.accent, 0.14)};
-        color: {p.accent if not p.dark else p.accent};
+        color: {p.accent};
         padding: 8px 16px;
     }}
     QPushButton#soft:hover {{ background: {rgba(p.accent, 0.22)}; }}

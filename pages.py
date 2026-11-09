@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QPoint, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,
                                QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect,
@@ -19,6 +19,22 @@ from theme import (GLYPH, PRESET_HINTS, PRESET_LABELS, PRESET_ORDER, THEME, flat
 from widgets import (Card, Chip, ExpandSetting, Glyph, NumberStepper, ProgramRow, ProgressLine,
                      SearchBox, SegmentedControl, SettingGroup, SettingRow, StatTile, TabButton,
                      ThemedCombo, ToggleSwitch, WrapLabel)
+
+
+class _DingTestWorker(QThread):
+    """「发送测试」放到后台线程，避免 urlopen 卡住整个界面。"""
+    done = Signal(bool, str)
+
+    def __init__(self, cfg: dict, text: str):
+        super().__init__()
+        self.cfg, self.text = cfg, text
+
+    def run(self):
+        try:
+            ok = core.send_dingtalk_raw(self.cfg, self.text)
+            self.done.emit(bool(ok), "" if ok else "检查 Webhook 与加签密钥")
+        except Exception as e:
+            self.done.emit(False, str(e))
 
 import autostart
 import core
@@ -1077,12 +1093,25 @@ class SettingsPage(QWidget):
 
         self.blur_toggle = ToggleSwitch(bool(self.cfg.get("ui", {}).get("blur", True)))
         self.blur_toggle.toggled.connect(self._on_blur)
-        self._row(lay, "funnel", "毛玻璃模糊", "关闭后背景不再模糊，低配机器更流畅", self.blur_toggle)
+        self.blur_row = self._row(lay, "funnel", "毛玻璃模糊",
+                                  "关闭后背景不再模糊，低配机器更流畅", self.blur_toggle)
+        self._sync_blur_control()
         self._style_segmented()
+
+    def _sync_blur_control(self) -> None:
+        """Miuix 之类不使用毛玻璃的皮肤，把开关禁用并说明，别让用户白点。"""
+        if not hasattr(self, "blur_toggle"):
+            return
+        ok = bool(getattr(THEME.p, "support_blur", True))
+        self.blur_toggle.setEnabled(ok)
+        if hasattr(self, "blur_row"):
+            self.blur_row.set_desc("关闭后背景不再模糊，低配机器更流畅" if ok
+                                   else "当前皮肤不使用毛玻璃，此开关无效")
 
     def _on_preset(self, key: str) -> None:
         THEME.set_preset(key)
         self.cfg.setdefault("ui", {})["preset"] = key
+        self._sync_blur_control()
         self.config_changed.emit()
         self.theme_changed.emit()
 
@@ -1246,15 +1275,24 @@ class SettingsPage(QWidget):
         self.cfg.setdefault("dingtalk", {})["enabled"] = on
 
     def _test_ding(self) -> None:
+        # 输入框可能还没失焦（editingFinished 未发），先把当前文本落进 cfg 再测
+        self._save_ding()
         cfg = self.cfg.get("dingtalk", {})
         if not (cfg.get("webhook") or "").strip():
             self.ding_test_lbl.setText("先填写 Webhook 端点再测试")
             return
         self.ding_test_lbl.setText("正在发送测试消息…")
-        QApplication.processEvents()
-        ok = core.send_dingtalk_raw(cfg, "### 测试消息\n\n如果你看到这条，说明通知配置是通的。")
+        w = getattr(self, "_ding_test_worker", None)
+        if w is not None and w.isRunning():
+            return
+        w = _DingTestWorker(cfg, "### 测试消息\n\n如果你看到这条，说明通知配置是通的。")
+        w.done.connect(self._on_ding_test_done)
+        self._ding_test_worker = w
+        w.start()
+
+    def _on_ding_test_done(self, ok: bool, info: str) -> None:
         self.ding_test_lbl.setText("测试消息已发送，去群里看看" if ok
-                                   else "发送失败：检查 Webhook 与加签密钥")
+                                   else "发送失败：" + (info or "检查 Webhook 与加签密钥"))
 
     def _save_background(self, *_):
         bg = self.cfg.setdefault("background", {})
@@ -1496,7 +1534,7 @@ class SettingsPage(QWidget):
         self.proxy_edit.editingFinished.connect(self._save_proxy)
         self.proxy_addr_row = self._row(
             lay, "settings", "代理地址",
-            "支持 http:// 与 socks5://；带密码写成 http://用户名:密码@主机:端口",
+            "仅支持 http://（SOCKS5 请在本机转成 HTTP 端口）；带密码写成 http://用户名:密码@主机:端口",
             self.proxy_edit)
         self.proxy_addr_row.setVisible(mode == "manual")
 
@@ -1549,8 +1587,16 @@ class SettingsPage(QWidget):
         pc = self.cfg.setdefault("proxy", {})
         mode = self.proxy_mode.value() or "auto"
         pc["mode"] = mode
-        pc["url"] = self.proxy_edit.text().strip()
+        url = self.proxy_edit.text().strip()
+        pc["url"] = url
         self.proxy_addr_row.setVisible(mode == "manual")
+        if url.lower().startswith("socks"):
+            # urllib 的 ProxyHandler 不支持 SOCKS，填了也会静默失效，必须说清楚
+            self.proxy_addr_row.set_desc(
+                "SOCKS5 暂不支持，请填 http:// 开头（或在代理软件里开一个 HTTP 端口）")
+        else:
+            self.proxy_addr_row.set_desc(
+                "仅支持 http://（SOCKS5 请在本机转成 HTTP 端口）；带密码写成 http://用户名:密码@主机:端口")
         self.config_changed.emit()
         self.proxy_changed.emit()
 
@@ -1606,6 +1652,7 @@ class SettingsPage(QWidget):
     # ---------- 主题刷新 ----------
     def refresh_theme(self) -> None:
         self._style_segmented()
+        self._sync_blur_control()
         p = THEME.p
         for row in self.findChildren(RootRow):
             row.icon.set_color(p.accent)

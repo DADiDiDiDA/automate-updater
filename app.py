@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import math
 import os
 import sys
@@ -116,6 +117,12 @@ class ScanWorker(QThread):
 
     def run(self):
         try:
+            # 扫描前先落地镜像测速（以前 ensure_mirror 只在 git fetch 里被调到，
+            # 设置页的「chosen」形同虚设，界面一直显示「检测中…」）
+            try:
+                self.engine.ensure_mirror()
+            except Exception:
+                pass
             self.engine.scan_all(
                 self.items,
                 on_item=lambda it: self.item_ready.emit(it),
@@ -166,19 +173,6 @@ class UndoWorker(QThread):
         self.done.emit(res)
 
 
-class PrepareWorker(QThread):
-    """扫描前的准备工作：探测代理、测速镜像。"""
-
-    done = Signal(str, str)
-
-    def __init__(self, engine: core.Engine):
-        super().__init__()
-        self.engine = engine
-
-    def run(self):
-        proxy = self.engine.proxy or ""
-        mirror = self.engine.ensure_mirror() or ""
-        self.done.emit(proxy, mirror)
 
 
 class MirrorWorker(QThread):
@@ -332,11 +326,23 @@ class MainWindow(QWidget):
         if os.environ.get("AM_TOPMOST") == "1":
             self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        # 最小宽度要容纳「筛选胶囊 + 搜索框 + 两个排序下拉」一整行，否则会被裁掉
-        self.setMinimumSize(1120, 690)
+        # 最小尺寸按屏幕可用区自适应：高分屏 150% 缩放时逻辑分辨率可能只有 910×490，
+        # 写死 1120×690 会让窗口超出屏幕、按钮点不到
+        screen = QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else None
+        min_w = min(1120, max(760, int(avail.width() * 0.92))) if avail else 1120
+        min_h = min(690, max(520, int(avail.height() * 0.88))) if avail else 690
+        self.setMinimumSize(min_w, min_h)
         geo = (self.cfg.get("ui") or {}).get("geometry") or []
         if len(geo) == 4:
-            self.setGeometry(int(geo[0]), int(geo[1]), int(geo[2]), int(geo[3]))
+            x, y, w, h = (int(v) for v in geo)
+            if avail:
+                # 拔掉副屏后旧坐标可能整个落在屏幕外，先夹回当前屏幕
+                w = max(min_w, min(w, avail.width()))
+                h = max(min_h, min(h, avail.height()))
+                x = max(avail.left(), min(x, avail.right() - w + 1))
+                y = max(avail.top(), min(y, avail.bottom() - h + 1))
+            self.setGeometry(x, y, w, h)
         else:
             self.resize(1180, 790)
 
@@ -573,7 +579,7 @@ class MainWindow(QWidget):
             self.page_settings.refresh_mirror_row()
         self._refresh_net_info()
         added = len(left) - before
-        tail = "；下次检查 / 测速时重新挑最快的" if added or left != before else ""
+        tail = "；下次检查 / 测速时重新挑最快的" if added or len(left) != before else ""
         self.toast.show_text(f"镜像列表已保存（{len(left)} 个）{tail}")
 
     def _on_proxy_changed(self) -> None:
@@ -600,17 +606,19 @@ class MainWindow(QWidget):
             self._apply_theme()
 
     def _toggle_quick_theme(self) -> None:
-        if THEME.mode == "auto":
-            THEME.set_mode("light" if THEME.is_dark else "dark")
-        else:
-            THEME.set_mode("dark" if THEME.mode == "light" else "light")
+        # 三态循环，能回到「跟随系统」；并立即落盘
+        nxt = {"auto": "light", "light": "dark", "dark": "auto"}.get(THEME.mode, "auto")
+        THEME.set_mode(nxt)
+        self.cfg.setdefault("ui", {})["theme"] = nxt
+        core.save_config(self.cfg)
         self._apply_theme()
 
     def _apply_theme(self) -> None:
         p = THEME.p
         # 必须挂在 qApp 上：QToolTip 是原生弹层，挂在主窗口上它读不到，会退化成系统黑框
         QApplication.instance().setStyleSheet(build_qss(p))
-        self.theme_btn.setText("切换到浅色" if THEME.is_dark else "切换到深色")
+        self.theme_btn.setText("主题：" + {"auto": "跟随系统", "light": "浅色",
+                                      "dark": "深色"}.get(THEME.mode, "跟随系统"))
         self.theme_btn.setIcon(mode_icon(not THEME.is_dark))
 
         tint(self.brand_name, p.text)
@@ -627,30 +635,12 @@ class MainWindow(QWidget):
         self._update_logo()
         self.page_home.refresh_theme()
         self.progs_list.refresh_theme()
-        self._rebuild_settings()
+        # 只刷配色，不重建整页（重建会丢掉正在输入但未失焦的代理/Webhook）
+        if hasattr(self, "page_settings"):
+            self.page_settings.refresh_theme()
         self._update_background()
         self.update()
 
-    def _rebuild_settings(self) -> None:
-        """主题变化后重建设置页（保证分组文字配色一致）。"""
-        idx = self.stack.indexOf(self._page_wraps[2])
-        old = self._page_wraps[2]
-        new_page = SettingsPage(self.cfg)
-        self._wire_settings(new_page)
-        wrap = QWidget()
-        wl = QVBoxLayout(wrap)
-        wl.setContentsMargins(22, 4, 18, 18)
-        wl.addWidget(new_page)
-        self.stack.insertWidget(idx, wrap)
-        old.hide()                  # removeWidget 不隐藏，旧页会盖住新页闪一下
-        self.stack.removeWidget(old)
-        old.deleteLater()
-        self._page_wraps[2] = wrap
-        self.page_settings = new_page
-        if getattr(self, "_net_text", ""):
-            self.page_settings.set_network_info(self._net_text.replace("\n", "　|　"))
-        if idx == self.stack.currentIndex():
-            self.stack.setCurrentWidget(wrap)
 
     def _update_logo(self) -> None:
         p = THEME.p
@@ -819,7 +809,7 @@ class MainWindow(QWidget):
         self.tray = TrayIcon(icon, self)
         self.tray.open_main.connect(self.show_main)
         self.tray.open_settings.connect(lambda: self.show_main("settings"))
-        self.tray.check_now.connect(lambda: self.start_scan(silent=True))
+        self.tray.check_now.connect(self._tray_check_now)
         self.tray.silent_update.connect(self.silent_update_all)
         self.tray.cancel_task.connect(self.cancel_tasks)
         self.tray.autostart_toggled.connect(self._set_autostart)
@@ -885,12 +875,29 @@ class MainWindow(QWidget):
         self.toast.show_text("已设置为开机后台启动" if (on and ok) else
                              ("已取消开机启动" if not on else "设置开机启动失败"))
 
-    def quit_app(self) -> None:
+    def _shutdown(self) -> None:
+        """统一退出入口：取消并等待所有后台线程（扫描/更新/测速/撤销）后再退出。
+
+        托盘「退出」以前完全绕过 closeEvent，更新器可能正在 rmtree/copy2，
+        直接 quit 会留下半成品程序目录甚至崩溃。
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        self._shutting_down = True
         self._quitting = True
+        self.engine.cancel.set()
+        for name in ("scan_worker", "update_worker", "prep_worker",
+                     "_probe_worker", "_undo_worker"):
+            w = getattr(self, name, None)
+            if w is not None and hasattr(w, "isRunning") and w.isRunning():
+                w.wait(8000)
         self._save_cfg()
         if self.tray is not None:
             self.tray.hide()
         QApplication.quit()
+
+    def quit_app(self) -> None:
+        self._shutdown()
 
     # ---------- 数据与扫描 ----------
     def _update_brand(self) -> None:
@@ -910,8 +917,19 @@ class MainWindow(QWidget):
         if hasattr(self, "page_settings"):
             self.page_settings.set_network_info(self._net_text.replace("\n", "　|　"))
 
+    def _tray_check_now(self) -> None:
+        """托盘「立即检查」是用户主动动作，窗口隐藏时也要给一点反馈。"""
+        self.start_scan(silent=False)
+        if not self.isVisible() and self.tray is not None:
+            self.tray.notify("正在检查", "正在检查程序更新，完成后托盘角标会更新")
+
     def start_scan(self, silent: bool = False) -> None:
         if self.scan_worker and self.scan_worker.isRunning():
+            return
+        if self.update_worker and self.update_worker.isRunning():
+            # 扫描与更新共用 items，并发会互相覆盖状态
+            if not silent:
+                self.toast.show_text("正在更新程序，等更新结束后再检查", ok=False)
             return
         self._silent_scan = silent
         self.engine.cancel.clear()
@@ -995,7 +1013,7 @@ class MainWindow(QWidget):
         if not targets:
             self.toast.show_text("没有需要更新的程序")
             return
-        self._start_update(targets)
+        self._start_update(targets, from_user=True)
 
     def silent_update_all(self) -> None:
         """托盘「静默更新」：不弹主界面，直接后台更新。"""
@@ -1008,7 +1026,7 @@ class MainWindow(QWidget):
             else:
                 self.toast.show_text("没有需要更新的程序")
             return
-        self._start_update(targets, background=True)
+        self._start_update(targets, background=True, from_user=True)
 
     def update_one(self, key: str) -> None:
         it = next((i for i in self.items if i.key == key), None)
@@ -1020,9 +1038,14 @@ class MainWindow(QWidget):
         if it.status == "latest":
             self.toast.show_text(f"{it.name} 已是最新版")
             return
-        self._start_update([it])
+        self._start_update([it], from_user=True)
 
-    def _start_update(self, targets, background: bool = False) -> None:
+    def _start_update(self, targets, background: bool = False,
+                      from_user: bool = False) -> None:
+        if from_user and self.scan_worker and self.scan_worker.isRunning():
+            # 用户手动点更新时别和扫描抢同一批 items；自动更新走另一条路径不受影响
+            self.toast.show_text("正在检查新版本，等检查结束后再更新", ok=False)
+            return
         if self.update_worker and self.update_worker.isRunning():
             # 已有任务在跑：不丢弃请求，加入待更新队列，本轮结束后自动继续
             run = {t.key for t in targets}
@@ -1039,10 +1062,13 @@ class MainWindow(QWidget):
             return
         self._launch_update(targets, background)
 
-    def _launch_update(self, targets, background: bool = False) -> None:
+    def _launch_update(self, targets, background: bool = False,
+                       keep_cancel: bool = False) -> None:
         self._running_targets = list(targets)
         self._background_update = background
-        self.engine.cancel.clear()
+        # 队列续跑不是用户新发起的任务，不能把「停止」请求清掉
+        if not keep_cancel:
+            self.engine.cancel.clear()
         if not background:
             self.toast.show_text(f"开始更新 {len(targets)} 个程序…")
         if self.tray is not None:
@@ -1092,23 +1118,28 @@ class MainWindow(QWidget):
         if self.tray is not None:
             self.tray.set_busy(False)
             self.tray.set_tooltip(self.engine.records.get("last_scan", ""), left)
-        # 队列里还有待更新程序：稍等上一个 worker 退出后自动开跑
+        # 队列：攒齐所有批次再统一发一次通知（以前每批弹一条，还会重跑时清掉「停止」）
         self._running_targets = []
+        self._queue_results = (getattr(self, "_queue_results", None) or []) + list(items)
         if self._pending_updates:
             nxt = self._pending_updates[:]
             self._pending_updates = []
-            QTimer.singleShot(300, lambda: self._launch_update(nxt, background))
-        # 后台模式：静默更新时不打扰；「更新后提示」才发通知
+            QTimer.singleShot(300, lambda: self._launch_update(
+                nxt, background, keep_cancel=True))
+            return
+        all_items = self._queue_results
+        self._queue_results = []
+        ok = sum(1 for i in all_items if i.state == "done")
+        bad = sum(1 for i in all_items if i.state == "failed")
+        detail = "\n".join(f"- {i.name}：{i.detail}" for i in all_items[:20])
+        body = f"成功 {ok} 个" + (f"，失败 {bad} 个" if bad else "") + "\n" + detail
+        # 手动更新和后台更新统一走 _notify，遵守设置里的通知方式
         mode = self.cfg.get("background", {}).get("auto_mode", "off")
         if background:
             if mode == "notify":
-                body = f"成功 {ok} 个" + (f"，失败 {bad} 个" if bad else "")
-                detail = "\n".join(f"- {i.name}：{i.detail}" for i in items[:6])
-                self._notify("后台更新完成", f"{body}\n{detail}")
+                self._notify("后台更新完成", body)
             return
-        self.engine.notify("🔄 Automate 更新完成",
-                           f"### Automate 更新完成\n\n- 成功 **{ok}** 个\n- 失败 **{bad}** 个\n\n" +
-                           "\n".join(f"- {i.name}：{i.detail}" for i in items[:20]))
+        self._notify("Automate 更新完成", body)
 
     # ---------- 其它交互 ----------
     def open_item_folder(self, key: str) -> None:
@@ -1283,16 +1314,8 @@ class MainWindow(QWidget):
             e.ignore()
             self.hide()
             return
-        self._save_cfg()
-        if self.scan_worker and self.scan_worker.isRunning():
-            self.engine.cancel.set()
-            self.scan_worker.wait(2000)
-        if self.tray is not None:
-            self.tray.hide()
+        self._shutdown()
         super().closeEvent(e)
-        if not self._quitting:
-            self._quitting = True
-            QApplication.quit()
 
 
 # ---------------------------------------------------------------- 入口
@@ -1342,10 +1365,15 @@ def main() -> int:
     probe = QLocalSocket()
     probe.connectToServer(ipc_key)
     if probe.waitForConnected(400):
-        if not start_hidden:                      # 后台启动时不要抢焦点
-            probe.write(b"show")
+        # 明确告诉常驻实例这次是「叫出窗口」还是「后台静默启动」，
+        # 否则 --tray 二次启动反而把主窗口弹到前台
+        try:
+            probe.write(json.dumps({"show": not start_hidden,
+                                    "hidden": start_hidden}).encode("utf-8"))
             probe.flush()
             probe.waitForBytesWritten(400)
+        except Exception:
+            pass
         probe.disconnectFromServer()
         return 0
 
@@ -1358,9 +1386,28 @@ def main() -> int:
     def _on_second_instance() -> None:
         while server.hasPendingConnections():
             conn = server.nextPendingConnection()
-            conn.readyRead.connect(lambda c=conn: c.readAll())
-            conn.disconnected.connect(conn.deleteLater)
-        win.show_main()
+            state = {"buf": b"", "done": False}
+
+            def _read(c=conn, st=state):
+                st["buf"] += bytes(c.readAll())
+                if st["done"]:
+                    return
+                try:
+                    payload = json.loads(st["buf"].decode("utf-8"))
+                except Exception:
+                    return                  # 分包没收齐
+                st["done"] = True
+                if payload.get("show") or not payload.get("hidden"):
+                    win.show_main()
+
+            def _on_disconnect(c=conn, st=state):
+                # 兼容旧版只发 b"show" 的客户端
+                if not st["done"] and st["buf"].strip() in (b"show", b""):
+                    win.show_main()
+                c.deleteLater()
+
+            conn.readyRead.connect(_read)
+            conn.disconnected.connect(_on_disconnect)
 
     server.newConnection.connect(_on_second_instance)
 
@@ -1369,14 +1416,28 @@ def main() -> int:
     return app.exec()
 
 
+def _excepthook(exc_type, exc, tb):
+    """Qt 事件循环里的异常不会冒到 main()，必须挂 excepthook 才能留下日志。"""
+    import traceback
+    text = "".join(traceback.format_exception(exc_type, exc, tb))
+    try:
+        log_path = os.path.join(core.config_dir(), "crash.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n{text}")
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc, tb)
+
+
 if __name__ == "__main__":
+    sys.excepthook = _excepthook
     try:
         sys.exit(main())
     except Exception:
         import traceback
         try:
             log_path = os.path.join(core.config_dir(), "crash.log")
-            with open(log_path, "w", encoding="utf-8") as f:
+            with open(log_path, "a", encoding="utf-8") as f:
                 f.write(traceback.format_exc())
         except Exception:
             pass
