@@ -965,7 +965,6 @@ class ProgramRow(QFrame):
                               and it.status != "unbound")
         act_undo = m.addAction("撤销上次更新")
         act_undo.setEnabled(not busy and it.kind != "git")   # git 仓库无备份，无法还原
-        act_undo.setToolTip("把程序目录还原到最近一次更新前的备份")
         act_bind = None
         if it.status == "unbound" or not it.repo:
             act_bind = m.addAction("绑定 GitHub 仓库…")

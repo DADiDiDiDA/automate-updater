@@ -20,3 +20,4 @@ zoom_*.png
 v12_*.png
 tools/diag_*.py
 .write_test
+dist/
