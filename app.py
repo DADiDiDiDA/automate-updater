@@ -298,6 +298,7 @@ class MainWindow(QWidget):
         self.prep_worker = None
         self.tray: TrayIcon | None = None
         self._silent_scan = start_hidden
+        self._last_upd_sig = None   # 上次弹过通知的待更新名单，避免重复弹窗
         self._background_update = start_hidden
         self._quitting = False
         self._tray_hint_shown = False
@@ -568,7 +569,8 @@ class MainWindow(QWidget):
 
     def _apply_theme(self) -> None:
         p = THEME.p
-        self.setStyleSheet(build_qss(p))
+        # 必须挂在 qApp 上：QToolTip 是原生弹层，挂在主窗口上它读不到，会退化成系统黑框
+        QApplication.instance().setStyleSheet(build_qss(p))
         self.theme_btn.setText("切换到浅色" if THEME.is_dark else "切换到深色")
         self.theme_btn.setIcon(mode_icon(not THEME.is_dark))
 
@@ -920,6 +922,12 @@ class MainWindow(QWidget):
         # ---- 后台检查：按设置决定通知 / 静默更新 ----
         if not upd:
             return
+        # 待更新名单和上次一样就不再弹：程序运行中会一直处于「待更新」，
+        # 每轮定时检查都弹会变成一堆重复小弹窗
+        sig = tuple(sorted((i.name, i.remote or "") for i in upd))
+        if sig == self._last_upd_sig:
+            return
+        self._last_upd_sig = sig
         bg = self.cfg.get("background", {})
         mode = bg.get("auto_mode", "off")
         names = "、".join(i.name for i in upd[:6]) + ("…" if len(upd) > 6 else "")

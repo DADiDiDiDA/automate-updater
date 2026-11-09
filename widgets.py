@@ -183,6 +183,9 @@ class ThemedMenu(QWidget):
     def mousePressEvent(self, e):
         act = self._action_at(e.position().toPoint())
         if act is None:
+            # Popup 会抓取鼠标：点击菜单外的按下事件也会投递到这里（坐标在边界外），
+            # 必须交给基类处理，它负责把点在弹层外面的情况关闭（否则菜单永远不消失）
+            super().mousePressEvent(e)
             return
         if not act.enabled:
             return                 # 禁用项：不关闭、不触发
@@ -1019,6 +1022,8 @@ class Toast(QWidget):
     def __init__(self, parent):
         super().__init__(parent)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_StyledBackground, True)   # 否则样式表背景不生效，露出深色调色板
+        self.setObjectName("toast")
         self.setVisible(False)
         lay = QHBoxLayout(self)
         lay.setContentsMargins(16, 10, 16, 10)
@@ -1037,14 +1042,16 @@ class Toast(QWidget):
     def show_text(self, text: str, ok: bool = True) -> None:
         p = THEME.p
         self.lbl.setText(text)
-        col = p.text if ok else p.danger
-        self.lbl.setStyleSheet(f"color: {col}; background: transparent;")
+        self.lbl.setStyleSheet(f"color: {p.text}; background: transparent;")
+        border = qc(p.danger, 0.45).name() if not ok else rgba(p.border, 0.22)
+        # 带 #toast 选择器：无选择器的规则会级联到子 QLabel，给文字画出一圈多余边框
         self.setStyleSheet(
-            f"background: {rgba(p.card_alt if p.dark else '#FFFFFF', 0.96)};"
-            f"border: 1px solid {rgba(p.border, 0.16)}; border-radius: {p.radius_btn + 4}px;")
+            f"#toast{{background: {rgba(p.surface(), 0.97)};"
+            f"border: 1px solid {border}; border-radius: {p.radius_btn + 4}px;}}")
         self.adjustSize()
         self.move((self.parentWidget().width() - self.width()) // 2,
                   self.parentWidget().height() - self.height() - 26)
+        self.raise_()                 # 页面重建后可能盖住 Toast，置顶再显示
         self.effect.setOpacity(0.0)
         self.setVisible(True)
         self._anim.stop()

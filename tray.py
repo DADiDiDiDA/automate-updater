@@ -53,31 +53,41 @@ def _stamp_text(stamp: str) -> str:
 
 
 def badge_icon(base: QIcon, count: int) -> QIcon:
-    """在图标右上角画一个红色数字角标。"""
+    """在图标右上角画一个红色数字角标。
+
+    Windows 托盘按小图标尺寸（SM_CXSMICON，随 DPI 变化）来取图，
+    这里按常用尺寸逐档原生渲染，避免只给一张大图被缩小后显得比别的图标小。
+    """
     if count <= 0:
         return base
-    src = base.pixmap(64, 64)
-    if src.isNull():
+    src_any = base.pixmap(64, 64)
+    if src_any.isNull():
         return base
-    pm = QPixmap(64, 64)
-    pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing)
-    p.setRenderHint(QPainter.SmoothPixmapTransform)
-    p.drawPixmap(0, 0, 64, 64, src)          # 底图铺满，和其它托盘图标一样大
-    p.setPen(Qt.NoPen)
-    p.setBrush(QColor("#F0453A"))
-    d = 26 if count < 10 else 32
-    box = QRectF(64 - d, 0, d, d)
-    p.drawEllipse(box)
-    f = QFont("Microsoft YaHei UI")
-    f.setPixelSize(17 if count < 10 else 15)
-    f.setWeight(QFont.Bold)
-    p.setFont(f)
-    p.setPen(QPen(QColor("#FFFFFF")))
-    p.drawText(box, Qt.AlignCenter, str(count) if count < 100 else "99")
-    p.end()
-    return QIcon(pm)
+    icon = QIcon()
+    for s in (16, 20, 24, 32, 48, 64):
+        pm = QPixmap(s, s)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        src = base.pixmap(s, s)
+        if src.width() != s or src.height() != s:
+            src = src.scaled(s, s, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        p.drawPixmap(0, 0, s, s, src)        # 底图铺满，和其它托盘图标一样大
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#F0453A"))
+        d = s * (26 / 64) if count < 10 else s * (32 / 64)
+        box = QRectF(s - d, 0, d, d)
+        p.drawEllipse(box)
+        f = QFont("Microsoft YaHei UI")
+        f.setPixelSize(max(8, round(s * (17 / 64) if count < 10 else s * (15 / 64))))
+        f.setWeight(QFont.Bold)
+        p.setFont(f)
+        p.setPen(QPen(QColor("#FFFFFF")))
+        p.drawText(box, Qt.AlignCenter, str(count) if count < 100 else "99")
+        p.end()
+        icon.addPixmap(pm)
+    return icon
 
 
 class TrayIcon(QSystemTrayIcon):
