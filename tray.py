@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 
 from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QCursor, QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QCursor, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QSystemTrayIcon
 
 import core
@@ -52,15 +52,34 @@ def _stamp_text(stamp: str) -> str:
     return stamp
 
 
-def badge_icon(base: QIcon, count: int) -> QIcon:
-    """在图标右上角画一个红色数字角标。
+def _dot_ratio(s: int) -> float:
+    """红点直径相对画布的比例：小图标上要相对粗一点才看得见。"""
+    if s <= 16:
+        return 0.46
+    if s <= 20:
+        return 0.40
+    if s <= 24:
+        return 0.38
+    if s <= 32:
+        return 0.34
+    return 0.30
 
-    Windows 托盘按小图标尺寸（SM_CXSMICON，随 DPI 变化）来取图，
-    这里按常用尺寸逐档原生渲染，避免只给一张大图被缩小后显得比别的图标小。
+
+def badge_icon(base: QIcon, count: int) -> QIcon:
+    """图标右上角加一个红色小圆点，只表示「有待处理」。
+
+    不写数字：20px 的托盘画布上两位数必然糊成一团，写数字就得把角标放大，
+    图标本体也只好跟着缩小。红点保持纯色小圆，图标就能维持满幅，和别的
+    托盘图标一样大。具体数量看鼠标悬停的提示和托盘菜单。
+
+    画布只有 20px，红点想真的跨到图标轮廓外就得占掉图标自己的位置，所以
+    改成「白描边 + 顶到圆角」：白边让它从图标背景里浮出来，视觉上骑在角上。
     """
     if count <= 0:
         return base
-    src_any = base.pixmap(64, 64)
+    src_any = base.pixmap(128, 128)
+    if src_any.isNull():
+        src_any = base.pixmap(64, 64)
     if src_any.isNull():
         return base
     icon = QIcon()
@@ -70,21 +89,22 @@ def badge_icon(base: QIcon, count: int) -> QIcon:
         p = QPainter(pm)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
-        src = base.pixmap(s, s)
-        if src.width() != s or src.height() != s:
-            src = src.scaled(s, s, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-        p.drawPixmap(0, 0, s, s, src)        # 底图铺满，和其它托盘图标一样大
+
+        src = base.pixmap(max(s * 4, 128), max(s * 4, 128))
+        if src.isNull():
+            src = src_any
+        p.drawPixmap(QRectF(0, 0, s, s), src,
+                     QRectF(0, 0, src.width(), src.height()))
+
+        d = s * _dot_ratio(s)
+        inset = s * 0.04                       # 顶到图标右上角，压住圆角
+        ring = max(0.8, s * 0.05)              # 白描边把红点从图标上「托」起来
         p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#FFFFFF"))
+        p.drawEllipse(QRectF(s - d - inset - ring, inset - ring,
+                             d + ring * 2, d + ring * 2))
         p.setBrush(QColor("#F0453A"))
-        d = s * (26 / 64) if count < 10 else s * (32 / 64)
-        box = QRectF(s - d, 0, d, d)
-        p.drawEllipse(box)
-        f = QFont("Microsoft YaHei UI")
-        f.setPixelSize(max(8, round(s * (17 / 64) if count < 10 else s * (15 / 64))))
-        f.setWeight(QFont.Bold)
-        p.setFont(f)
-        p.setPen(QPen(QColor("#FFFFFF")))
-        p.drawText(box, Qt.AlignCenter, str(count) if count < 100 else "99")
+        p.drawEllipse(QRectF(s - d - inset, inset, d, d))
         p.end()
         icon.addPixmap(pm)
     return icon

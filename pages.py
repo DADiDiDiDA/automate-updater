@@ -14,10 +14,11 @@ from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,
                                QStackedWidget, QVBoxLayout, QWidget)
 
 from backdrop import BACKDROP, paint_glass
-from theme import GLYPH, PRESET_HINTS, PRESET_LABELS, PRESET_ORDER, THEME, qc, rgba
+from theme import (GLYPH, PRESET_HINTS, PRESET_LABELS, PRESET_ORDER, THEME, flat, qc, rgba,
+                   scoped, tint)
 from widgets import (Card, Chip, ExpandSetting, Glyph, NumberStepper, ProgramRow, ProgressLine,
                      SearchBox, SegmentedControl, SettingGroup, SettingRow, StatTile, TabButton,
-                     ThemedCombo, ToggleSwitch)
+                     ThemedCombo, ToggleSwitch, WrapLabel)
 
 import autostart
 import core
@@ -26,14 +27,16 @@ import core
 def _label(text: str, size: int = 13, color_key: str = "text", bold: bool = False,
            wrap: bool = False) -> QLabel:
     p = THEME.p
-    lbl = QLabel(text)
+    # 需要换行的用 WrapLabel：布局会按实际宽度把高度撑开，避免折行处被裁掉
+    lbl = WrapLabel(text) if wrap else QLabel(text)
     f = QFont("Microsoft YaHei UI")
     f.setPixelSize(size)
     if bold:
         f.setWeight(QFont.DemiBold)
     lbl.setFont(f)
-    lbl.setWordWrap(wrap)
-    lbl.setStyleSheet(f"color: {getattr(p, color_key)}; background: transparent;")
+    if not wrap:
+        lbl.setWordWrap(False)
+    tint(lbl, getattr(p, color_key))
     return lbl
 
 
@@ -121,7 +124,7 @@ class ItemListView(QWidget):
 
         self.empty = QLabel("还没有检查结果，点右上角「重新检查」开始")
         self.empty.setAlignment(Qt.AlignCenter)
-        self.empty.setStyleSheet(f"color: {THEME.p.text_muted}; background: transparent;")
+        tint(self.empty, THEME.p.text_muted)
         self.empty.setVisible(False)
         outer.addWidget(self.empty)
 
@@ -131,7 +134,10 @@ class ItemListView(QWidget):
     def set_items(self, items) -> None:
         self.items = list(items)
         for row in self.rows.values():
-            row.setParent(None)
+            # 只 hide + 延后销毁，保持父子关系：可见控件一旦脱离父级会立刻
+            # 变成一个独立顶层小窗，每次重建列表都闪一批
+            row.hide()
+            self.list_lay.removeWidget(row)
             row.deleteLater()
         self.rows.clear()
         order = self.sorted_items()
@@ -284,7 +290,7 @@ class ItemListView(QWidget):
         self.search.refresh_theme()
         self.base_combo._restyle()
         self.prior_combo._restyle()
-        self.empty.setStyleSheet(f"color: {THEME.p.text_muted}; background: transparent;")
+        tint(self.empty, THEME.p.text_muted)
 
 
 class HomePage(QWidget):
@@ -440,9 +446,9 @@ class HomePage(QWidget):
 
     def refresh_theme(self) -> None:
         self.list.refresh_theme()
-        self.title.setStyleSheet(f"color: {THEME.p.text}; background: transparent;")
-        self.subtitle.setStyleSheet(f"color: {THEME.p.text_muted}; background: transparent;")
-        self.scan_hint.setStyleSheet(f"color: {THEME.p.text_muted}; background: transparent;")
+        tint(self.title, THEME.p.text)
+        tint(self.subtitle, THEME.p.text_muted)
+        tint(self.scan_hint, THEME.p.text_muted)
         for t in (self.tile_update, self.tile_latest, self.tile_problem, self.tile_time):
             t.refresh()
         self.hero.update()
@@ -582,6 +588,151 @@ class ExcludeDialog(ThemedDialog):
         return [l.strip() for l in self.edit.toPlainText().splitlines() if l.strip()]
 
 
+class MirrorDialog(ThemedDialog):
+    """管理 GitHub 镜像 / 代理地址：可以删内置的，也可以手动加自己的。"""
+
+    def __init__(self, parent, mirrors: list[str], chosen: str = ""):
+        super().__init__(parent, "GitHub 镜像地址", 580)
+        self.items = [m for m in (mirrors or []) if m]
+        self.chosen = chosen or ""
+        self._rows: list[QWidget] = []
+
+        self.body.addWidget(_label(
+            "下载时按「镜像地址 + 原始 GitHub 地址」转发；测速后自动挑最快的。"
+            "填域名或完整地址都行，例如 gh-proxy.com 或 https://gh-proxy.com/ 。"
+            "自建反代、公司内网代理都可以加进来。", 11, "text_muted", wrap=True))
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setFixedHeight(204)
+        self.scroll.viewport().setStyleSheet(
+            "QScrollArea > QWidget { background: transparent; }")
+        holder = QWidget()
+        flat(holder)
+        self.rows_lay = QVBoxLayout(holder)
+        self.rows_lay.setContentsMargins(0, 0, 4, 0)
+        self.rows_lay.setSpacing(6)
+        self.scroll.setWidget(holder)
+        self.body.addWidget(self.scroll)
+
+        add_line = QHBoxLayout()
+        add_line.setSpacing(8)
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText("https://你的代理地址/   或   gh-proxy.com")
+        self.edit.setMinimumHeight(34)
+        self.edit.returnPressed.connect(self._add)
+        self.add_btn = QPushButton("添加")
+        self.add_btn.setObjectName("soft")
+        self.add_btn.setCursor(Qt.PointingHandCursor)
+        self.add_btn.setFixedHeight(34)
+        self.add_btn.clicked.connect(self._add)
+        add_line.addWidget(self.edit, 1)
+        add_line.addWidget(self.add_btn)
+        self.body.addLayout(add_line)
+
+        self.hint = _label("", 11, "text_muted")
+        self.hint.setVisible(False)
+        self.body.addWidget(self.hint)
+
+        restore = QPushButton("恢复内置")
+        restore.setObjectName("ghost")
+        restore.setCursor(Qt.PointingHandCursor)
+        restore.setFixedHeight(32)
+        restore.setToolTip("把列表恢复成内置的公共镜像")
+        restore.clicked.connect(self._restore)
+        self.add_footer(restore)
+        self._rebuild()
+
+    # ---------- 列表 ----------
+    def _clear(self) -> None:
+        while self.rows_lay.count():
+            item = self.rows_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+        self._rows.clear()
+
+    def _tag(self, text: str, color: str) -> QLabel:
+        b = QLabel(text)
+        f = QFont("Microsoft YaHei UI")
+        f.setPixelSize(10)
+        f.setWeight(QFont.DemiBold)
+        b.setFont(f)
+        scoped(b, f"background: {rgba(color, 0.16)}; color: {color};"
+                  f"border-radius: 8px; padding: 2px 8px;")
+        return b
+
+    def _rebuild(self) -> None:
+        self._clear()
+        tp = THEME.p
+        if not self.items:
+            self.rows_lay.addWidget(_label("列表是空的，在下面填一个地址试试", 12, "text_muted"))
+        for url in self.items:
+            row = QFrame()
+            row.setFixedHeight(38)
+            scoped(row, f"background: {rgba(tp.text, 0.05)}; border: none;"
+                        f"border-radius: 10px;")
+            h = QHBoxLayout(row)
+            h.setContentsMargins(12, 0, 8, 0)
+            h.setSpacing(8)
+            lbl = _label(url, 12, "text")
+            lbl.setToolTip(url)
+            h.addWidget(lbl, 1)
+            if url.rstrip("/") in {x.rstrip("/") for x in core.DEFAULT_MIRRORS}:
+                h.addWidget(self._tag("内置", tp.text_dim))
+            if self.chosen and self.chosen.rstrip("/") == url.rstrip("/"):
+                h.addWidget(self._tag("当前使用", tp.accent))
+            b = QPushButton("删除")
+            b.setObjectName("ghost")
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedHeight(26)
+            b.clicked.connect(lambda _=False, u=url: self._remove(u))
+            h.addWidget(b)
+            self.rows_lay.addWidget(row)
+            self._rows.append(row)
+        self.rows_lay.addStretch(1)
+
+    def _remove(self, url: str) -> None:
+        self.items = [x for x in self.items if x.rstrip("/") != url.rstrip("/")]
+        if self.chosen.rstrip("/") == url.rstrip("/"):
+            self.chosen = ""
+        self._note(f"已从列表删掉 {url}，点保存生效")
+        self._rebuild()
+
+    def _add(self) -> None:
+        u = core.normalize_mirror(self.edit.text())
+        if not u:
+            self._note("这个地址用不了：检查一下域名；官方 github.com 本身不用加", bad=True)
+            return
+        if u.rstrip("/") in {x.rstrip("/") for x in self.items}:
+            self._note("列表里已经有这个地址了")
+            self.edit.clear()
+            return
+        self.items.append(u)
+        self.edit.clear()
+        self._note(f"已添加 {u}，保存后会一起参与测速")
+        self._rebuild()
+        bar = self.scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _restore(self) -> None:
+        self.items = list(core.DEFAULT_MIRRORS)
+        self.chosen = ""
+        self._note("已恢复成内置镜像列表，点保存生效")
+        self._rebuild()
+
+    def _note(self, text: str, bad: bool = False) -> None:
+        self.hint.setText(text)
+        self.hint.setVisible(True)
+        tint(self.hint, THEME.p.danger if bad else THEME.p.text_muted)
+
+    def values(self) -> list[str]:
+        return list(self.items)
+
+
 class VersionDialog(ThemedDialog):
     """手动标记本地版本：程序目录里读不到版本号时用它兜底比对。"""
 
@@ -631,7 +782,7 @@ class PreserveDialog(ThemedDialog):
         names = self._candidates(path, current)
         self.chips: dict[str, Chip] = {}
         box = QWidget()
-        box.setStyleSheet("background: transparent;")
+        flat(box)
         grid = QGridLayout(box)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(7)
@@ -649,8 +800,8 @@ class PreserveDialog(ThemedDialog):
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.NoFrame)
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            scroll.setStyleSheet("background: transparent;")
-            scroll.viewport().setStyleSheet("background: transparent;")
+            flat(scroll)
+            flat(scroll.viewport())
             scroll.setWidget(box)
             scroll.setFixedHeight(min(230, 39 * ((len(names) + self.COLS - 1) // self.COLS) + 6))
             self.body.addWidget(scroll)
@@ -664,8 +815,8 @@ class PreserveDialog(ThemedDialog):
 
         self.hint = _label("" if custom else "当前沿用「设置 → 更新策略」里的全局保留列表。",
                            11, "text_muted", wrap=True)
-        self.hint.setVisible(not custom)
         self.body.addWidget(self.hint)
+        self.hint.setVisible(not custom)     # 挂进布局后再显示，避免变成顶层小窗
 
         extra_btn = QPushButton("跟随全局")
         extra_btn.setObjectName("ghost")
@@ -733,12 +884,12 @@ class RootRow(QWidget):
         f = QFont("Microsoft YaHei UI")
         f.setPixelSize(13)
         self.path_lbl.setFont(f)
-        self.path_lbl.setStyleSheet(f"color: {THEME.p.text}; background: transparent;")
+        tint(self.path_lbl, THEME.p.text)
         self.sub_lbl = QLabel()
         f2 = QFont("Microsoft YaHei UI")
         f2.setPixelSize(11)
         self.sub_lbl.setFont(f2)
-        self.sub_lbl.setStyleSheet(f"color: {THEME.p.text_muted}; background: transparent;")
+        tint(self.sub_lbl, THEME.p.text_muted)
         col.addWidget(self.path_lbl)
         col.addWidget(self.sub_lbl)
         lay.addLayout(col, 1)
@@ -805,6 +956,7 @@ class SettingsPage(QWidget):
     config_changed = Signal()
     mirrors_changed = Signal()
     mirror_probe_requested = Signal()
+    mirror_manage_requested = Signal()
     autostart_requested = Signal(bool)
     proxy_changed = Signal()
 
@@ -886,7 +1038,7 @@ class SettingsPage(QWidget):
     def _sub_line(self, title: str, desc: str, control=None) -> QWidget:
         """展开卡片内部的一行：左标题说明 + 右侧控件。"""
         box = QWidget()
-        box.setStyleSheet("background: transparent;")
+        flat(box)
         lay = QHBoxLayout(box)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(14)
@@ -970,7 +1122,7 @@ class SettingsPage(QWidget):
         self.interval_combo.changed.connect(self._save_background)
 
         box = QWidget()
-        box.setStyleSheet("background: transparent;")
+        flat(box)
         bl = QHBoxLayout(box)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(10)
@@ -991,13 +1143,13 @@ class SettingsPage(QWidget):
 
         # ---- 通知方式：一个可展开的设置项，里面放全部通知相关设置 ----
         body = QWidget()
-        body.setStyleSheet("background: transparent;")
+        flat(body)
         bl2 = QVBoxLayout(body)
         bl2.setContentsMargins(0, 0, 0, 0)
         bl2.setSpacing(14)
 
         chips_box = QWidget()
-        chips_box.setStyleSheet("background: transparent;")
+        flat(chips_box)
         il = QHBoxLayout(chips_box)
         il.setContentsMargins(0, 0, 0, 0)
         il.setSpacing(7)
@@ -1026,7 +1178,7 @@ class SettingsPage(QWidget):
         self.secret_edit.editingFinished.connect(self._save_ding)
 
         ding_box = QWidget()
-        ding_box.setStyleSheet("background: transparent;")
+        flat(ding_box)
         dl = QVBoxLayout(ding_box)
         dl.setContentsMargins(0, 0, 0, 0)
         dl.setSpacing(14)
@@ -1037,7 +1189,7 @@ class SettingsPage(QWidget):
                                     "安全设置里选择「加签」后得到的 SEC 开头字符串",
                                     self.secret_edit))
         test_row = QWidget()
-        test_row.setStyleSheet("background: transparent;")
+        flat(test_row)
         tl = QHBoxLayout(test_row)
         tl.setContentsMargins(0, 0, 0, 0)
         tl.setSpacing(12)
@@ -1134,7 +1286,7 @@ class SettingsPage(QWidget):
         self.install_row = self._row(lay, "restore", "安装方式", "", self.install_seg)
 
         chips_box = QWidget()
-        chips_box.setStyleSheet("background: transparent;")
+        flat(chips_box)
         cl = QVBoxLayout(chips_box)
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(8)
@@ -1171,7 +1323,7 @@ class SettingsPage(QWidget):
                   "下载 + 解压总时长超过该值即中止，避免卡死", self.timeout_spin)
 
         bk = QWidget()
-        bk.setStyleSheet("background: transparent;")
+        flat(bk)
         bkl = QHBoxLayout(bk)
         bkl.setContentsMargins(0, 0, 0, 0)
         bkl.setSpacing(10)
@@ -1262,7 +1414,8 @@ class SettingsPage(QWidget):
         while self.roots_box.count():
             w = self.roots_box.takeAt(0).widget()
             if w:
-                w.setParent(None)
+                w.hide()            # 先隐藏再销毁，脱离父级会变成顶层小窗闪一下
+                w.deleteLater()
         for r in self.cfg.get("roots", []):
             row = RootRow(r)
             row.changed.connect(self._roots_dirty)
@@ -1308,6 +1461,18 @@ class SettingsPage(QWidget):
             return f"共 {n} 个候选镜像，尚未测速（下次检查时自动挑最快的）"
         return f"当前使用 {chosen}　候选 {n} 个"
 
+    def _mirror_addr_desc(self) -> str:
+        m = self.cfg.get("mirrors", {})
+        lst = [x for x in (m.get("list") or []) if isinstance(x, str)]
+        builtin = {x.rstrip("/") for x in core.DEFAULT_MIRRORS}
+        n_custom = sum(1 for x in lst if x.rstrip("/") not in builtin)
+        head = f"共 {len(lst)} 个（内置 {len(lst) - n_custom} · 自定义 {n_custom}）"
+        return head + "；可以手动添加自己的 GitHub 代理地址，保存后一起参与测速"
+
+    def refresh_mirror_row(self) -> None:
+        self.mirror_row.set_desc(self._mirror_addr_desc())
+        self.mirror_lbl.setText(self._mirror_summary())
+
     def _build_network(self, lay: QVBoxLayout) -> None:
         self._group(lay, "网络")
 
@@ -1342,8 +1507,13 @@ class SettingsPage(QWidget):
                   f"内置 {len(mcfg.get('list') or [])} 个公共镜像，默认开启；关闭后只走直连与代理",
                   self.mirror_toggle)
 
+        self.mirror_btn = self._small_btn("管理…", self.mirror_manage_requested.emit)
+        self.mirror_btn.setToolTip("增删镜像地址：可以加自己的 GitHub 代理 / 反代")
+        self.mirror_row = self._row(lay, "link", "镜像地址", self._mirror_addr_desc(),
+                                    self.mirror_btn)
+
         box = QWidget()
-        box.setStyleSheet("background: transparent;")
+        flat(box)
         bl = QHBoxLayout(box)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(10)
@@ -1439,8 +1609,8 @@ class SettingsPage(QWidget):
         p = THEME.p
         for row in self.findChildren(RootRow):
             row.icon.set_color(p.accent)
-            row.path_lbl.setStyleSheet(f"color: {p.text}; background: transparent;")
-            row.sub_lbl.setStyleSheet(f"color: {p.text_muted}; background: transparent;")
+            tint(row.path_lbl, p.text)
+            tint(row.sub_lbl, p.text_muted)
             row.update()
         for card in self.findChildren(Card):
             card.update()

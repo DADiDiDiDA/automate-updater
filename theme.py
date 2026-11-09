@@ -200,6 +200,32 @@ def field_radius(p) -> int:
     return max(7, min(p.radius_btn - 2, 12))
 
 
+# ------------------------------------------------------------------ 内联样式工具
+# 为什么不用裸 setStyleSheet("color: …; background: transparent;")：
+# Qt 里的 tooltip 窗口（QTipLabel）是「触发它的那个控件」的子窗口，没有选择器的
+# 样式会级联下去，把 QToolTip 的白底一起抹成透明（露出系统底色 = 纯黑），文字也被
+# 染成控件自己的颜色 —— 表现就是「黑底灰字，几乎看不清」。
+# 所以内联样式统一套一层 #objectName，只作用于控件自己。
+
+def scoped(w, decls: str) -> None:
+    """把一段样式限定在这个控件自己身上（自动补 #objectName 外层）。"""
+    name = w.objectName()
+    if not name:
+        name = "scoped"
+        w.setObjectName(name)
+    w.setStyleSheet(f"#{name} {{ {decls} }}")
+
+
+def tint(w, color: str) -> None:
+    """只改文字颜色，不波及子控件（含 tooltip）。"""
+    scoped(w, f"color: {color};")
+
+
+def flat(w) -> None:
+    """只把这个控件刷成透明底，不波及子控件（含 tooltip）。"""
+    scoped(w, "background: transparent;")
+
+
 def build_qss(p: Palette) -> str:
     """根据调色板生成全局样式表。"""
     return f"""

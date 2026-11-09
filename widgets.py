@@ -3,15 +3,15 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import (QEasingCurve, QEventLoop, QPoint, QPointF, QPropertyAnimation, QRectF,
-                            QSize, Qt, QTimer, Property, Signal, QObject)
+from PySide6.QtCore import (QEasingCurve, QEvent, QEventLoop, QPoint, QPointF,
+                            QPropertyAnimation, QRectF, QSize, Qt, QTimer, Property, Signal, QObject)
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath,
                            QPen)
 from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
                                QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
 
 from backdrop import BACKDROP, paint_glass
-from theme import GLYPH, THEME, card_color, qc, rgba
+from theme import GLYPH, THEME, card_color, flat, qc, rgba, scoped, tint
 
 
 class _MenuAction(QObject):
@@ -243,11 +243,44 @@ class Glyph(QLabel):
         self.setFont(f)
         self.setFixedSize(size + 6, size + 6)
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet(f"color: {color or THEME.p.text_dim}; background: transparent;")
+        tint(self, color or THEME.p.text_dim)
 
     def set_color(self, color: str) -> None:
         self._color = color
-        self.setStyleSheet(f"color: {color}; background: transparent;")
+        tint(self, color)
+
+
+class WrapLabel(QLabel):
+    """会自动换行并按宽度撑高的 QLabel。
+
+    Qt 里 QLabel 虽然实现了 heightForWidth，但布局经常只按单行高度分配空间，
+    窗口一窄、文字折成两行，第二行就被上下裁掉（只剩半截字）。这里在每次改宽度时
+    把 minimumHeight 同步成 heightForWidth，布局就压不扁它了。
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+        sp = self.sizePolicy()
+        sp.setHeightForWidth(True)
+        sp.setVerticalPolicy(QSizePolicy.Minimum)
+        self.setSizePolicy(sp)
+
+    def _sync_height(self) -> None:
+        w = self.width()
+        if w <= 0:
+            return
+        h = self.heightForWidth(w)
+        if h > 0 and self.minimumHeight() != h:
+            self.setMinimumHeight(h)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._sync_height()
+
+    def setText(self, text: str) -> None:
+        super().setText(text)
+        self._sync_height()
 
 
 class Card(QFrame):
@@ -487,9 +520,22 @@ class Badge(QWidget):
         fm = QFontMetrics(self.font())
         w = fm.horizontalAdvance(text) + self.PAD_X * 2 if text else 0
         self.setFixedWidth(w)
-        self.setVisible(bool(text))
+        if text and self.parentWidget() is None:
+            # 还没挂进布局就想显示 —— 无父级 setVisible(True) 会让徽章变成独立顶层小窗，
+            # 列表每次重建都闪一批；等收到 ParentChange 再显示。
+            self.hide()
+            self._pending_show = True
+        else:
+            self._pending_show = False
+            self.setVisible(bool(text))
         self.updateGeometry()
         self.update()
+
+    def event(self, e):
+        if e.type() == QEvent.ParentChange and getattr(self, "_pending_show", False):
+            self._pending_show = False
+            self.setVisible(True)
+        return super().event(e)
 
     def sizeHint(self) -> QSize:
         return QSize(self.width(), self.H)
@@ -545,15 +591,15 @@ class Chip(QPushButton):
         # 圆角超过高度一半时 Qt 会画成直角，这里统一夹住
         r = max(8, min(p.radius_chip, 16))
         if self._active:
-            self.setStyleSheet(
-                f"background: {rgba(p.accent, 0.95)}; color: {p.accent_on};"
-                f"border: none; border-radius: {r}px; padding: 0 14px;"
-                f"font-size: 12px; font-weight: 600;")
+            scoped(self,
+                   f"background: {rgba(p.accent, 0.95)}; color: {p.accent_on};"
+                   f"border: none; border-radius: {r}px; padding: 0 14px;"
+                   f"font-size: 12px; font-weight: 600;")
         else:
-            self.setStyleSheet(
-                f"background: {rgba(p.text, 0.07)}; color: {p.text_dim};"
-                f"border: none; border-radius: {r}px; padding: 0 14px;"
-                f"font-size: 12px;")
+            scoped(self,
+                   f"background: {rgba(p.text, 0.07)}; color: {p.text_dim};"
+                   f"border: none; border-radius: {r}px; padding: 0 14px;"
+                   f"font-size: 12px;")
             self.setCursor(Qt.PointingHandCursor)
 
 
@@ -636,9 +682,9 @@ class StatTile(QWidget):
         p = THEME.p
         col = getattr(p, self.color_key, p.text)
         self.v.setText(self.value_text)
-        self.v.setStyleSheet(f"color: {col}; background: transparent;")
+        tint(self.v, col)
         self.l.setText(self.label)
-        self.l.setStyleSheet(f"color: {p.text_dim}; background: transparent;")
+        tint(self.l, p.text_dim)
 
     def paintEvent(self, e):
         p = THEME.p
@@ -779,13 +825,13 @@ class ProgramRow(QFrame):
         # 按钮
         btns = QHBoxLayout()
         btns.setSpacing(6)
-        self.log_btn = QPushButton("日志")
+        self.log_btn = QPushButton("日志", self.body)
         self.log_btn.setObjectName("ghost")
         self.log_btn.setFixedHeight(30)
         self.log_btn.setCursor(Qt.PointingHandCursor)
         self.log_btn.clicked.connect(self.toggle_expand)
 
-        self.action_btn = QPushButton("更新")
+        self.action_btn = QPushButton("更新", self.body)
         self.action_btn.setObjectName("primary")
         self.action_btn.setFixedHeight(30)
         self.action_btn.setCursor(Qt.PointingHandCursor)
@@ -832,17 +878,17 @@ class ProgramRow(QFrame):
         p = THEME.p
         it = self.item
         self.name_lbl.setText(it.name)
-        self.name_lbl.setStyleSheet(f"color: {p.text}; background: transparent;")
+        tint(self.name_lbl, p.text)
         if it.state == "running":
             pct = int(max(0.0, min(1.0, it.progress)) * 100)
             self.detail_lbl.setText(f"{it.message or '更新中'}… {pct}%")
         else:
             self.detail_lbl.setText(it.detail or it.path)
         self.detail_lbl.setToolTip(it.path)
-        self.detail_lbl.setStyleSheet(f"color: {p.text_muted}; background: transparent;")
-        self.avatar.setStyleSheet(
-            f"background: {rgba(p.accent, 0.16)}; color: {p.accent};"
-            f"border-radius: {p.radius_btn}px;")
+        tint(self.detail_lbl, p.text_muted)
+        scoped(self.avatar,
+               f"background: {rgba(p.accent, 0.16)}; color: {p.accent};"
+               f"border-radius: {p.radius_btn}px;")
 
         status_map = {
             "update": ("可更新", "accent"),
@@ -1047,7 +1093,7 @@ class Toast(QWidget):
     def show_text(self, text: str, ok: bool = True) -> None:
         p = THEME.p
         self.lbl.setText(text)
-        self.lbl.setStyleSheet(f"color: {p.text}; background: transparent;")
+        tint(self.lbl, p.text)
         border = qc(p.danger, 0.45).name() if not ok else rgba(p.border, 0.22)
         # 带 #toast 选择器：无选择器的规则会级联到子 QLabel，给文字画出一圈多余边框
         self.setStyleSheet(
@@ -1088,7 +1134,7 @@ class SectionHead(QWidget):
         f.setPixelSize(14)
         f.setWeight(QFont.DemiBold)
         t.setFont(f)
-        t.setStyleSheet(f"color: {THEME.p.text}; background: transparent;")
+        tint(t, THEME.p.text)
         lay.addWidget(t)
         if desc:
             d = QLabel(desc)
@@ -1096,7 +1142,7 @@ class SectionHead(QWidget):
             fd.setPixelSize(11)
             d.setFont(fd)
             d.setWordWrap(True)
-            d.setStyleSheet(f"color: {THEME.p.text_muted}; background: transparent;")
+            tint(d, THEME.p.text_muted)
             lay.addWidget(d)
 
 
@@ -1473,7 +1519,7 @@ class ChevronButton(QPushButton):
         self._up = False
         self.setFixedSize(26, 26)
         self.setCursor(Qt.PointingHandCursor)
-        self.setStyleSheet("background: transparent; border: none;")
+        scoped(self, "background: transparent; border: none;")
 
     def set_up(self, on: bool) -> None:
         self._up = on
@@ -1540,16 +1586,16 @@ class ExpandSetting(Card):
         ft.setPixelSize(13)
         ft.setWeight(QFont.DemiBold)
         self.title_lbl.setFont(ft)
-        self.title_lbl.setStyleSheet(f"color: {THEME.p.text}; background: transparent;")
+        tint(self.title_lbl, THEME.p.text)
         col.addWidget(self.title_lbl)
-        self.desc_lbl = QLabel(desc)
+        self.desc_lbl = QLabel(desc, self)
         fd = QFont("Microsoft YaHei UI")
         fd.setPixelSize(11)
         self.desc_lbl.setFont(fd)
         self.desc_lbl.setWordWrap(True)
-        self.desc_lbl.setStyleSheet(f"color: {THEME.p.text_muted}; background: transparent;")
-        self.desc_lbl.setVisible(bool(desc))
+        tint(self.desc_lbl, THEME.p.text_muted)
         col.addWidget(self.desc_lbl)
+        self.desc_lbl.setVisible(bool(desc))    # 有父级之后再显示，否则会变成顶层小窗
         hl.addLayout(col, 1)
 
         self.control = control
@@ -1564,9 +1610,9 @@ class ExpandSetting(Card):
         wrap.addWidget(head)
 
         self.body = body or QWidget()
-        self.body.setStyleSheet("background: transparent;")
+        flat(self.body)
         self.body_wrap = QWidget()
-        self.body_wrap.setStyleSheet("background: transparent;")
+        flat(self.body_wrap)
         bl = QVBoxLayout(self.body_wrap)
         bl.setContentsMargins(16, 2, 16, 14)
         bl.setSpacing(0)
@@ -1627,16 +1673,16 @@ class SettingRow(Card):
         ft.setPixelSize(13)
         ft.setWeight(QFont.DemiBold)
         self.title_lbl.setFont(ft)
-        self.title_lbl.setStyleSheet(f"color: {THEME.p.text}; background: transparent;")
+        tint(self.title_lbl, THEME.p.text)
         col.addWidget(self.title_lbl)
-        self.desc_lbl = QLabel(desc)
+        self.desc_lbl = QLabel(desc, self)
         fd = QFont("Microsoft YaHei UI")
         fd.setPixelSize(11)
         self.desc_lbl.setFont(fd)
         self.desc_lbl.setWordWrap(True)
-        self.desc_lbl.setStyleSheet(f"color: {THEME.p.text_muted}; background: transparent;")
-        self.desc_lbl.setVisible(bool(desc))
+        tint(self.desc_lbl, THEME.p.text_muted)
         col.addWidget(self.desc_lbl)
+        self.desc_lbl.setVisible(bool(desc))    # 有父级之后再显示，否则会变成顶层小窗
         line.addLayout(col, 1)
 
         if control is not None:
@@ -1662,7 +1708,7 @@ class SettingGroup(QLabel):
         f.setWeight(QFont.DemiBold)
         self.setFont(f)
         self.setContentsMargins(4, 8, 0, 0)
-        self.setStyleSheet(f"color: {THEME.p.text_dim}; background: transparent;")
+        tint(self, THEME.p.text_dim)
 
 
 class TabButton(QPushButton):
@@ -1696,7 +1742,7 @@ def hline(p=None) -> QFrame:
     p = p or THEME.p
     line = QFrame()
     line.setFixedHeight(1)
-    line.setStyleSheet(f"background: {rgba(p.border, p.border_alpha)}; border: none;")
+    line.setStyleSheet(f"QFrame{{background: {rgba(p.border, p.border_alpha)}; border: none;}}")
     return line
 
 

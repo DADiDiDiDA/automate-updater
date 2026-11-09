@@ -21,3 +21,7 @@ v12_*.png
 tools/diag_*.py
 .write_test
 dist/
+
+# 开发用测试脚本 / 临时构建产物
+_test/
+dist_new/

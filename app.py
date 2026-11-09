@@ -19,9 +19,9 @@ from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QPu
 import core
 import autostart
 from backdrop import BACKDROP
-from pages import (HomePage, ItemListView, PreserveDialog, SettingsPage, ThemedDialog,
-                   VersionDialog, _label)
-from theme import GLYPH, THEME, build_qss, qc
+from pages import (HomePage, ItemListView, MirrorDialog, PreserveDialog, SettingsPage,
+                   ThemedDialog, VersionDialog, _label)
+from theme import GLYPH, THEME, build_qss, flat, qc, scoped, tint
 from tray import TrayIcon
 from widgets import NavButton, Toast
 
@@ -534,6 +534,7 @@ class MainWindow(QWidget):
         page.config_changed.connect(self._save_cfg)
         page.autostart_requested.connect(self._set_autostart)
         page.mirror_probe_requested.connect(self._probe_mirrors)
+        page.mirror_manage_requested.connect(self._manage_mirrors)
         page.proxy_changed.connect(self._on_proxy_changed)
 
     def _probe_mirrors(self) -> None:
@@ -556,6 +557,24 @@ class MainWindow(QWidget):
                                       if i.status == "update"
                                       or (i.status == "unknown" and i.scanned)))
         self._refresh_net_info()
+
+    def _manage_mirrors(self) -> None:
+        """设置页「镜像地址 · 管理」：增删 GitHub 镜像 / 手填代理地址。"""
+        mcfg = self.cfg.setdefault("mirrors", {})
+        dlg = MirrorDialog(self, [x for x in (mcfg.get("list") or [])
+                                  if isinstance(x, str)], mcfg.get("chosen") or "")
+        if not dlg.exec():
+            return
+        before = len(mcfg.get("list") or [])
+        left = core.set_mirrors(self.cfg, dlg.values())
+        self.engine.mirror = None            # 列表变了，下次检查重新测速
+        self._save_cfg()
+        if hasattr(self, "page_settings"):
+            self.page_settings.refresh_mirror_row()
+        self._refresh_net_info()
+        added = len(left) - before
+        tail = "；下次检查 / 测速时重新挑最快的" if added or left != before else ""
+        self.toast.show_text(f"镜像列表已保存（{len(left)} 个）{tail}")
 
     def _on_proxy_changed(self) -> None:
         """设置页改了代理方式 / 地址后立刻生效。"""
@@ -594,11 +613,11 @@ class MainWindow(QWidget):
         self.theme_btn.setText("切换到浅色" if THEME.is_dark else "切换到深色")
         self.theme_btn.setIcon(mode_icon(not THEME.is_dark))
 
-        self.brand_name.setStyleSheet(f"color: {p.text}; background: transparent;")
-        self.brand_ver.setStyleSheet(f"color: {p.text_muted}; background: transparent;")
-        self.page_title.setStyleSheet(f"color: {p.text}; background: transparent;")
-        self.progs_header.setStyleSheet(f"color: {p.text}; background: transparent;")
-        self.side_status.setStyleSheet(f"color: {p.text_muted}; background: transparent;")
+        tint(self.brand_name, p.text)
+        tint(self.brand_ver, p.text_muted)
+        tint(self.page_title, p.text)
+        tint(self.progs_header, p.text)
+        tint(self.side_status, p.text_muted)
         for b in (self.btn_min, self.btn_max, self.btn_close):
             b.update()
 
@@ -623,6 +642,7 @@ class MainWindow(QWidget):
         wl.setContentsMargins(22, 4, 18, 18)
         wl.addWidget(new_page)
         self.stack.insertWidget(idx, wrap)
+        old.hide()                  # removeWidget 不隐藏，旧页会盖住新页闪一下
         self.stack.removeWidget(old)
         old.deleteLater()
         self._page_wraps[2] = wrap

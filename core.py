@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.3.6"
+APP_VERSION = "1.5.0"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -284,6 +284,86 @@ def mirror_list(cfg: dict) -> list:
         return []
     out = [x for x in (m.get("list") or []) if isinstance(x, str) and x.strip()]
     return out
+
+
+def normalize_mirror(url: str) -> str:
+    """把用户输入的代理地址整理成「https://主机/路径/」；不像网址就返回空串。
+
+    下载时按「镜像 + 原始地址」拼接，所以允许带路径前缀（如 https://x.com/gh/）。
+    """
+    u = str(url or "").strip().replace(" ", "")
+    if not u:
+        return ""
+    if not re.match(r"^https?://", u, re.I):
+        u = "https://" + u
+    m = re.match(r"^(https?)://([^/]+)(/.*)?$", u, re.I)
+    if not m:
+        return ""
+    scheme, host, path = m.group(1).lower(), m.group(2), m.group(3) or "/"
+    if "." not in host and ":" not in host:
+        return ""
+    if re.fullmatch(r"(www\.)?github\.com", host, re.I):
+        return ""                       # 官方地址不是镜像，加了只会绕圈
+    if not path.endswith("/"):
+        path += "/"
+    return f"{scheme}://{host}{path}"
+
+
+def add_mirror(cfg: dict, url: str) -> str:
+    """把一个代理地址加进候选列表；已存在就返回原样，非法输入返回空串。"""
+    u = normalize_mirror(url)
+    if not u:
+        return ""
+    m = cfg.setdefault("mirrors", {})
+    lst = [x for x in (m.get("list") or []) if isinstance(x, str)]
+    if u.rstrip("/") not in {x.rstrip("/") for x in lst}:
+        lst.append(u)
+    m["list"] = lst
+    return u
+
+
+def remove_mirror(cfg: dict, url: str) -> bool:
+    """从候选列表删掉一个地址（内置的也可以删，下次升级不会自动补回）。"""
+    m = cfg.setdefault("mirrors", {})
+    lst = [x for x in (m.get("list") or []) if isinstance(x, str)]
+    key = (normalize_mirror(url) or str(url or "").strip()).rstrip("/")
+    left = [x for x in lst if x.rstrip("/") != key]
+    if len(left) == len(lst):
+        return False
+    m["list"] = left
+    # 删掉的地址不希望被「升级补充内置镜像」的逻辑加回来
+    m["seeded"] = len(DEFAULT_MIRRORS)
+    if str(m.get("chosen") or "").rstrip("/") == key:
+        m["chosen"] = ""
+        m["last_check"] = ""
+    return True
+
+
+def set_mirrors(cfg: dict, urls) -> list:
+    """整体替换候选列表（设置页对话框保存时用），返回清洗后的列表。"""
+    out, seen = [], set()
+    for u in urls or []:
+        n = normalize_mirror(u)
+        if n and n.rstrip("/") not in seen:
+            seen.add(n.rstrip("/"))
+            out.append(n)
+    m = cfg.setdefault("mirrors", {})
+    m["list"] = out
+    m["seeded"] = len(DEFAULT_MIRRORS)
+    if (m.get("chosen") or "").rstrip("/") not in {x.rstrip("/") for x in out}:
+        m["chosen"] = ""
+        m["last_check"] = ""
+    return out
+
+
+def reset_mirrors(cfg: dict) -> list:
+    """恢复成内置镜像列表。"""
+    m = cfg.setdefault("mirrors", {})
+    m["list"] = list(DEFAULT_MIRRORS)
+    m["seeded"] = len(DEFAULT_MIRRORS)
+    m["chosen"] = ""
+    m["last_check"] = ""
+    return m["list"]
 
 
 def load_config() -> dict:
