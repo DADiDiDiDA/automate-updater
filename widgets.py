@@ -3,54 +3,228 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import (QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt,
-                            QTimer, Property, Signal)
+from PySide6.QtCore import (QEasingCurve, QEventLoop, QPoint, QPointF, QPropertyAnimation, QRectF,
+                            QSize, Qt, QTimer, Property, Signal, QObject)
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath,
                            QPen)
 from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
-                               QLineEdit, QMenu, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
+                               QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
 
 from backdrop import BACKDROP, paint_glass
 from theme import GLYPH, THEME, card_color, qc, rgba
 
 
-def menu_style() -> str:
-    """右键菜单样式：底板由 ThemedMenu 自绘玻璃，这里只管菜单项。"""
-    p = THEME.p
-    return (
-        f"QMenu{{background:transparent; color:{p.text}; border:none; padding:6px;}}"
-        f"QMenu::item{{padding:7px 24px 7px 10px; border-radius:6px; font-size:12px;}}"
-        f"QMenu::item:selected{{background:{rgba(p.accent, 0.18)}; color:{p.accent};}}"
-        f"QMenu::item:disabled{{color:{p.text_muted};}}"
-        f"QMenu::separator{{height:1px; background:{rgba(p.border, 0.13)};"
-        f" margin:5px 8px;}}"
-        f"QMenu::icon{{padding-left:6px;}}"
-    )
+class _MenuAction(QObject):
+    """自绘菜单的动作项（对齐 QMenu.addAction 的常用接口）。"""
+
+    triggered = Signal()
+    toggled = Signal(bool)
+
+    def __init__(self, text: str = "", separator: bool = False):
+        super().__init__()
+        self.text = text
+        self.separator = separator
+        self.enabled = True
+        self.visible = True
+        self.checkable = False
+        self.checked = False
+
+    def setEnabled(self, on: bool) -> None:
+        self.enabled = on
+
+    def setVisible(self, on: bool) -> None:
+        self.visible = on
+
+    def setText(self, text: str) -> None:
+        self.text = text
+
+    def setCheckable(self, on: bool) -> None:
+        self.checkable = on
+
+    def setChecked(self, on: bool) -> None:
+        if self.checked == on:
+            return
+        self.checked = on
+        if self.checkable:
+            self.toggled.emit(on)
 
 
-class ThemedMenu(QMenu):
-    """玻璃质感的右键菜单：模糊壁纸底板 + 主题色柔化，和主窗口一致。"""
+class ThemedMenu(QWidget):
+    """全自绘的玻璃菜单：底板模糊背后真实画面，悬停高亮自己跟踪、移开即清除。
+
+    不用原生 QMenu —— 半透明 + 无边框模式下它会留下悬停残影，
+    且和自绘玻璃叠不出正确效果。
+    """
+
+    ITEM_H = 30
+    MARGIN = 7
+    SEP_V = 5  # 分隔线上下留白
 
     def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowFlags(self.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setStyleSheet(menu_style())
-        # 弹出前先截屏，菜单才能模糊「背后的真实内容」（真毛玻璃）
-        self.aboutToShow.connect(lambda: BACKDROP.snapshot(self.screen()))
+        self.setMouseTracking(True)
+        self._actions: list[_MenuAction] = []
+        self._hover = -1
+        self._rects: list[tuple[_MenuAction, QRectF]] = []
+        self._result: _MenuAction | None = None
+        self._loop: QEventLoop | None = None
 
+    # ---------- 构建菜单（QMenu 风格） ----------
+    def addAction(self, text: str) -> _MenuAction:
+        act = _MenuAction(text)
+        self._actions.append(act)
+        return act
+
+    def addSeparator(self) -> _MenuAction:
+        act = _MenuAction(separator=True)
+        self._actions.append(act)
+        return act
+
+    def _live_actions(self) -> list[_MenuAction]:
+        return [a for a in self._actions if a.visible and not a.separator]
+
+    # ---------- 布局 ----------
+    def _font(self) -> QFont:
+        f = QFont("Microsoft YaHei UI")
+        f.setPixelSize(12)
+        return f
+
+    def _compute_size(self) -> None:
+        fm = QFontMetrics(self._font())
+        widest = 0
+        for a in self._actions:
+            if a.visible and not a.separator:
+                widest = max(widest, fm.horizontalAdvance(a.text))
+        self._w = max(168, widest + self.MARGIN * 2 + 12 + 24)
+        n_items = len(self._live_actions())
+        n_sep = sum(1 for a in self._actions if a.visible and a.separator)
+        self._h = self.MARGIN * 2 + n_items * self.ITEM_H + (n_sep * 2 * self.SEP_V + n_sep)
+        self.setFixedSize(self._w, self._h)
+
+    def _layout_items(self) -> None:
+        self._rects = []
+        y = float(self.MARGIN)
+        for a in self._actions:
+            if not a.visible:
+                continue
+            if a.separator:
+                y += self.SEP_V
+                self._rects.append((a, QRectF(self.MARGIN + 4, y + 0.5, self._w - self.MARGIN * 2 - 8, 1)))
+                y += 1 + self.SEP_V
+            else:
+                self._rects.append((a, QRectF(self.MARGIN, y, self._w - self.MARGIN * 2, self.ITEM_H)))
+                y += self.ITEM_H
+
+    def _action_at(self, pos: QPoint) -> _MenuAction | None:
+        for a, r in self._rects:
+            if a.separator or not a.visible:
+                continue
+            if r.contains(QPointF(pos)):
+                return a
+        return None
+
+    def _index_at(self, pos: QPoint) -> int:
+        for i, (a, r) in enumerate(self._rects):
+            if a.separator or not a.visible:
+                continue
+            if r.contains(QPointF(pos)):
+                return i
+        return -1
+
+    # ---------- 绘制 ----------
     def paintEvent(self, e):
         p = THEME.p
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.Antialiasing | QPainter.TextAntialiasing)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         radius = max(8, min(p.radius_btn + 2, 14))
         path = paint_glass(painter, rect, radius, self.mapToGlobal(QPoint(0, 0)), p,
                            THEME.blur_active)
-        painter.setPen(QPen(qc(p.border, 0.16), 1))
+        painter.setPen(QPen(qc(p.border, 0.20), 1))
         painter.drawPath(path)
+
+        self._layout_items()
+        painter.setFont(self._font())
+        for i, (a, r) in enumerate(self._rects):
+            if a.separator:
+                painter.setPen(QPen(qc(p.border, 0.13), 1))
+                painter.drawLine(QPointF(r.left(), r.top()), QPointF(r.right(), r.top()))
+                continue
+            hovered = i == self._hover and a.enabled
+            if hovered:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(qc(p.accent, 0.16))
+                painter.drawRoundedRect(r, 7, 7)
+            painter.setPen(qc(p.accent if hovered else (p.text if a.enabled else p.text_muted)))
+            tx = r.left() + 12
+            if a.checkable:
+                if a.checked:
+                    painter.drawText(QRectF(r.left(), r.top(), 12, r.height()),
+                                     Qt.AlignCenter, "✓")
+                tx = r.left() + 24
+            painter.drawText(QRectF(tx, r.top(), r.right() - tx, r.height()),
+                             Qt.AlignVCenter | Qt.AlignLeft, a.text)
         painter.end()
-        super().paintEvent(e)
+
+    # ---------- 交互 ----------
+    def mouseMoveEvent(self, e):
+        idx = self._index_at(e.position().toPoint())
+        if idx != self._hover:
+            self._hover = idx
+            self.update()          # 全量重绘，旧高亮立即消失
+        self.setCursor(Qt.PointingHandCursor if self._hover >= 0 else Qt.ArrowCursor)
+
+    def leaveEvent(self, e):
+        if self._hover != -1:
+            self._hover = -1
+            self.update()
+
+    def mousePressEvent(self, e):
+        act = self._action_at(e.position().toPoint())
+        if act is None:
+            return
+        if not act.enabled:
+            return                 # 禁用项：不关闭、不触发
+        if act.checkable:
+            act.setChecked(not act.checked)
+        self._result = act
+        act.triggered.emit()
+        self.close()
+
+    def hideEvent(self, e):
+        if self._loop is not None:
+            self._loop.quit()
+        super().hideEvent(e)
+
+    # ---------- 弹出 ----------
+    def exec(self, global_pos) -> _MenuAction | None:
+        """弹出并阻塞，返回被点中的动作（未选择返回 None），同 QMenu.exec。"""
+        self._result = None
+        self._place(global_pos)
+        BACKDROP.snapshot(self.screen())   # 先取样，才模糊「背后真实内容」
+        self.show()
+        self._loop = QEventLoop()
+        self._loop.exec()
+        self._loop = None
+        return self._result
+
+    def popup_at(self, global_pos) -> None:
+        """直接弹出，不阻塞（托盘菜单用，走动作信号）。"""
+        self._place(global_pos)
+        BACKDROP.snapshot(self.screen())
+        self.show()
+
+    def _place(self, global_pos) -> None:
+        self._compute_size()
+        self._hover = -1
+        pos = QPointF(global_pos).toPoint()
+        screen = QApplication.screenAt(pos + QPoint(8, 8)) or QApplication.primaryScreen()
+        if screen is not None:
+            g = screen.availableGeometry()
+            pos.setX(max(g.left(), min(pos.x(), g.right() - self._w - 4)))
+            pos.setY(max(g.top(), min(pos.y(), g.bottom() - self._h - 4)))
+        self.move(pos)
 
 
 class Glyph(QLabel):

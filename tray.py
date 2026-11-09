@@ -10,11 +10,11 @@ from __future__ import annotations
 import time
 
 from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QCursor, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QSystemTrayIcon
 
 import core
-from widgets import ThemedMenu, menu_style
+from widgets import ThemedMenu
 
 
 def _elapsed_text(stamp: str) -> str:
@@ -97,7 +97,6 @@ class TrayIcon(QSystemTrayIcon):
         self._last_check = ""
         self._menu = ThemedMenu()
         self._build_menu()
-        self.setContextMenu(self._menu)
         self.activated.connect(self._on_activated)
         self.set_tooltip("", 0)
 
@@ -125,7 +124,7 @@ class TrayIcon(QSystemTrayIcon):
         self.act_quit.triggered.connect(self.quit_requested.emit)
 
     def refresh_style(self) -> None:
-        self._menu.setStyleSheet(menu_style())
+        self._menu.update()
 
     def set_autostart(self, on: bool) -> None:
         self.act_autostart.blockSignals(True)
@@ -175,3 +174,7 @@ class TrayIcon(QSystemTrayIcon):
     def _on_activated(self, reason) -> None:
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
             self.open_main.emit()
+        elif reason == QSystemTrayIcon.Context:
+            # QSystemTrayIcon.setContextMenu 只接受原生 QMenu（会留悬停残影），
+            # 这里右键时手动弹出同款自绘玻璃菜单
+            self._menu.popup_at(QCursor.pos())
