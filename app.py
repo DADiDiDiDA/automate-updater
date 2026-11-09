@@ -662,9 +662,10 @@ class MainWindow(QWidget):
         rect = QRectF(0, 0, 30, 30)
         path = QPainterPath()
         path.addRoundedRect(rect, 9, 9)
-        g = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        g.setColorAt(0, qc(p.accent, 0.95))
-        g.setColorAt(1, qc(p.accent_hover, 0.85))
+        # 与 assets/icon.ico 同款蓝紫渐变（make_icon.py 采样值）
+        g = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        g.setColorAt(0, QColor(108, 139, 254))
+        g.setColorAt(1, QColor(149, 110, 240))
         painter.fillPath(path, g)
         f = QFont("Segoe Fluent Icons")
         f.setPixelSize(15)
