@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.0"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -155,7 +155,7 @@ def default_config() -> dict:
         },
         "backup": {"enabled": True, "keep": 2},
         "dingtalk": {"enabled": False, "webhook": "", "secret": ""},
-        "ui": {"theme": "auto", "preset": "acrylic", "blur": True, "blur_tint": 150,
+        "ui": {"theme": "auto", "preset": "acrylic", "blur": True,
                "sort": "name", "prior": "update"},   # sort=基础排序, prior=特殊优先规则
         "programs": [],
         "last_scan": "",
@@ -437,6 +437,25 @@ def detect_proxy(ports) -> str | None:
     return None
 
 
+def mask_url(url: str | None) -> str:
+    """隐藏 URL 里的凭证（user:pass@），只保留协议+主机+端口，供日志/界面显示。
+
+    代理地址可能是 ``http://user:pass@host:port`` 形式，原样展示会把密码暴露在
+    Toast、侧栏和 crash.log 里；这里统一脱敏成 ``http://***@host:port``。
+    """
+    if not url:
+        return ""
+    try:
+        p = urllib.parse.urlsplit(url)
+    except Exception:
+        return url
+    host = p.hostname or ""
+    if p.port:
+        host = f"{host}:{p.port}"
+    cred = "***@" if (p.username or p.password) else ""
+    return f"{p.scheme}://{cred}{host}" if p.scheme else f"{cred}{host}"
+
+
 def http_get(url: str, proxy: str | None = None, timeout: int = 25, headers: dict | None = None):
     handlers = []
     if proxy:
@@ -494,15 +513,16 @@ def http_json(url: str, proxy: str | None, mirrors=None, retries: int = 1,
     """
     ms = [m for m in (mirrors or []) if m]
     preferred = ms[0] if ms else None
+    # (proxy, url, 是否官方直连)
     cands = []
     if proxy:
-        cands.append((proxy, url))
+        cands.append((proxy, url, False))
     if preferred:
-        cands.append((None, preferred.rstrip("/") + "/" + url))
-    cands.append((None, url))
+        cands.append((None, preferred.rstrip("/") + "/" + url, False))
+    cands.append((None, url, True))          # 官方直连
     for m in (ms[1:] if preferred else []):
-        cands.append((None, m.rstrip("/") + "/" + url))
-    for px, u in cands:
+        cands.append((None, m.rstrip("/") + "/" + url, False))
+    for px, u, official in cands:
         if deadline and time.time() > deadline:
             return None
         for _ in range(max(1, retries)):
@@ -511,7 +531,9 @@ def http_json(url: str, proxy: str | None, mirrors=None, retries: int = 1,
                               headers={"Accept": "application/vnd.github+json"}) as r:
                     return json.load(r)
             except urllib.error.HTTPError as e:
-                if e.code == 404:
+                # 只有官方源的 404 才算「资源不存在」；镜像/代理 404 说明它不支持该路径，
+                # 应继续回退到下一个候选，否则一个坏镜像会挡住官方直连
+                if e.code == 404 and official:
                     return None
             except Exception:
                 pass
@@ -519,31 +541,60 @@ def http_json(url: str, proxy: str | None, mirrors=None, retries: int = 1,
 
 
 def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
-             deadline: float = 0, expect_size: int = 0) -> bool:
-    """下载到 dest，支持断点续传。
+             deadline: float = 0, expect_size: int = 0, sha256: str = "") -> bool:
+    """下载到 dest，支持断点续传，支持 sha256 内容校验。
 
     实际写入 dest.part：下载中断时保留已传字节，下一次（或换下一个候选源）
     带 Range 头从断点继续；服务器不支持 Range（返回非 206）时自动从头重下。
     只有所有候选源都失败才返回 False，.part 仍保留待续传。
+
+    内容可信性：expect_size 只能证明「大小完整」，不能证明「内容可信」。有 sha256
+    时下载后必须校验哈希；校验失败会删除 .part 并失败（防止恶意镜像用同尺寸包替换）。
     """
     part = dest + ".part"
+    # 续传缓存必须绑定 URL：同资产名跨版本/跨源会复用同一 .part，换源后内容可能 A/B 拼接。
+    # 用 URL 哈希做缓存键，源变了就从头下，避免拼接出错误文件。
+    url_key = hashlib.sha256((url or "").encode("utf-8")).hexdigest()[:16]
+    part = dest + "." + url_key + ".part"
+    # 只允许 https 的镜像（明文 http 的镜像/代理会暴露内容，且无法信任）
     cands = []
     if proxy:
         cands.append((proxy, url))
     cands.append((None, url))
     for m in mirrors or []:
-        cands.append((None, m.rstrip("/") + "/" + url))
+        if str(m).lower().startswith("https://"):
+            cands.append((None, m.rstrip("/") + "/" + url))
     for px, u in cands:
         if deadline and time.time() > deadline:
             return False
         try:
             have = os.path.getsize(part) if os.path.exists(part) else 0
+            # 已完成的 .part：完整大小与预期一致时直接校验收尾，别再发 Range 触发 416
+            if have > 0 and expect_size and have == expect_size:
+                if _verify_digest(part, sha256):
+                    shutil.move(part, dest)
+                    return True
+                os.remove(part)
+                have = 0
             headers = {"Range": f"bytes={have}-"} if have > 0 else None
             with http_get(u, proxy=px, timeout=180, headers=headers) as r:
                 code = int(getattr(r, "status", 0) or 200)
+                if have > 0 and code == 416:
+                    # 服务器认为断点越界：可能文件已完成。若大小/哈希匹配则收尾，否则重下。
+                    os.remove(part)
+                    have = 0
+                    continue
                 if have > 0 and code != 206:
                     # 服务器不支持续传：丢弃旧数据从头下
                     have = 0
+                # 校验 Content-Range 起点：换源后若服务器从非 have 处返回，会拼出错误文件
+                cr = r.headers.get("Content-Range") or ""
+                if have > 0 and code == 206 and cr:
+                    m = re.match(r"bytes\s+(\d+)-", cr)
+                    if m and int(m.group(1)) != have:
+                        os.remove(part)
+                        have = 0
+                        continue
                 cl = int(r.headers.get("Content-Length") or 0)
                 total = have + cl if code == 206 else cl
                 done = have
@@ -569,9 +620,12 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
                 # GitHub API 给了 asset.size，用来挡住「无 Content-Length 时断连也当成功」
                 os.remove(part)
                 raise IOError(f"文件大小不符：{got}/{expect_size}")
-            if got > 1024:
-                shutil.move(part, dest)
-                return True
+            if not _verify_digest(part, sha256):
+                os.remove(part)
+                raise IOError("文件 sha256 校验失败（内容可能被镜像篡改）")
+            # 小文件（如 <1KB 的合法 zip）也应能成功：以哈希/大小为准，不再要求 >1024
+            shutil.move(part, dest)
+            return True
         except UpdateTimeout:
             return False
         except Exception:
@@ -579,24 +633,60 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
     return False
 
 
+def _verify_digest(path: str, sha256: str) -> bool:
+    """校验文件 sha256；未提供摘要时视为通过（大小校验由调用方负责）。"""
+    if not sha256:
+        return True
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(256 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest().lower() == sha256.lower()
+    except Exception:
+        return False
+
+
 # ==================================================================== 版本工具
 
-def ver_tuple(s: str):
-    return tuple(int(x) for x in re.findall(r"\d+", s or "")[:4])
+def _ver_parts(s: str):
+    """解析版本为 (数字元组, 预发布标识或 None)。解析失败返回 (None, None)。"""
+    s = (s or "").strip().lstrip("vV")
+    m = re.match(r"^(\d+(?:\.\d+)*)(?:[-_.]?([A-Za-z0-9][A-Za-z0-9_.-]*))?$", s)
+    if not m:
+        return None, None
+    try:
+        nums = tuple(int(x) for x in m.group(1).split("."))
+    except Exception:
+        return None, None
+    pre = m.group(2) or None
+    return nums, pre
 
 
 def ver_gt(a: str, b: str) -> bool:
-    # 稳定版不该被 beta / rc / nightly 之类的预发布 tag 顶掉
-    pre = re.compile(r"(?i)(alpha|beta|rc\d*|pre|dev|nightly|snapshot)")
-    if pre.search(a or "") and not pre.search(b or ""):
+    """比较 a 是否比 b 新。完整 SemVer 语义，解析失败返回 False（不把未知格式当最新）。"""
+    na, pa = _ver_parts(a)
+    nb, pb = _ver_parts(b)
+    if na is None and nb is None:
         return False
-    ta, tb = ver_tuple(a), ver_tuple(b)
-    if not ta or not tb:
-        return bool(ta) and not tb
-    n = max(len(ta), len(tb))
-    ta += (0,) * (n - len(ta))
-    tb += (0,) * (n - len(tb))
-    return ta > tb
+    if na is None:        # a 不可解析（如 nightly）→ 不算更新
+        return False
+    if nb is None:        # 本地不可解析，远端可解析 → 视为有更新
+        return True
+    # 数字段逐段比较（不截断）
+    n = max(len(na), len(nb))
+    ta = na + (0,) * (n - len(na))
+    tb = nb + (0,) * (n - len(nb))
+    if ta != tb:
+        return ta > tb
+    # 数字段相同：预发布版本低于正式版；同为预发布时按字典序比较
+    if pa is None and pb is None:
+        return False
+    if pa is None and pb is not None:
+        return True          # a 是正式版，b 是预发布 → a 更新
+    if pa is not None and pb is None:
+        return False
+    return pa > pb
 
 
 
@@ -649,6 +739,7 @@ class Item:
     local_manual: bool = False           # 版本号是否由用户手动标记
     asset: str = ""
     asset_size: int = 0
+    asset_digest: str = ""          # GitHub 提供的 sha256（若有），用于下载后校验内容可信性
     asset_regex: str = ""
     download_url: str = ""
     anchor: str = ""
@@ -677,9 +768,20 @@ class Engine:
         self.mirror = None
         self._mirror_lock = threading.Lock()
         self.cancel = threading.Event()
-        self._deadline = 0.0
-        self._timed_out = False
+        self._target_locks: dict[str, threading.Lock] = {}
+        self._target_locks_guard = threading.Lock()
         self.records = self._load_records()
+
+    def _lock_for(self, path: str) -> threading.Lock:
+        """按规范化目标路径取锁，更新与撤销对同一目录互斥，防止并发删除/复制出混合版本。"""
+        key = os.path.normcase(os.path.realpath(path))
+        with self._target_locks_guard:
+            return self._target_locks.setdefault(key, threading.Lock())
+
+    def _record_key(self, it) -> str:
+        """记录键：显示名 + 路径哈希，避免不同根目录下的同名程序互相污染 records。"""
+        ph = hashlib.sha256(os.path.normcase(os.path.realpath(it.path)).encode("utf-8")).hexdigest()[:10]
+        return f"{it.name}@{ph}"
 
     # ---------- 代理 ----------
     def resolve_proxy(self) -> str | None:
@@ -736,20 +838,29 @@ class Engine:
             if isinstance(data, dict):
                 out.update(data)
         except Exception:
-            pass
+            # 解析失败可能是上次非原子写留下半截文件；保留副本便于排查，不再静默当空
+            try:
+                if os.path.exists(self.records_path):
+                    shutil.copyfile(self.records_path, self.records_path + ".corrupt")
+            except Exception:
+                pass
         # 旧文件可能缺键，后面都是直接 self.records["versions"][name] 索引
         for k, v in (("versions", {}), ("update_times", {}), ("last_scan", "")):
             if not isinstance(out.get(k), type(v)):
                 out[k] = v
         return out
 
-    def save_records(self) -> None:
-        try:
+    def save_records(self, update_last_scan: bool = True) -> None:
+        # 原子写：先写临时文件再替换，避免崩溃/磁盘满留下空文件或混合 JSON
+        if update_last_scan:
             self.records["last_scan"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            with open(self.records_path, "w", encoding="utf-8") as f:
-                json.dump(self.records, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        os.makedirs(config_dir(), exist_ok=True)
+        tmp = self.records_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.records, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.records_path)
 
     # ---------- 镜像 ----------
     def mirrors(self) -> list:
@@ -764,7 +875,14 @@ class Engine:
         """返回可用镜像：优先用上次测速记录的最快项，并按需每天重新测速一次。"""
         with self._mirror_lock:
             if self.mirror is not None and not force:
-                return self.mirror or None
+                # 缓存值要连日期一起看：长期驻留进程跨天后也要重新测速，不能永远复用旧结果
+                mcfg = self.cfg.setdefault("mirrors", {})
+                today = time.strftime("%Y-%m-%d")
+                last = str(mcfg.get("last_check") or "")[:10]
+                if mcfg.get("daily_check", True) and last != today:
+                    self.mirror = None
+                else:
+                    return self.mirror or None
             cands = self.mirrors()
             if not cands:
                 self.mirror = ""
@@ -958,7 +1076,8 @@ class Engine:
 
     # ---------- 扫描单个对象 ----------
     def scan_item(self, it: Item) -> Item:
-        it.updated_at = (self.records.get("update_times") or {}).get(it.name, "")
+        rk = self._record_key(it)
+        it.updated_at = (self.records.get("update_times") or {}).get(rk, "")
         if not it.local_size:
             it.local_size = dir_size(it.path)
         try:
@@ -979,7 +1098,7 @@ class Engine:
             it.error = err
             it.detail = "网络/代理不可用：" + short(err, 90)
             return it
-        branch = git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip() or "HEAD"
+        branch = (git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout or "").strip() or "HEAD"
         up = git(repo, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
         if up.returncode == 0:
             uref = "@{u}"
@@ -989,8 +1108,15 @@ class Engine:
                 it.status = "error"
                 it.detail = f"分支 {branch} 没有可用的上游"
                 return it
-        behind = int(git(repo, ["rev-list", "--count", f"HEAD..{uref}"]).stdout.strip() or 0)
-        ahead = int(git(repo, ["rev-list", "--count", f"{uref}..HEAD"]).stdout.strip() or 0)
+        # 关键命令必须检查返回码：rev-list 失败时 stdout 为空，int("" or 0)=0 会误判成 latest
+        rl = git_checked(repo, ["rev-list", "--count", f"HEAD..{uref}"])
+        if rl is None:
+            it.status = "error"
+            it.detail = "统计落后提交失败"
+            return it
+        behind = int((rl.stdout or "").strip() or 0)
+        ra = git_checked(repo, ["rev-list", "--count", f"{uref}..HEAD"])
+        ahead = int((ra.stdout or "").strip() or 0) if ra is not None else 0
         it.local = (git(repo, ["rev-parse", "--short", "HEAD"]).stdout or "").strip()
         it.remote = (git(repo, ["rev-parse", "--short", uref]).stdout or "").strip()
         it.detail = f"{branch} · {how}" + (f" · 本地领先 {ahead}" if ahead else "")
@@ -998,7 +1124,8 @@ class Engine:
         if behind == 0:
             it.status = "latest"
             return it
-        dirty = (git(repo, ["status", "--porcelain"]).stdout or "").strip()
+        st = git_checked(repo, ["status", "--porcelain"])
+        dirty = (st.stdout or "").strip() if st is not None else ""
         it.status = "update"
         it.detail = f"落后 {behind} 个提交 · {branch}"
         it.message = f"落后 {behind} 个提交"
@@ -1036,15 +1163,17 @@ class Engine:
         if asset:
             it.asset = asset.get("name", "")
             it.asset_size = int(asset.get("size") or 0)
+            it.asset_digest = str(asset.get("digest") or "").strip() or ""
             it.download_url = asset.get("browser_download_url", "")
-        it.local = read_local_version(it.path, it.version_spec, it.name, self.records)
+        it.local = read_local_version(it.path, it.version_spec, it.name, self.records,
+                                      record_key=self._record_key(it))
         it.local_manual = False
         if not it.local:
             mv = self.manual_version(it.name)
             if mv:
                 it.local, it.local_manual = mv, True
         if not it.local:
-            it.local = self.records["versions"].get(it.name, "")
+            it.local = self.records["versions"].get(self._record_key(it), "")
         mark = "　· 手动标记" if it.local_manual else ""
         if not tag:
             it.status = "error"
@@ -1066,7 +1195,7 @@ class Engine:
             it.detail = f"{it.local}（最新 {tag}）{mark}"
         return it
 
-    def _git_fetch(self, repo: str):
+    def _git_fetch(self, repo: str, deadline: float = 0):
         base_cfg = ["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"]
         attempts = []
         if self.proxy:
@@ -1080,11 +1209,11 @@ class Engine:
         for label, cfg in attempts:
             if self.cancel.is_set():
                 return False, label, "已取消"
-            if self.expired():
+            if self.expired(deadline):
                 return False, label, "更新超时"
             try:
                 r = git(repo, ["fetch", "--prune", "--quiet"],
-                        timeout=int(max(15, self.remaining(180))), cfg=cfg)
+                        timeout=int(max(15, self.remaining(deadline, 180))), cfg=cfg)
                 if r.returncode == 0:
                     return True, label, ""
                 last = ((r.stderr or r.stdout) or "").strip()[:140]
@@ -1126,23 +1255,26 @@ class Engine:
         except Exception:
             return 600
 
-    def expired(self) -> bool:
-        return bool(self._deadline) and time.time() > self._deadline
+    def expired(self, deadline: float = 0) -> bool:
+        return bool(deadline) and time.time() > deadline
 
-    def remaining(self, cap: float = 1e9) -> float:
-        if not self._deadline:
+    def remaining(self, deadline: float = 0, cap: float = 1e9) -> float:
+        if not deadline:
             return cap
-        return max(0.0, min(cap, self._deadline - time.time()))
+        return max(0.0, min(cap, deadline - time.time()))
 
     def update_item(self, it: Item, on_progress=None) -> Item:
         limit = self.timeout_sec()
-        self._deadline = time.time() + limit
-        self._timed_out = False
+        deadline = time.time() + limit
+        with self._lock_for(it.path):
+            return self._update_item_locked(it, deadline, on_progress)
+
+    def _update_item_locked(self, it: Item, deadline: float = 0, on_progress=None) -> Item:
         try:
             it.state = "running"
             if it.kind == "git":
-                return self._update_git(it, on_progress)
-            return self._update_release(it, on_progress)
+                return self._update_git(it, deadline, on_progress)
+            return self._update_release(it, deadline, on_progress)
         except Exception as e:
             it.state = "failed"
             it.error = f"{type(e).__name__}: {e}"
@@ -1151,25 +1283,27 @@ class Engine:
 
     def _stamp_update(self, it: Item) -> None:
         """记录「上次更新时间」，供排序使用。"""
-        self.records.setdefault("update_times", {})[it.name] = time.strftime("%Y-%m-%d %H:%M:%S")
-        it.updated_at = self.records["update_times"][it.name]
+        rk = self._record_key(it)
+        self.records.setdefault("update_times", {})[rk] = time.strftime("%Y-%m-%d %H:%M:%S")
+        it.updated_at = self.records["update_times"][rk]
 
-    def _update_git(self, it: Item, on_progress=None) -> Item:
+    def _update_git(self, it: Item, deadline: float = 0, on_progress=None) -> Item:
         repo = it.path
-        ok, how, err = self._git_fetch(repo)
+        ok, how, err = self._git_fetch(repo, deadline)
         if not ok:
             it.state, it.status = "failed", "error"
             it.detail = "拉取失败：" + short(err, 90)
             return it
         branch = git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
         uref = "@{u}"
-        if git(repo, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).returncode != 0:
+        if (git(repo, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).returncode != 0):
             uref = f"origin/{branch}"
-        if (git(repo, ["status", "--porcelain"]).stdout or "").strip():
+        st = git_checked(repo, ["status", "--porcelain"])
+        if st is not None and (st.stdout or "").strip():
             it.state, it.status = "failed", "skip"
             it.detail = "本地有未提交改动，已跳过"
             return it
-        r = git(repo, ["merge", "--ff-only", uref], timeout=int(max(30, self.remaining(180))))
+        r = git(repo, ["merge", "--ff-only", uref], timeout=int(max(30, self.remaining(deadline, 180))))
         if r.returncode == 0:
             it.state, it.status = "done", "latest"
             it.local = (git(repo, ["rev-parse", "--short", "HEAD"]).stdout or "").strip()
@@ -1181,7 +1315,7 @@ class Engine:
         it.detail = short((r.stderr or r.stdout), 120)
         return it
 
-    def _update_release(self, it: Item, on_progress=None) -> Item:
+    def _update_release(self, it: Item, deadline: float = 0, on_progress=None) -> Item:
         if not it.download_url:
             it.state, it.status = "failed", "error"
             it.detail = "缺少下载地址"
@@ -1214,21 +1348,21 @@ class Engine:
             pr(0.02, "下载中（支持断点续传）")
             ok = download(it.download_url, archive, self.proxy, self.mirrors(),
                           progress_cb=lambda p: pr(0.02 + p * 0.6, "下载中"),
-                          cancel=self.cancel, deadline=self._deadline,
-                          expect_size=int(it.asset_size or 0))
+                          cancel=self.cancel, deadline=deadline,
+                          expect_size=int(it.asset_size or 0),
+                          sha256=it.asset_digest)
             if self.cancel.is_set():
                 it.state, it.status = "failed", "error"
                 it.detail = "已取消"
                 return it
             if not ok:
                 it.state, it.status = "failed", "error"
-                if self.expired():
-                    self._timed_out = True
+                if self.expired(deadline):
                     it.detail = f"更新超时（超过 {mins} 分钟），已中止"
                 else:
                     it.detail = "下载失败（网络/镜像均不可用或文件不完整）"
                 return it
-            if self.expired():
+            if self.expired(deadline):
                 it.state, it.status = "failed", "error"
                 it.detail = f"更新超时（超过 {mins} 分钟），已中止"
                 return it
@@ -1240,9 +1374,16 @@ class Engine:
                 it.detail = "解压失败（7z 需要 py7zr 或已安装 7-Zip）"
                 return it
             src_root = locate_root(ex, it.anchor)
+            # 锚点必验：找不到预期的锚点（exe/interface.json）就中止，绝不清空原程序再装错误内容
+            if it.anchor and not os.path.exists(os.path.join(src_root, it.anchor)):
+                it.state, it.status = "failed", "error"
+                it.detail = f"解压包内未找到预期锚点「{it.anchor}」，已中止（资产可能选错）"
+                return it
 
             pr(0.72, "备份中")
             if self.cfg.get("backup", {}).get("enabled", True):
+                # 备份失败必须终止：磁盘满/权限不足时若继续替换，旧文件删了、新文件
+                # 没装上、备份也没有，完全不可恢复。绝不吞异常继续。
                 try:
                     it.archived = backup_dir(it.path, it.name,
                                              int(self.cfg.get("backup", {}).get("keep", 2)))
@@ -1251,8 +1392,10 @@ class Engine:
                               encoding="utf-8") as f:
                         json.dump({"version": it.local, "time": time.strftime("%Y-%m-%d %H:%M:%S")},
                                   f, ensure_ascii=False)
-                except Exception:
-                    it.archived = ""
+                except Exception as e:
+                    it.state, it.status = "failed", "error"
+                    it.detail = f"备份失败，已中止更新：{short(str(e), 90)}"
+                    return it
 
             pr(0.8, "替换文件")
             try:
@@ -1279,14 +1422,21 @@ class Engine:
                 return it
             it.state, it.status = "done", "latest"
             it.local = it.remote or it.local
-            self.records["versions"][it.name] = it.remote
+            self.records["versions"][self._record_key(it)] = it.remote
             self._stamp_update(it)
-            # 更新成功：清掉下载缓存（本次压缩包 + 其它历史残留）
-            for f in glob.glob(os.path.join(cache_dir, "*")):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
+            # 成功立即原子写盘：只改内存的话，record 类型程序下次启动会把已装新版
+            # 误判为「待更新」。写盘失败单独报告，不能静默丢失，也不能把已装好的文件
+            # 误标成安装失败。
+            try:
+                self.save_records()
+            except Exception:
+                it.detail += "（注意：记录保存失败）"
+            # 更新成功：只清理当前这次下载的缓存文件，别把其它程序的断点/并发下载一起删掉
+            try:
+                if os.path.exists(archive):
+                    os.remove(archive)
+            except Exception:
+                pass
             pr(1.0, "完成")
             return it
         finally:
@@ -1294,6 +1444,10 @@ class Engine:
 
     def undo_update(self, it: Item, on_progress=None) -> Item:
         """撤销上次更新：把最近一次备份还原回程序目录。"""
+        with self._lock_for(it.path):
+            return self._undo_update_locked(it, on_progress)
+
+    def _undo_update_locked(self, it: Item, on_progress=None) -> Item:
         def pr(p, msg=""):
             it.progress = p
             if msg:
@@ -1303,6 +1457,7 @@ class Engine:
 
         it.state = "running"
         pr(0.1, "查找备份")
+        target_norm = os.path.normcase(os.path.realpath(it.path))
         cands = []
         if it.archived and os.path.isdir(it.archived):
             cands.append(it.archived)
@@ -1310,7 +1465,22 @@ class Engine:
         cache = os.path.join(os.path.dirname(it.path.rstrip(os.sep)), "Cache", "_backup")
         cands += sorted(glob.glob(os.path.join(cache, safe + "_*")),
                         key=os.path.getmtime, reverse=True)
-        bk = next((c for c in cands if os.path.isdir(c)), "")
+        # 按 manifest 核对备份归属：跳过不属于本程序（同名/同前缀碰撞）的备份
+        bk = ""
+        for c in cands:
+            if not os.path.isdir(c):
+                continue
+            mf = os.path.join(c, "_updater_manifest.json")
+            if os.path.exists(mf):
+                try:
+                    with open(mf, encoding="utf-8") as f:
+                        owner = (json.load(f).get("target") or "")
+                    if owner and os.path.normcase(owner) != target_norm:
+                        continue
+                except Exception:
+                    continue
+            bk = c
+            break
         if not bk:
             it.state, it.status = "failed", "error"
             it.detail = "没有可用的备份，无法撤销（备份关闭或从未更新过）"
@@ -1328,13 +1498,18 @@ class Engine:
             it.state, it.status = "failed", "error"
             it.detail = f"还原失败：{short(str(e), 90)}"
             return it
+        # 还原后重新读本地版本：元数据缺失时绝不能把已还原的旧版标成「最新」
+        new_local = ver or read_local_version(it.path, it.version_spec, it.name, self.records)
         if ver:
-            self.records["versions"][it.name] = ver
-            self.save_records()
-        it.local = ver or it.local
-        it.state = "done"
-        it.status = "update" if (it.remote and ver and it.remote != ver) else "latest"
-        it.detail = f"已撤销更新，恢复到 {ver or '备份版本'}（清理 {removed} 项，还原 {copied} 项）"
+            self.records["versions"][self._record_key(it)] = ver
+            self.save_records(update_last_scan=False)
+        it.local = new_local or it.local
+        it.state = "idle"          # 撤销完成归 idle，让行按钮恢复「更新」；不要用 done（会被显示成「已最新」禁用）
+        if it.remote and new_local:
+            it.status = "update" if ver_gt(it.remote, new_local) else "latest"
+        else:
+            it.status = "latest"
+        it.detail = f"已撤销更新，恢复到 {new_local or '备份版本'}（清理 {removed} 项，还原 {copied} 项）"
         pr(1.0, "完成")
         return it
 
@@ -1346,25 +1521,39 @@ class Engine:
 
 
 def send_dingtalk_raw(ding_cfg: dict, text: str, title: str = APP_NAME) -> bool:
-    """按 webhook + 加签密钥推送一条 markdown 消息。"""
+    """按 webhook + 加签密钥推送一条 markdown 消息。返回是否真正发送成功（errcode==0）。"""
     webhook = (ding_cfg.get("webhook") or "").strip()
     secret = (ding_cfg.get("secret") or "").strip()
     if not webhook:
+        return False
+    # 只允许 https：http 会明文发送 access_token 与消息内容
+    if not webhook.lower().startswith("https://"):
         return False
     url = webhook
     if secret:
         ts = str(round(time.time() * 1000))
         sign = urllib.parse.quote_plus(base64.b64encode(hmac.new(
             secret.encode(), f"{ts}\n{secret}".encode(), hashlib.sha256).digest()))
-        url = f"{webhook}&timestamp={ts}&sign={sign}"
+        # 用 urlparse 正确合并 query，先移除旧 timestamp/sign 再追加，避免重复参数或 fragment 错位
+        parts = urllib.parse.urlsplit(url)
+        q = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        q = [(k, v) for k, v in q if k not in ("timestamp", "sign")]
+        q += [("timestamp", ts), ("sign", sign)]
+        url = urllib.parse.urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(q), ""))
     payload = json.dumps({"msgtype": "markdown",
                           "markdown": {"title": title, "text": text}}).encode()
     try:
         req = urllib.request.Request(url, data=payload,
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=12) as r:
-            r.read()
-        return True
+            body = r.read(64 * 1024)
+        # 业务失败（如加签错 310000）也当失败，别把 HTTP 200 当成功
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except Exception:
+            return True
+        return int(data.get("errcode", 0) or 0) == 0
     except Exception:
         return False
 
@@ -1465,7 +1654,7 @@ def guess_version_spec(path: str) -> dict:
 
 
 
-def read_local_version(target: str, spec: dict, name: str, records: dict) -> str:
+def read_local_version(target: str, spec: dict, name: str, records: dict, record_key: str = "") -> str:
     spec = spec or {}
     t = spec.get("type")
     try:
@@ -1483,30 +1672,39 @@ def read_local_version(target: str, spec: dict, name: str, records: dict) -> str
             p = os.path.join(target, spec.get("file", ""))
             if not os.path.exists(p):
                 return ""
-            r = subprocess.run(["powershell", "-NoProfile", "-Command",
-                                f'(Get-Item -LiteralPath "{p}").VersionInfo.FileVersion'],
-                               capture_output=True, text=True, encoding="utf-8",
-                               errors="replace", timeout=20, **SILENT)
+            # 路径经环境变量传给 PowerShell，绝不用双引号拼进 -Command：
+            # 路径里含 $(...) 会被当成子表达式执行（命令注入）
+            env = dict(os.environ)
+            env["_AU_EXE"] = p
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-Item -LiteralPath $env:_AU_EXE).VersionInfo.FileVersion"],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=20, env=env, **SILENT)
             v = (r.stdout or "").strip()
             return v if re.search(r"\d", v) else ""
         if t == "record":
-            return str(records.get("versions", {}).get(name, "") or "")
+            key = record_key or name
+            return str(records.get("versions", {}).get(key, "") or "")
     except Exception:
         return ""
     return ""
 
 
 def pick_asset(assets, pattern: str = ""):
-    """挑出 Windows 压缩包：优先匹配正则，否则按关键词+体积挑选。"""
+    """挑出 Windows 压缩包。显式正则（asset_regex）是「严格匹配」：零匹配/非法正则
+    都返回 None 让调用方报错，绝不悄悄退回通用 ZIP/7z 选一个（可能选到 Linux 包）。"""
     if not assets:
         return None
     if pattern:
         try:
-            hit = [a for a in assets if re.search(pattern, a.get("name", ""), re.I)]
-            if hit:
-                return max(hit, key=lambda a: int(a.get("size") or 0))
+            rx = re.compile(pattern, re.I)
         except re.error:
-            pass
+            return None
+        hit = [a for a in assets if rx.search(a.get("name", ""))]
+        if not hit:
+            return None
+        return max(hit, key=lambda a: int(a.get("size") or 0))
     arcs = [a for a in assets
             if re.search(r"\.(zip|7z)$", a.get("name", ""), re.I)
             and not re.search(r"(source|sha256|checksum|symbol)", a.get("name", ""), re.I)]
@@ -1517,36 +1715,93 @@ def pick_asset(assets, pattern: str = ""):
     return max(pool, key=lambda a: int(a.get("size") or 0))
 
 
+def _safe_join(dest: str, member: str) -> str | None:
+    """把归档成员名解析到 dest 内的绝对路径；越界（.. / 绝对 / 盘符 / 链接）返回 None。"""
+    name = (member or "").replace("\\", "/")
+    if name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+        return None
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        return None
+    target = os.path.abspath(os.path.join(dest, *parts))
+    dest_abs = os.path.abspath(dest)
+    if target != dest_abs and not target.startswith(dest_abs + os.sep):
+        return None
+    return target
+
+
 def extract_archive(archive: str, dest: str) -> bool:
-    """解压 zip / 7z。zip 用内置；7z 依次尝试 py7zr、Windows 自带 tar(bsdtar)、7-Zip。"""
-    os.makedirs(dest, exist_ok=True)
+    """安全解压 zip / 7z。zip 用内置并做路径穿越防护；7z 依次尝试 py7zr、bsdtar、7-Zip。
+
+    每个后端都用一个全新的空目录，成功后只接受该次产物；避免某个后端部分解压失败后，
+    残留文件混入下一个后端继续处理的目录。
+    """
     low = archive.lower()
     if low.endswith(".zip"):
-        try:
-            with zipfile.ZipFile(archive) as z:
-                z.extractall(dest)
-            return True
-        except Exception:
-            pass
+        return _extract_zip(archive, dest)
+    # 7z 用外部工具，先解到独立临时目录再校验成员，再移入 dest
+    tmp = tempfile.mkdtemp(prefix="autoupd_x_")
     try:
-        import py7zr
-        with py7zr.SevenZipFile(archive, mode="r") as z:
-            z.extractall(dest)
-        if any(os.scandir(dest)):
+        ok = False
+        try:
+            import py7zr
+            with py7zr.SevenZipFile(archive, mode="r") as z:
+                z.extractall(tmp)
+            ok = any(os.scandir(tmp))
+        except Exception:
+            ok = False
+        if not ok:
+            for cmd in (["C:\\Windows\\System32\\tar.exe", "-xf", archive, "-C", tmp],
+                        ["C:\\Program Files\\7-Zip\\7z.exe", "x", archive, f"-o{tmp}", "-y"],
+                        ["C:\\Program Files (x86)\\7-Zip\\7z.exe", "x", archive, f"-o{tmp}", "-y"]):
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                       errors="replace", timeout=1800, **SILENT)
+                    if r.returncode == 0 and any(os.scandir(tmp)):
+                        ok = True
+                        break
+                except Exception:
+                    continue
+        if not ok:
+            return False
+        # 校验解压产物没有越界/链接后，再搬进 dest
+        for dirpath, dirnames, filenames in os.walk(tmp):
+            dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+            for fn in filenames:
+                p = os.path.join(dirpath, fn)
+                if os.path.islink(p):
+                    return False
+            for d in dirnames:
+                if os.path.islink(os.path.join(dirpath, d)):
+                    return False
+        os.makedirs(dest, exist_ok=True)
+        for entry in os.listdir(tmp):
+            shutil.move(os.path.join(tmp, entry), os.path.join(dest, entry))
+        return True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _extract_zip(archive: str, dest: str) -> bool:
+    """内置 zip 解压，逐成员做路径穿越防护。"""
+    try:
+        with zipfile.ZipFile(archive) as z:
+            for info in z.infolist():
+                # 目录项跳过；链接/设备项拒绝
+                if info.is_dir():
+                    continue
+                fmode = (info.external_attr >> 16) & 0o170000
+                if fmode == 0o120000:   # symlink
+                    return False
+                target = _safe_join(dest, info.filename)
+                if target is None:
+                    return False
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with z.open(info) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out, 256 * 1024)
             return True
     except Exception:
-        pass
-    for cmd in (["C:\\Windows\\System32\\tar.exe", "-xf", archive, "-C", dest],
-                ["C:\\Program Files\\7-Zip\\7z.exe", "x", archive, f"-o{dest}", "-y"],
-                ["C:\\Program Files (x86)\\7-Zip\\7z.exe", "x", archive, f"-o{dest}", "-y"]):
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                               errors="replace", timeout=1800, **SILENT)
-            if r.returncode == 0 and any(os.scandir(dest)):
-                return True
-        except Exception:
-            continue
-    return False
+        return False
 
 
 def locate_root(extract_dir: str, anchor: str) -> str:
@@ -1620,6 +1875,13 @@ def clean_replace(src_root: str, dst: str, preserve) -> tuple[int, int]:
 
 
 def backup_dir(target: str, app_name: str, keep: int) -> str:
+    """备份程序目录，返回备份路径。
+
+    目录名用「清洗后的程序名 + 8 位随机 + 时间」保证唯一，避免中文名/空格名
+    （如 `Foo Bar` 与 `Foo_Bar`）清洗后前缀碰撞，撤销时把另一个程序的备份还原进来。
+    备份内写入 _updater_manifest.json 记录目标绝对路径，撤销前必须核对。
+    同秒并发时 dirs_exist_ok=True 会把两份备份合并，这里改成独占目录：已存在就重试新名字。
+    """
     cache = os.path.join(os.path.dirname(target.rstrip(os.sep)), "Cache", "_backup")
     try:
         os.makedirs(cache, exist_ok=True)
@@ -1627,8 +1889,20 @@ def backup_dir(target: str, app_name: str, keep: int) -> str:
         cache = os.path.join(config_dir(), "backups")
         os.makedirs(cache, exist_ok=True)
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", app_name)
-    out = os.path.join(cache, f"{safe}_{time.strftime('%Y%m%d_%H%M%S')}")
-    shutil.copytree(target, out, dirs_exist_ok=True)
+    target_norm = os.path.normcase(os.path.realpath(target))
+    out = ""
+    for _ in range(20):
+        cand = os.path.join(cache, f"{safe}_{time.strftime('%Y%m%d_%H%M%S')}_{os.urandom(4).hex()}")
+        if not os.path.exists(cand):
+            out = cand
+            break
+    if not out:
+        raise RuntimeError("无法创建唯一备份目录")
+    shutil.copytree(target, out, dirs_exist_ok=False)
+    with open(os.path.join(out, "_updater_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"target": target_norm, "app_name": app_name,
+                   "time": time.strftime("%Y-%m-%d %H:%M:%S")}, f, ensure_ascii=False)
+    # 清理超量旧备份：只按「同一程序前缀」收集，避免误删其它程序的备份
     olds = sorted(glob.glob(os.path.join(cache, safe + "_*")), key=os.path.getmtime, reverse=True)
     for old in olds[max(1, keep):]:
         shutil.rmtree(old, ignore_errors=True)
@@ -1666,6 +1940,15 @@ def git(repo: str, args, timeout=120, cfg=None):
     cmd += args
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                           errors="replace", timeout=timeout, **SILENT)
+
+
+def git_checked(repo: str, args, timeout=120, cfg=None):
+    """执行 git 命令并检查返回码；失败时返回 None（调用方必须处理），避免把空 stdout
+    当成「没有落后提交 / 工作区干净」这类错误结论。"""
+    r = git(repo, args, timeout=timeout, cfg=cfg)
+    if r.returncode != 0:
+        return None
+    return r
 
 
 def is_https_github(repo: str) -> bool:

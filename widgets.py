@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsOpacityEffect, QHB
                                QWidget)
 
 from backdrop import BACKDROP, paint_glass
-from theme import GLYPH, THEME, card_color, flat, qc, rgba, scoped, tint
+from theme import (GLYPH, THEME, badge_fg, card_color, flat, glyph_font, qc, rgba, scoped,
+                   tint)
 
 
 class _MenuAction(QObject):
@@ -239,8 +240,7 @@ class Glyph(QLabel):
         self._size = size
         self._color = color
         self.setText(GLYPH.get(name, name))
-        f = QFont("Segoe Fluent Icons")
-        f.setPixelSize(size)
+        f = glyph_font(size)
         self.setFont(f)
         self.setFixedSize(size + 6, size + 6)
         self.setAlignment(Qt.AlignCenter)
@@ -363,6 +363,14 @@ class NavButton(QWidget):
         self.setFixedHeight(42)
         self.setCursor(Qt.PointingHandCursor)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAccessibleName(text)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.clicked.emit(self.key)
+            return
+        super().keyPressEvent(e)
 
     def set_active(self, on: bool) -> None:
         if self.active != on:
@@ -401,8 +409,7 @@ class NavButton(QWidget):
             painter.drawRoundedRect(rect, p.radius_btn + 2, p.radius_btn + 2)
 
         color = p.text if self.active else (p.text if self._hover else p.text_dim)
-        f = QFont("Segoe Fluent Icons")
-        f.setPixelSize(17)
+        f = glyph_font(17)
         painter.setFont(f)
         painter.setPen(QPen(qc(color if self.active else p.text_muted)))
         painter.drawText(QRectF(rect.left() + 12, rect.top(), 24, rect.height()),
@@ -428,9 +435,16 @@ class ToggleSwitch(QWidget):
         self._pos = 1.0 if checked else 0.0
         self.setFixedSize(44, 24)
         self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
         self._anim = QPropertyAnimation(self, b"knob", self)
         self._anim.setDuration(160)
         self._anim.setEasingCurve(QEasingCurve.OutCubic)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.setChecked(not self._checked, emit=True)
+            return
+        super().keyPressEvent(e)
 
     def isChecked(self) -> bool:
         return self._checked
@@ -554,7 +568,7 @@ class Badge(QWidget):
         bg.setAlphaF(0.16)
         painter.fillPath(path, bg)
         painter.setFont(self.font())
-        painter.setPen(qc(col.name(), 0.95))
+        painter.setPen(qc(badge_fg(col.name(), THEME.p.dark), 0.95))
         painter.drawText(self.rect(), Qt.AlignCenter, self._text)
         painter.end()
 
@@ -581,6 +595,10 @@ class Chip(QPushButton):
 
     def set_count(self, n: int) -> None:
         self._count = n
+        self._apply()
+
+    def refresh_theme(self) -> None:
+        """主题切换后重刷配色（与 SearchBox/ThemedCombo 保持同名协议）。"""
         self._apply()
 
     def _apply(self) -> None:
@@ -1344,6 +1362,10 @@ class ThemedCombo(QPushButton):
             f"border-radius:8px;color:{p.text_dim};font-family:'Microsoft YaHei UI';"
             f"font-size:12px;text-align:left;padding-left:11px;padding-right:24px;}}"
             f"QPushButton:hover{{background:{rgba(p.text, 0.11)};color:{p.text};}}")
+
+    def refresh_theme(self) -> None:
+        """主题切换后重刷配色（与 Chip/SearchBox 保持同名协议）。"""
+        self._restyle()
 
     def paintEvent(self, e):
         super().paintEvent(e)

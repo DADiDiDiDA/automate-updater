@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import ctypes
+import html
 import json
 import math
 import os
 import sys
+import time
 import winreg
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal
@@ -22,7 +24,7 @@ import autostart
 from backdrop import BACKDROP
 from pages import (HomePage, ItemListView, MirrorDialog, PreserveDialog, SettingsPage,
                    ThemedDialog, VersionDialog, _label)
-from theme import GLYPH, THEME, build_qss, flat, qc, scoped, tint
+from theme import GLYPH, THEME, build_qss, glyph_font, qc, tint
 from tray import TrayIcon
 from widgets import NavButton, Toast
 
@@ -168,9 +170,16 @@ class UndoWorker(QThread):
         self.item = item
 
     def run(self):
-        res = self.engine.undo_update(
-            self.item, on_progress=lambda i, p, m=None: None)
-        self.done.emit(res)
+        try:
+            res = self.engine.undo_update(
+                self.item, on_progress=lambda i, p, m=None: None)
+        except Exception as e:
+            self.item.state = "failed"
+            self.item.status = "error"
+            self.item.detail = f"撤销异常：{type(e).__name__}: {e}"
+            res = self.item
+        finally:
+            self.done.emit(res)
 
 
 
@@ -306,7 +315,6 @@ class MainWindow(QWidget):
         self.items: list[core.Item] = []
         self.scan_worker = None
         self.update_worker = None
-        self.prep_worker = None
         self.tray: TrayIcon | None = None
         self._silent_scan = start_hidden
         self._last_upd_sig = None   # 上次弹过通知的待更新名单，避免重复弹窗
@@ -542,6 +550,12 @@ class MainWindow(QWidget):
         page.mirror_probe_requested.connect(self._probe_mirrors)
         page.mirror_manage_requested.connect(self._manage_mirrors)
         page.proxy_changed.connect(self._on_proxy_changed)
+        page.mirrors_changed.connect(self._on_mirrors_changed)
+
+    def _on_mirrors_changed(self) -> None:
+        # 镜像总开关/每日测速开关变了：清掉缓存镜像，下次检查按新设置重新走
+        self.engine.mirror = None
+        self._refresh_net_info()
 
     def _probe_mirrors(self) -> None:
         """设置页「立即测速」：后台线程并发测速所有镜像。"""
@@ -587,7 +601,7 @@ class MainWindow(QWidget):
         proxy = self.engine.refresh_proxy()
         self._update_brand()
         if proxy:
-            self.toast.show_text(f"代理已切换为 {proxy}")
+            self.toast.show_text(f"代理已切换为 {core.mask_url(proxy)}")
         else:
             self.toast.show_text("当前不使用代理，走直连 / 镜像加速")
 
@@ -657,8 +671,7 @@ class MainWindow(QWidget):
         g.setColorAt(0, QColor(108, 139, 254))
         g.setColorAt(1, QColor(149, 110, 240))
         painter.fillPath(path, g)
-        f = QFont("Segoe Fluent Icons")
-        f.setPixelSize(15)
+        f = glyph_font(15)
         painter.setFont(f)
         painter.setPen(QPen(qc("#FFFFFF", 0.96)))
         painter.drawText(rect, Qt.AlignCenter, GLYPH["refresh"])
@@ -886,31 +899,45 @@ class MainWindow(QWidget):
         self._shutting_down = True
         self._quitting = True
         self.engine.cancel.set()
-        for name in ("scan_worker", "update_worker", "prep_worker",
-                     "_probe_worker", "_undo_worker"):
-            w = getattr(self, name, None)
-            if w is not None and hasattr(w, "isRunning") and w.isRunning():
-                w.wait(8000)
-        self._save_cfg()
-        if self.tray is not None:
-            self.tray.hide()
-        QApplication.quit()
+        try:
+            # 撤销不可取消，必须等它真正结束；其余线程请求取消后等待，超时也不静默放行
+            for name in ("scan_worker", "update_worker",
+                         "_probe_worker", "_undo_worker"):
+                w = getattr(self, name, None)
+                if w is not None and hasattr(w, "isRunning") and w.isRunning():
+                    if not w.wait(8000):
+                        # 仍在线程里写文件就退出会留下半残目录；继续延长等待
+                        w.wait(30000)
+            # 设置页的钉钉测试线程也纳入统一等待
+            ps = getattr(self, "page_settings", None)
+            dw = getattr(ps, "_ding_test_worker", None) if ps is not None else None
+            if dw is not None and hasattr(dw, "isRunning") and dw.isRunning():
+                dw.wait(12000)
+        finally:
+            # 保存失败不能阻断退出（否则下次退出因 _shutting_down 直接 return，再也退不掉）
+            try:
+                self._save_cfg()
+            except Exception:
+                pass
+            if self.tray is not None:
+                self.tray.hide()
+            QApplication.quit()
 
     def quit_app(self) -> None:
         self._shutdown()
 
     # ---------- 数据与扫描 ----------
     def _update_brand(self) -> None:
-        proxy = self.engine.proxy or "未检测到本地代理"
+        proxy = core.mask_url(self.engine.proxy) or "未检测到本地代理"
         self.side_status.setText(
-            f'<p style="margin:0;line-height:160%">网络：{proxy}</p>'
+            f'<p style="margin:0;line-height:160%">网络：{html.escape(proxy)}</p>'
             f'<p style="margin:4px 0 0 0;line-height:160%">扫描目录 {len(self.cfg.get("roots", []))} 个</p>')
         self._refresh_net_info()
 
     def _refresh_net_info(self) -> None:
         mode = (self.cfg.get("proxy") or {}).get("mode", "auto")
         tag = {"auto": "自动探测", "manual": "手动指定", "off": "不使用"}.get(mode, "自动探测")
-        proxy = self.engine.proxy or "未检测到"
+        proxy = core.mask_url(self.engine.proxy) or "未检测到"
         mirror = self.engine.mirror
         mirror_txt = "检测中…" if mirror is None else (mirror or "无可用镜像")
         self._net_text = f"代理：{proxy}（{tag}）\n镜像：{mirror_txt}"
@@ -931,15 +958,26 @@ class MainWindow(QWidget):
             if not silent:
                 self.toast.show_text("正在更新程序，等更新结束后再检查", ok=False)
             return
+        if self._undo_worker and self._undo_worker.isRunning():
+            if not silent:
+                self.toast.show_text("正在撤销更新，等结束后再检查", ok=False)
+            return
         self._silent_scan = silent
+        self._scan_silent = silent        # 本次任务快照，打开窗口不会改变它的语义
         self.engine.cancel.clear()
         self.page_home.set_scan_state(True, 0, 0, "正在准备…")
         self.page_home.last_scan_time = self.engine.records.get("last_scan", "—") or "—"
         items = self.engine.collect()
         if not items:
+            # 空结果也要清空旧列表/统计：删除全部根目录后，旧程序不能继续显示、更不能更新
+            self.items = []
+            self.page_home.set_items([])
+            self.progs_list.set_items([])
+            self.page_home.refresh_stats()
             self.page_home.set_scan_state(False)
             if self.tray is not None:
                 self.tray.set_busy(False)
+                self.tray.set_tooltip(self.engine.records.get("last_scan", ""), 0)
             if not silent:
                 self.toast.show_text("没有找到可检查的程序，请先在设置里添加文件夹", ok=False)
             return
@@ -971,37 +1009,46 @@ class MainWindow(QWidget):
         self.page_home.refresh_stats()
         upd = [i for i in items
                if i.status == "update" or (i.status == "unknown" and i.scanned)]
+        errs = [i for i in items if i.status == "error"]
+        cancelled = self.engine.cancel.is_set()
         if self.tray is not None:
             self.tray.set_busy(False)
             self.tray.set_tooltip(self.engine.records.get("last_scan", ""), len(upd))
         self._update_brand()
-        if not self._silent_scan:
-            self.toast.show_text(f"检查完成：{len(upd)} 个程序有新版本" if upd else "检查完成：全部已是最新")
+        if not getattr(self, "_scan_silent", False):
+            if cancelled:
+                self.toast.show_text("已停止检查，结果不完整", ok=False)
+            elif errs and not upd:
+                self.toast.show_text(f"检查完成：{len(errs)} 个程序未能确认", ok=False)
+            elif upd:
+                self.toast.show_text(f"检查完成：{len(upd)} 个程序有新版本")
+            else:
+                self.toast.show_text("检查完成：全部已是最新")
             return
         # ---- 后台检查：按设置决定通知 / 静默更新 ----
         if not upd:
             return
-        # 待更新名单和上次一样就不再弹：程序运行中会一直处于「待更新」，
-        # 每轮定时检查都弹会变成一堆重复小弹窗
-        sig = tuple(sorted((i.name, i.remote or "") for i in upd))
-        if sig == self._last_upd_sig:
-            return
-        self._last_upd_sig = sig
         bg = self.cfg.get("background", {})
         mode = bg.get("auto_mode", "off")
-        if mode == "off":
-            # 用户选了「不自动处理」：不弹任何托盘通知（图标角标已展示数量），
-            # 打开主界面即可看到详情
-            return
         names = "、".join(i.name for i in upd[:6]) + ("…" if len(upd) > 6 else "")
-        if mode in ("silent", "notify"):
-            if mode == "notify":
-                self._notify(f"发现 {len(upd)} 个新版本",
-                             f"正在后台更新：{names}")
-            self._start_update(upd, background=True)
-        else:
-            self._notify(f"发现 {len(upd)} 个程序有新版本",
-                         f"{names}\n右键托盘图标可以静默更新，或打开主界面查看详情。")
+        # 去重签名必须纳入「策略」：off 只通知过一次，之后改成自动更新时，相同版本名单
+        # 若被提前去重，自动更新永远不会执行。分开「通知去重」和「自动更新去重」。
+        sig = tuple(sorted((i.name, i.remote or "") for i in upd))
+        if mode == "off":
+            # 用户选了「只通知不自动更新」：必须真的通知，否则这个选项名不副实
+            if sig != self._last_upd_sig:
+                self._last_upd_sig = sig
+                self._notify(f"发现 {len(upd)} 个程序有新版本",
+                             f"{names}\n右键托盘图标可以静默更新，或打开主界面查看详情。")
+            return
+        # 自动更新模式（silent / notify）：按「是否已处理过」去重，处理失败则允许下次重试
+        if sig == getattr(self, "_last_auto_sig", None):
+            return
+        if mode == "notify":
+            self._notify(f"发现 {len(upd)} 个新版本",
+                         f"正在后台更新：{names}")
+        self._last_auto_sig = sig
+        self._start_update(upd, background=True)
 
     def cancel_tasks(self) -> None:
         self.engine.cancel.set()
@@ -1045,6 +1092,9 @@ class MainWindow(QWidget):
         if from_user and self.scan_worker and self.scan_worker.isRunning():
             # 用户手动点更新时别和扫描抢同一批 items；自动更新走另一条路径不受影响
             self.toast.show_text("正在检查新版本，等检查结束后再更新", ok=False)
+            return
+        if self._undo_worker and self._undo_worker.isRunning():
+            self.toast.show_text("正在撤销更新，等结束后再更新", ok=False)
             return
         if self.update_worker and self.update_worker.isRunning():
             # 已有任务在跑：不丢弃请求，加入待更新队列，本轮结束后自动继续
@@ -1100,6 +1150,9 @@ class MainWindow(QWidget):
     def _on_update_all_done(self, items) -> None:
         ok = sum(1 for i in items if i.state == "done")
         bad = sum(1 for i in items if i.state == "failed")
+        # 有失败项时清掉自动更新去重标记，下轮扫描会重试，避免「失败一次就再也不更新」
+        if bad:
+            self._last_auto_sig = None
         background = getattr(self, "_background_update", False)
         self._background_update = False
         if background:
@@ -1121,11 +1174,12 @@ class MainWindow(QWidget):
         # 队列：攒齐所有批次再统一发一次通知（以前每批弹一条，还会重跑时清掉「停止」）
         self._running_targets = []
         self._queue_results = (getattr(self, "_queue_results", None) or []) + list(items)
+        # 直接由 finished_all 续跑下一批，不用 singleShot 延时：
+        # 延时窗口内用户再点「全部更新」会启动第二个 worker，两个线程同时写同一目录
         if self._pending_updates:
             nxt = self._pending_updates[:]
             self._pending_updates = []
-            QTimer.singleShot(300, lambda: self._launch_update(
-                nxt, background, keep_cancel=True))
+            self._launch_update(nxt, background, keep_cancel=True)
             return
         all_items = self._queue_results
         self._queue_results = []
@@ -1189,16 +1243,22 @@ class MainWindow(QWidget):
         if it.state == "running":
             self.toast.show_text(f"{it.name} 正在更新，等结束后再撤销", ok=False)
             return
+        if (self.update_worker and self.update_worker.isRunning()) or self._pending_updates:
+            self.toast.show_text("有更新任务进行中，等结束后再撤销", ok=False)
+            return
         if self._undo_worker and self._undo_worker.isRunning():
             self.toast.show_text("已有一个撤销任务在进行中", ok=False)
             return
         self.toast.show_text(f"正在把 {it.name} 还原到更新前的备份…")
+        it.state = "running"            # 立即在 GUI 线程置 running，禁用相关操作
+        self.page_home.update_item(it)
+        self.progs_list.update_item(it)
         self._undo_worker = UndoWorker(self.engine, it)
         self._undo_worker.done.connect(self._on_undo_done)
         self._undo_worker.start()
 
     def _on_undo_done(self, it) -> None:
-        ok = it.state == "done"
+        ok = it.state != "failed"
         self.toast.show_text(f"{it.name}：{it.detail}", ok=ok)
         for i, old in enumerate(self.items):
             if old.key == it.key:
@@ -1379,7 +1439,10 @@ def main() -> int:
 
     QLocalServer.removeServer(ipc_key)            # 清理上次异常退出留下的名字
     server = QLocalServer()
-    server.listen(ipc_key)
+    if not server.listen(ipc_key):
+        # 监听失败（另一个实例抢先 / 名字被占）：绝不能再建第二套完整实例
+        print(f"无法建立单实例服务：{server.errorString()}", file=sys.stderr)
+        return 0
 
     win = MainWindow(start_hidden=start_hidden)
 
@@ -1397,17 +1460,33 @@ def main() -> int:
                 except Exception:
                     return                  # 分包没收齐
                 st["done"] = True
-                if payload.get("show") or not payload.get("hidden"):
+                if isinstance(payload, dict) and (payload.get("show") or not payload.get("hidden")):
+                    win.show_main()
+
+            def _try_parse(st):
+                # 数据可能在 disconnected 之前就全部到达，但 readyRead 没再触发；
+                # 断开前先尝试解析剩余缓冲，否则 JSON 负载会丢
+                if st["done"]:
+                    return
+                try:
+                    payload = json.loads(st["buf"].decode("utf-8"))
+                except Exception:
+                    return
+                st["done"] = True
+                if isinstance(payload, dict) and (payload.get("show") or not payload.get("hidden")):
                     win.show_main()
 
             def _on_disconnect(c=conn, st=state):
+                _try_parse(st)
                 # 兼容旧版只发 b"show" 的客户端
-                if not st["done"] and st["buf"].strip() in (b"show", b""):
+                if not st["done"] and st["buf"].strip() == b"show":
                     win.show_main()
                 c.deleteLater()
 
             conn.readyRead.connect(_read)
             conn.disconnected.connect(_on_disconnect)
+            # 连接后立即主动读一次：数据可能先于 readyRead 到达
+            _read(conn, state)
 
     server.newConnection.connect(_on_second_instance)
 

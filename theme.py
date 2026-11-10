@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFont, QFontDatabase
 
 
 def rgba(hex_color: str, alpha: float) -> str:
@@ -105,7 +105,7 @@ MIUIX_DARK = Palette(
     id="miuix", label="Miuix", dark=True,
     bg="#101012", card="#1D1D20", card_alt="#26262A", sidebar="#17171A",
     border="#FFFFFF", text="#F0F0F2", text_dim="#BCBCC4", text_muted="#95959D",
-    accent="#3482FF", accent_hover="#4E93FF", accent_on="#FFFFFF",
+    accent="#3482FF", accent_hover="#4E93FF", accent_on="#08101F",
     accent_soft="#3482FF", success="#37C46B", warning="#FFB020", danger="#FF5B4E",
     radius_card=20, radius_btn=16, radius_chip=14,
     card_alpha=0.96, border_alpha=0.06, window_alpha=0.97, support_blur=False,
@@ -370,9 +370,14 @@ def card_color(p: Palette, hover: bool = False, alpha_scale: float = 1.0):
 
     card_alpha 很低（<=0.15）说明是「玻璃叠层」风格，用白色薄层提亮；
     否则是实心卡片（莫奈 / Miuix），必须用 palettes 里定义的卡片色。
+    深色玻璃皮肤一旦关闭模糊，白色薄层失去模糊底托，必须回退到略亮于背景的
+    深色实色，否则会出现刺眼的纯白卡片。
     """
     alpha = (p.card_alpha if THEME.blur_active else 1.0) * alpha_scale
     if p.dark and p.card_alpha <= 0.15:
+        if not THEME.blur_active:
+            base = QColor(p.bg).lighter(118 if hover else 112)
+            return qc(base.name(), 1.0)
         if hover:
             alpha = min(1.0, alpha + 0.02)
         return qc("#FFFFFF", alpha)
@@ -383,6 +388,68 @@ def contrast_text(hex_color: str) -> str:
     c = QColor(hex_color)
     lum = (0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()) / 255
     return "#111318" if lum > 0.6 else "#FFFFFF"
+
+
+def _rel_lum(c: QColor) -> float:
+    def ch(v: int) -> float:
+        s = v / 255.0
+        return s / 12.92 if s <= 0.04045 else ((s + 0.055) / 1.055) ** 2.4
+    return 0.2126 * ch(c.red()) + 0.7152 * ch(c.green()) + 0.0722 * ch(c.blue())
+
+
+def wcag_ratio(fg: QColor, bg: QColor) -> float:
+    """两个颜色之间的 WCAG 对比度（1~21）。"""
+    l1, l2 = _rel_lum(fg), _rel_lum(bg)
+    if l1 < l2:
+        l1, l2 = l2, l1
+    return (l1 + 0.05) / (l2 + 0.05)
+
+
+def badge_fg(hex_color: str, dark: bool) -> str:
+    """Badge 文字前景色：相对「浅色卡片底」（light）或「深色卡片底」（dark）调到 >=4.5:1。
+
+    徽章背景只铺 16% 的彩色（其余是卡片底色），所以文字可读性其实取决于它相对
+    卡片底色的对比度，而不是相对那层淡彩。这里以白色（light）/ 深灰（dark）为基准，
+    逐步加深或加亮状态色直到达标，避免出现「绿字浅底 2.6:1」这种看不清的情况。
+    """
+    c = QColor(hex_color)
+    bg = QColor("#FFFFFF") if not dark else QColor("#15171C")
+    for _ in range(40):
+        if wcag_ratio(c, bg) >= 4.5:
+            break
+        c = c.darker(108) if not dark else c.lighter(108)
+    return c.name()
+
+
+# ------------------------------------------------------------------ 图标字体
+
+_ICON_FONT_CACHE: str | None = None
+
+
+def icon_font_family() -> str:
+    """图标字体族：优先 Segoe Fluent Icons（Win11），缺失时回退 Segoe MDL2 Assets（Win10）。
+
+    Fluent Icons 是 Win11 才带的字体，Win10 上只有旧版 MDL2；两者大部分基础图标码点
+    继承一致，回退后 home/settings/close 等仍能正常显示，而不是一堆方框。结果缓存一次。
+    """
+    global _ICON_FONT_CACHE
+    if _ICON_FONT_CACHE is not None:
+        return _ICON_FONT_CACHE
+    fams = set(QFontDatabase.families())
+    if "Segoe Fluent Icons" in fams:
+        _ICON_FONT_CACHE = "Segoe Fluent Icons"
+    elif "Segoe MDL2 Assets" in fams:
+        _ICON_FONT_CACHE = "Segoe MDL2 Assets"
+    else:
+        _ICON_FONT_CACHE = "Segoe UI Symbol"
+    return _ICON_FONT_CACHE
+
+
+def glyph_font(size: int) -> QFont:
+    """构造指定像素大小的图标字体。"""
+    f = QFont(icon_font_family())
+    f.setPixelSize(size)
+    return f
 
 
 GLYPH = {

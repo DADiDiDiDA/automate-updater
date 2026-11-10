@@ -7,15 +7,15 @@ import os
 
 from PySide6.QtCore import QPoint, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,
+from PySide6.QtWidgets import (QDialog, QFileDialog,
                                QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect,
                                QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
                                QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
                                QStackedWidget, QVBoxLayout, QWidget)
 
 from backdrop import BACKDROP, paint_glass
-from theme import (GLYPH, PRESET_HINTS, PRESET_LABELS, PRESET_ORDER, THEME, flat, qc, rgba,
-                   scoped, tint)
+from theme import (GLYPH, PRESET_HINTS, PRESET_LABELS, PRESET_ORDER, THEME, flat, glyph_font,
+                   qc, rgba, scoped, tint)
 from widgets import (Card, Chip, ExpandSetting, Glyph, NumberStepper, ProgramRow, ProgressLine,
                      SearchBox, SegmentedControl, SettingGroup, SettingRow, StatTile, TabButton,
                      ThemedCombo, ToggleSwitch, WrapLabel)
@@ -54,6 +54,47 @@ def _label(text: str, size: int = 13, color_key: str = "text", bold: bool = Fals
         lbl.setWordWrap(False)
     tint(lbl, getattr(p, color_key))
     return lbl
+
+
+class SecretEdit(QWidget):
+    """密码式输入框 + 「显示/隐藏」切换按钮。
+
+    Webhook 的 access_token 与加签密钥都是敏感凭证，默认打码；点「显示」临时明文。
+    控件对外暴露 ``edit``（内部 QLineEdit），并转发 editingFinished / text / setText。
+    """
+
+    def __init__(self, text: str = "", placeholder: str = "", width: int = 330, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        self.edit = QLineEdit(text)
+        self.edit.setPlaceholderText(placeholder)
+        self.edit.setEchoMode(QLineEdit.Password)
+        self.edit.setMinimumWidth(width)
+        lay.addWidget(self.edit, 1)
+        self._btn = QPushButton("显示")
+        self._btn.setObjectName("link")
+        self._btn.setCursor(Qt.PointingHandCursor)
+        self._btn.setFixedHeight(28)
+        self._btn.clicked.connect(self._toggle)
+        lay.addWidget(self._btn, 0, Qt.AlignVCenter)
+
+    def _toggle(self) -> None:
+        show = self.edit.echoMode() == QLineEdit.Password
+        self.edit.setEchoMode(QLineEdit.Normal if show else QLineEdit.Password)
+        self._btn.setText("隐藏" if show else "显示")
+
+    # 转发常用接口，调用方无需直接访问 .edit
+    @property
+    def editingFinished(self):
+        return self.edit.editingFinished
+
+    def text(self) -> str:
+        return self.edit.text()
+
+    def setText(self, text: str) -> None:
+        self.edit.setText(text)
 
 
 class ItemListView(QWidget):
@@ -519,8 +560,7 @@ class ThemedDialog(QDialog):
         close.setFixedSize(24, 24)
         close.setCursor(Qt.PointingHandCursor)
         close.setText(GLYPH["close"])
-        f = QFont("Segoe Fluent Icons")
-        f.setPixelSize(10)
+        f = glyph_font(10)
         close.setFont(f)
         tp = THEME.p
         close.setStyleSheet(
@@ -1196,15 +1236,12 @@ class SettingsPage(QWidget):
         bl2.addWidget(self._sub_line("推送渠道", "可多选；都不选时只用系统通知", chips_box))
 
 
-        self.webhook_edit = QLineEdit(self.cfg.get("dingtalk", {}).get("webhook", ""))
-        self.webhook_edit.setPlaceholderText("https://oapi.dingtalk.com/robot/send?access_token=…")
-        self.webhook_edit.setMinimumWidth(330)
-        self.webhook_edit.editingFinished.connect(self._save_ding)
-        self.secret_edit = QLineEdit(self.cfg.get("dingtalk", {}).get("secret", ""))
-        self.secret_edit.setPlaceholderText("SEC…（加签密钥）")
-        self.secret_edit.setEchoMode(QLineEdit.Password)
-        self.secret_edit.setMinimumWidth(330)
-        self.secret_edit.editingFinished.connect(self._save_ding)
+        self.webhook_edit = SecretEdit(self.cfg.get("dingtalk", {}).get("webhook", ""),
+                                       "https://oapi.dingtalk.com/robot/send?access_token=…")
+        self.webhook_edit.edit.editingFinished.connect(self._save_ding)
+        self.secret_edit = SecretEdit(self.cfg.get("dingtalk", {}).get("secret", ""),
+                                      "SEC…（加签密钥）")
+        self.secret_edit.edit.editingFinished.connect(self._save_ding)
 
         ding_box = QWidget()
         flat(ding_box)
@@ -1663,3 +1700,8 @@ class SettingsPage(QWidget):
             card.update()
         for tab in (self.tab_general, self.tab_about):
             tab._apply()
+        # 下拉框 / 筛选胶囊内部用了内联样式，theme 切换后必须手动重刷，否则残留旧配色
+        for combo in self.findChildren(ThemedCombo):
+            combo.refresh_theme()
+        for chip in self.findChildren(Chip):
+            chip.refresh_theme()
