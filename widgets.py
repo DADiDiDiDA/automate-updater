@@ -1708,6 +1708,14 @@ class SettingRow(Card):
         self.desc_lbl.setText(text)
         self.desc_lbl.setVisible(bool(text))
 
+    def refresh_theme(self) -> None:
+        """主题/配色变化后重刷标题、说明与图标的文字颜色。"""
+        p = THEME.p
+        if self.icon is not None:
+            self.icon.set_color(p.text_dim)
+        tint(self.title_lbl, p.text)
+        tint(self.desc_lbl, p.text_muted)
+
 
 class SettingGroup(QLabel):
     """设置分组标题（行列表上方的小标题）。"""
@@ -1719,6 +1727,9 @@ class SettingGroup(QLabel):
         f.setWeight(QFont.DemiBold)
         self.setFont(f)
         self.setContentsMargins(4, 8, 0, 0)
+        tint(self, THEME.p.text_dim)
+
+    def refresh_theme(self) -> None:
         tint(self, THEME.p.text_dim)
 
 

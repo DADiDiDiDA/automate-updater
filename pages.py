@@ -1705,3 +1705,9 @@ class SettingsPage(QWidget):
             combo.refresh_theme()
         for chip in self.findChildren(Chip):
             chip.refresh_theme()
+        # 卡片标题/说明/图标、分组标题也是内联 tint 着色，必须重刷，
+        # 否则从深色切到浅色后会出现「浅色卡片 + 残留的深色浅字」看不清
+        for row in self.findChildren(SettingRow):
+            row.refresh_theme()
+        for grp in self.findChildren(SettingGroup):
+            grp.refresh_theme()
