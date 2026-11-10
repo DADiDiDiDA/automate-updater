@@ -271,17 +271,33 @@ class WrapLabel(QLabel):
         w = self.width()
         if w <= 0:
             return
+        # 必须先在「无最小高度约束」的干净状态下求 heightForWidth：QLabel 会把
+        # 已设的 minimumHeight 算进文本可用高度，导致算出来的值只增不减（窄窗口
+        # 折行撑到 24 后，拉宽也缩不回 11，行距就一直偏大）。
+        self.setMinimumHeight(0)
         h = self.heightForWidth(w)
-        if h > 0 and self.minimumHeight() != h:
+        if h > 0:
             self.setMinimumHeight(h)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self._sync_height()
 
-    def setText(self, text: str) -> None:
-        super().setText(text)
+    def showEvent(self, e):
+        # 从隐藏变可见（set_desc / set_summary 常这么做）时宽度刚定下，重算一次
+        super().showEvent(e)
         self._sync_height()
+
+    def setText(self, text: str) -> None:
+        # 动态改字（set_desc / set_summary）时控件往往还隐藏、宽度还是默认的 100px，
+        # 此刻 heightForWidth 会把短句误判成「折好几行」返回偏大的值并锁进
+        # minimumHeight；等真正显示、宽度变宽后 QLabel 换行缓存又不会自动缩回，
+        # 结果标题与说明之间被撑出一大块空白（行间距不对）。
+        # 所以这里只把旧高度清零并让布局重算，绝不在宽度未定时锁定高度；
+        # 真正的同步交给随后的 showEvent / resizeEvent（那时宽度才是可信的）。
+        super().setText(text)
+        self.setMinimumHeight(0)
+        self.updateGeometry()
 
 
 class Card(QFrame):
@@ -1655,6 +1671,14 @@ class ExpandSetting(Card):
         if self.desc_lbl is not None:
             self.desc_lbl.setText(text)
             self.desc_lbl.setVisible(bool(text))
+
+    def refresh_theme(self) -> None:
+        """主题/配色变化后重刷标题、说明与图标（chevron 自绘读动态色，无需刷）。"""
+        p = THEME.p
+        self.icon.set_color(p.text_dim)
+        tint(self.title_lbl, p.text)
+        tint(self.desc_lbl, p.text_muted)
+        self.chevron.update()
 
 
 class SettingRow(Card):

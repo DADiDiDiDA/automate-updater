@@ -52,6 +52,8 @@ def _label(text: str, size: int = 13, color_key: str = "text", bold: bool = Fals
     lbl.setFont(f)
     if not wrap:
         lbl.setWordWrap(False)
+    # 记下用的是哪个调色板键，主题切换时 refresh_theme 会据此重刷文字色
+    lbl.setProperty("_fg_key", color_key)
     tint(lbl, getattr(p, color_key))
     return lbl
 
@@ -1706,8 +1708,17 @@ class SettingsPage(QWidget):
         for chip in self.findChildren(Chip):
             chip.refresh_theme()
         # 卡片标题/说明/图标、分组标题也是内联 tint 着色，必须重刷，
-        # 否则从深色切到浅色后会出现「浅色卡片 + 残留的深色浅字」看不清
+        # 否则从深色切到浅色后会出现「浅色卡片 + 残留的深色浅字」看不清。
+        # ExpandSetting（可展开卡片）与 SettingRow 是并列的 Card 子类，得单独遍历。
         for row in self.findChildren(SettingRow):
+            row.refresh_theme()
+        for row in self.findChildren(ExpandSetting):
             row.refresh_theme()
         for grp in self.findChildren(SettingGroup):
             grp.refresh_theme()
+        # 通用兜底：_label() 生成的静态标签（展开卡片内的行、提示文字等）也带内联
+        # tint，按记录的颜色键统一重刷，避免每加一类控件就漏一类。
+        for w in self.findChildren(QWidget):
+            key = w.property("_fg_key")
+            if key:
+                tint(w, getattr(p, key, p.text))
