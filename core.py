@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -144,7 +144,10 @@ def default_config() -> dict:
             "last_check": "",
             "chosen": "",
         },
-        "update": {"timeout_min": 10, "install_mode": "clean"},   # clean 保留指定文件夹 | overwrite 直接覆盖
+        # clean 保留指定文件夹 | overwrite 直接覆盖
+        # retry_on_locked：目标文件被其它进程占用时自动暂停并重试，而不是直接判失败
+        "update": {"timeout_min": 10, "install_mode": "clean",
+                   "retry_on_locked": True, "retry_wait_min": 5},
         "background": {
             "close_to_tray": True,           # 关闭窗口时最小化到托盘
             "run_at_startup": False,         # 开机自启（后台静默）
@@ -189,13 +192,23 @@ def _normalize(cfg: dict) -> dict:
                 mm["list"].append(url)
         mm["seeded"] = len(DEFAULT_MIRRORS)
     if not isinstance(cfg.get("update"), dict):
-        cfg["update"] = {"timeout_min": 10, "install_mode": "clean"}
-    if cfg["update"].get("install_mode") not in ("clean", "overwrite"):
-        cfg["update"]["install_mode"] = "clean"
+        cfg["update"] = {}
+    u = cfg["update"]
+    u.setdefault("timeout_min", 10)
+    u.setdefault("install_mode", "clean")
+    u.setdefault("retry_on_locked", True)
+    u.setdefault("retry_wait_min", 5)
+    if u.get("install_mode") not in ("clean", "overwrite"):
+        u["install_mode"] = "clean"
     try:
-        cfg["update"]["timeout_min"] = max(1, int(cfg["update"].get("timeout_min") or 10))
+        u["timeout_min"] = max(1, int(u.get("timeout_min") or 10))
     except Exception:
-        cfg["update"]["timeout_min"] = 10
+        u["timeout_min"] = 10
+    u["retry_on_locked"] = bool(u.get("retry_on_locked", True))
+    try:
+        u["retry_wait_min"] = max(1, min(60, int(u.get("retry_wait_min") or 5)))
+    except Exception:
+        u["retry_wait_min"] = 5
     if not isinstance(cfg.get("preserve"), list):
         cfg["preserve"] = list(DEFAULT_PRESERVE)
     seen, cleaned = set(), []
@@ -747,6 +760,7 @@ class Item:
     version_spec: dict = field(default_factory=dict)
     state: str = "idle"            # idle | queued | running | done | failed
     scanned: bool = False          # 是否已完成本次检查
+    scanning: bool = False         # 本次检查正在进行（列表显示「检查中」而不是「待检查」）
     updated_at: str = ""           # 上次通过本程序更新成功的时间（排序用）
     progress: float = 0.0
     message: str = ""
@@ -1224,28 +1238,38 @@ class Engine:
     # ---------- 并发扫描 ----------
     def scan_all(self, items: list[Item], on_item=None, on_progress=None, workers: int = 6) -> list[Item]:
         # cancel 由 GUI 在启动 worker 前清理；这里再 clear 会吞掉刚点下的「停止」
+        # 全部并发提交，所以扫描期间每个未完成的行都应显示「检查中」。
+        for it in items:
+            it.scanning = True
         done = 0
         total = len(items)
         results: list[Item] = []
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(self.scan_item, it): it for it in items}
-            for fut in as_completed(futs):
-                it = futs[fut]
-                try:
-                    res = fut.result()
-                except Exception as e:
-                    it.status = "error"
-                    it.error = str(e)
-                    res = it
-                results.append(res)
-                done += 1
-                if on_item:
-                    on_item(res)
-                if on_progress:
-                    on_progress(done, total, res)
-                if self.cancel.is_set():
-                    break
-        self.save_records()
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(self.scan_item, it): it for it in items}
+                for fut in as_completed(futs):
+                    it = futs[fut]
+                    try:
+                        res = fut.result()
+                    except Exception as e:
+                        it.status = "error"
+                        it.error = str(e)
+                        res = it
+                    res.scanning = False
+                    it.scanning = False
+                    results.append(res)
+                    done += 1
+                    if on_item:
+                        on_item(res)
+                    if on_progress:
+                        on_progress(done, total, res)
+                    if self.cancel.is_set():
+                        break
+        finally:
+            # 取消 / 异常时没上报的行也必须复位，否则卡片会永远停在「检查中」
+            for it in items:
+                it.scanning = False
+            self.save_records()
         return results
 
     # ---------- 更新 ----------
@@ -1262,6 +1286,86 @@ class Engine:
         if not deadline:
             return cap
         return max(0.0, min(cap, deadline - time.time()))
+
+    # ---------- 文件占用：自动暂停 + 重试 ----------
+    LOCK_RETRY_INTERVAL = 3.0      # 每次重试间隔（秒）
+
+    def lock_wait_sec(self) -> float:
+        """文件被占用时最多等待多少秒；0 表示用户关闭了自动等待。"""
+        u = self.cfg.get("update", {}) or {}
+        if not u.get("retry_on_locked", True):
+            return 0.0
+        try:
+            return max(30.0, min(3600.0, float(u.get("retry_wait_min", 5) or 5) * 60))
+        except Exception:
+            return 300.0
+
+    def _wait_tick(self, deadline: float, wait_end: float) -> str:
+        """等一个重试间隔；0.5 秒粒度检查 cancel，用户点「停止」能立刻响应。"""
+        until = time.time() + self.LOCK_RETRY_INTERVAL
+        while True:
+            if self.cancel.is_set():
+                return "cancel"
+            now = time.time()
+            if self.expired(deadline) or now >= wait_end:
+                return "timeout"
+            left = until - now
+            if left <= 0:
+                return "ok"
+            if self.cancel.wait(min(0.5, left)):
+                return "cancel"
+
+    def _wait_for_process_close(self, exe_name: str, pr, deadline: float,
+                                wait_end: float) -> str:
+        """主 exe 还在运行就先等它退出，别白下载一整包再卡在替换阶段。"""
+        while is_process_running(exe_name):
+            if self.cancel.is_set():
+                return "已取消"
+            left = max(0, int(min(wait_end, deadline or wait_end) - time.time()))
+            if left <= 0:
+                return (f"等待超时：{exe_name} 仍在运行或已到更新时限，"
+                        f"已中止（关闭程序后点「重试」即可）")
+            pr(0.02, f"{exe_name} 正在运行，等待关闭后自动继续（剩余 {left} 秒）")
+            st = self._wait_tick(deadline, wait_end)
+            if st == "cancel":
+                return "已取消"
+            if st == "timeout":
+                return (f"等待超时：{exe_name} 仍在运行或已到更新时限，"
+                        f"已中止（关闭程序后点「重试」即可）")
+        return ""
+
+    def _install_with_retry(self, it: Item, src_root: str, pr,
+                            deadline: float, wait_end: float) -> str:
+        """执行替换；遇到文件占用则暂停、等待、重试，直到释放 / 取消 / 超时。"""
+        overwrite = (self.cfg.get("update", {}).get("install_mode", "clean") == "overwrite")
+        attempt = 0
+        while True:
+            attempt += 1
+            if self.cancel.is_set():
+                raise RuntimeError("已取消")
+            if self.expired(deadline):
+                raise RuntimeError(f"更新超时（超过 {self.timeout_sec() // 60} 分钟），已中止")
+            pr(0.8, "替换文件" if attempt == 1 else f"重试替换文件（第 {attempt} 次）")
+            try:
+                if overwrite:
+                    copied = copy_over(src_root, it.path, [])
+                    return f"已覆盖安装 {it.remote}（写入 {copied} 项）"
+                removed, copied = clean_replace(src_root, it.path, it.preserve)
+                return f"已更新到 {it.remote}（清理旧文件 {removed} 项，写入 {copied} 项）"
+            except Exception as e:
+                if not is_locked_error(e) or not wait_end:
+                    raise
+                why = short(str(e), 48)
+                left = max(0, int(min(wait_end, deadline or wait_end) - time.time()))
+                pr(0.8, f"文件被占用，{self.LOCK_RETRY_INTERVAL:g} 秒后重试"
+                        f"（剩余 {left} 秒）· {why}")
+                st = self._wait_tick(deadline, wait_end)
+                if st == "cancel":
+                    raise RuntimeError("已取消") from e
+                if st == "timeout":
+                    raise RuntimeError(
+                        f"文件一直被占用，已等待 {int(self.lock_wait_sec() // 60)} 分钟后中止："
+                        f"{why}") from e
 
     def update_item(self, it: Item, on_progress=None) -> Item:
         limit = self.timeout_sec()
@@ -1321,10 +1425,8 @@ class Engine:
             it.detail = "缺少下载地址"
             return it
         exe_name = os.path.basename(it.anchor or "")
-        if exe_name.lower().endswith(".exe") and is_process_running(exe_name):
-            it.state, it.status = "failed", "skip"
-            it.detail = f"{exe_name} 正在运行，请先关闭程序"
-            return it
+        wait_sec = self.lock_wait_sec()
+        wait_end = time.time() + wait_sec if wait_sec else 0
 
         def pr(p, msg=""):
             it.progress = p
@@ -1334,6 +1436,18 @@ class Engine:
                 on_progress(it, p, msg)
 
         mins = self.timeout_sec() // 60
+        if exe_name.lower().endswith(".exe") and is_process_running(exe_name):
+            if wait_end:
+                err = self._wait_for_process_close(exe_name, pr, deadline, wait_end)
+                if err:
+                    # 用 error 而不是 skip：行按钮会变成「重试」，用户关掉程序后可直接再点
+                    it.state, it.status = "failed", "error"
+                    it.detail = err
+                    return it
+            else:
+                it.state, it.status = "failed", "skip"
+                it.detail = f"{exe_name} 正在运行，请先关闭程序"
+                return it
 
         tmp = tempfile.mkdtemp(prefix="autoupd_")
         try:
@@ -1397,24 +1511,23 @@ class Engine:
                     it.detail = f"备份失败，已中止更新：{short(str(e), 90)}"
                     return it
 
-            pr(0.8, "替换文件")
             try:
-                if self.cfg.get("update", {}).get("install_mode", "clean") == "overwrite":
-                    # 直接覆盖：旧文件全部保留，只用新版同名内容替换
-                    copied = copy_over(src_root, it.path, [])
-                    it.detail = f"已覆盖安装 {it.remote}（写入 {copied} 项）"
-                else:
-                    removed, copied = clean_replace(src_root, it.path, it.preserve)
-                    it.detail = f"已更新到 {it.remote}（清理旧文件 {removed} 项，写入 {copied} 项）"
+                it.detail = self._install_with_retry(it, src_root, pr, deadline, wait_end)
             except Exception as e:
                 # 绝对不能标 latest / 写 records，否则用户目录残了却再也不会提示更新
                 rolled = ""
                 if it.archived and os.path.isdir(it.archived):
-                    try:
-                        clean_replace(it.archived, it.path, it.preserve)
-                        rolled = "，已自动回滚到更新前备份"
-                    except Exception:
-                        rolled = "，回滚也失败，请手动点「撤销上次更新」"
+                    # 占用可能还没释放，回滚也重试几次；不检查 cancel（回滚必须尽量完成）
+                    for _try in range(3):
+                        try:
+                            clean_replace(it.archived, it.path, it.preserve)
+                            rolled = "，已自动回滚到更新前备份"
+                            break
+                        except Exception as re:
+                            if not is_locked_error(re) or _try == 2:
+                                rolled = "，回滚也失败，请手动点「撤销上次更新」"
+                                break
+                            time.sleep(1.0)
                 else:
                     rolled = "（未开启备份，无法自动回滚）"
                 it.state, it.status = "failed", "error"
@@ -1820,18 +1933,32 @@ def locate_root(extract_dir: str, anchor: str) -> str:
     return cur
 
 
-def _force_remove(func, path, _):
-    try:
-        os.chmod(path, stat.S_IWRITE)
-        func(path)
-    except Exception:
-        pass
+class FileLockedError(RuntimeError):
+    """目标文件正被其它进程占用。调用方可以等待释放后重试，而不是直接判失败。"""
+
+
+def is_locked_error(exc: BaseException) -> bool:
+    """识别 Windows 文件占用（WinError 5/32/33）及其被包装成 RuntimeError 的情况。"""
+    if isinstance(exc, FileLockedError):
+        return True
+    if isinstance(exc, PermissionError):
+        return True
+    if getattr(exc, "winerror", None) in (5, 32, 33):
+        return True
+    s = str(exc).lower()
+    return any(k in s for k in (
+        "另一个程序正在使用", "正由另一进程使用", "被另一进程占用",
+        "being used by another process", "process cannot access the file",
+        "permission denied", "拒绝访问", "access is denied",
+        "winerror 32", "winerror 33", "winerror 5", "errno 13",
+    ))
 
 
 def copy_over(src_root: str, dst: str, preserve) -> int:
     """写入失败必须抛错：旧版这里静默吞异常，调用方却照样报「更新成功」。"""
     keep = {p.lower() for p in (preserve or [])}
     failures = []
+    locked = False
     n = 0
     for name in os.listdir(src_root):
         # _updater_undo.json 是备份目录里的内部元数据，不能随撤销拷回程序目录
@@ -1846,31 +1973,59 @@ def copy_over(src_root: str, dst: str, preserve) -> int:
             n += 1
         except Exception as e:
             failures.append(f"{name}: {e}")
+            locked = locked or is_locked_error(e)
     if failures:
-        raise RuntimeError("写入失败 " + "；".join(failures[:3]))
+        msg = "写入失败 " + "；".join(failures[:3])
+        raise (FileLockedError(msg) if locked else RuntimeError(msg))
     return n
 
 
 def clean_replace(src_root: str, dst: str, preserve) -> tuple[int, int]:
-    """净化覆盖：保留名单之外的全部删除，再写入新版内容。绝不改动目标目录名。"""
+    """净化覆盖：保留名单之外的全部删除，再写入新版内容。绝不改动目标目录名。
+
+    rmtree 的 onerror 以前被 _force_remove 静默吞掉：文件被占用时删不掉却照样报成功，
+    留下新旧混合的目录。现在把失败收集起来并抛出 FileLockedError，交给上层等待重试。
+    """
     keep = {p.lower() for p in (preserve or [])}
     removed = 0
-    failed = []
+    failed: list[str] = []
+    locked = False
+
+    def on_rm_error(func, path, exc):
+        nonlocal locked
+        err = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except Exception as e:
+            err = e
+            failed.append(f"{os.path.basename(path)}: {e}")
+            locked = locked or is_locked_error(err)
+
     for name in list(os.listdir(dst)):
         if name.lower() in keep:
             continue
         p = os.path.join(dst, name)
+        before = len(failed)
         try:
             if os.path.isdir(p) and not os.path.islink(p):
-                shutil.rmtree(p, onerror=_force_remove)
+                shutil.rmtree(p, onerror=on_rm_error)
             else:
                 os.remove(p)
-            removed += 1
+            if len(failed) == before:
+                removed += 1
         except Exception as e:
             failed.append(f"{name}: {e}")
-    copied = copy_over(src_root, dst, preserve)
+            locked = locked or is_locked_error(e)
+    try:
+        copied = copy_over(src_root, dst, preserve)
+    except RuntimeError as e:
+        if is_locked_error(e):
+            raise FileLockedError(str(e)) from e
+        raise
     if failed:
-        raise RuntimeError("旧文件清理失败 " + "；".join(failed[:3]))
+        msg = "旧文件清理失败 " + "；".join(failed[:3])
+        raise (FileLockedError(msg) if locked else RuntimeError(msg))
     return removed, copied
 
 

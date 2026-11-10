@@ -1399,6 +1399,24 @@ class SettingsPage(QWidget):
         self._row(lay, "timer", "单个程序更新超时",
                   "下载 + 解压总时长超过该值即中止，避免卡死", self.timeout_spin)
 
+        retry = QWidget()
+        flat(retry)
+        rl = QHBoxLayout(retry)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(10)
+        self.retry_toggle = ToggleSwitch(
+            bool(self.cfg.get("update", {}).get("retry_on_locked", True)))
+        self.retry_toggle.toggled.connect(self._save_retry)
+        self.retry_spin = NumberStepper(
+            int(self.cfg.get("update", {}).get("retry_wait_min", 5)), 1, 30, 1, " 分钟", 108)
+        self.retry_spin.valueChanged.connect(self._save_retry)
+        rl.addWidget(self.retry_toggle)
+        rl.addWidget(self.retry_spin)
+        self._row(lay, "refresh", "文件被占用时自动等待",
+                  "检测到程序或文件正被使用时自动暂停，每 3 秒重试一次；"
+                  "最长等待时长可右侧调整，随时可点「停止」中断", retry)
+        self._sync_retry()
+
         bk = QWidget()
         flat(bk)
         bkl = QHBoxLayout(bk)
@@ -1463,6 +1481,15 @@ class SettingsPage(QWidget):
 
     def _save_timeout(self, *_):
         self.cfg.setdefault("update", {})["timeout_min"] = int(self.timeout_spin.value())
+        self.config_changed.emit()
+
+    def _sync_retry(self) -> None:
+        self.retry_spin.setEnabled(self.retry_toggle.isChecked())
+
+    def _save_retry(self, *_):
+        self.cfg.setdefault("update", {})["retry_on_locked"] = self.retry_toggle.isChecked()
+        self.cfg["update"]["retry_wait_min"] = int(self.retry_spin.value())
+        self._sync_retry()
         self.config_changed.emit()
 
     def _save_backup(self, *_):

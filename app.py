@@ -982,6 +982,9 @@ class MainWindow(QWidget):
                 self.toast.show_text("没有找到可检查的程序，请先在设置里添加文件夹", ok=False)
             return
         self.items = items
+        # 重启会自动触发一次检查：列表第一帧就要显示「检查中」，不能等 worker 启动
+        for it in items:
+            it.scanning = True
         self.page_home.set_items(items)
         self.progs_list.set_items(items)
         self.page_home.set_scan_state(True, 0, len(items), "正在连接 GitHub…")
@@ -1004,6 +1007,12 @@ class MainWindow(QWidget):
 
     def _on_scan_finished(self, items) -> None:
         self.page_home.set_scan_state(False)
+        # 取消 / 异常时没有收到 item_ready 的行不会自己复位，统一清掉「检查中」并刷新
+        for it in self.items:
+            it.scanning = False
+        for it in self.items:
+            self.page_home.update_item(it)
+            self.progs_list.update_item(it)
         last = self.engine.records.get("last_scan", "—") or "—"
         self.page_home.last_scan_time = last
         self.page_home.refresh_stats()
@@ -1138,7 +1147,11 @@ class MainWindow(QWidget):
         for i, old in enumerate(self.items):
             if old.key == item.key:
                 self.items[i] = item
-        self.page_home.list.rows[item.key].refresh() if item.key in self.page_home.list.rows else None
+        # 等待文件释放时两个页面都要能看到最新提示，不只是首页
+        for view in (self.page_home, self.progs_list):
+            row = view.list.rows.get(item.key)
+            if row is not None:
+                row.refresh()
 
     def _on_update_done(self, item) -> None:
         for i, old in enumerate(self.items):

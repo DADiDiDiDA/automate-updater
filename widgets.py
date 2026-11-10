@@ -884,21 +884,25 @@ class ProgramRow(QFrame):
         # 展开区
         self.notes = QWidget(self)
         nl = QVBoxLayout(self.notes)
-        nl.setContentsMargins(64, 0, 16, 14)
-        nl.setSpacing(6)
+        # 展开区几乎占满卡片宽度：以前左缩进 64px 把可用宽度压掉一大截，
+        # 长日志每行都折行，看起来又小又挤
+        nl.setContentsMargins(22, 2, 18, 16)
+        nl.setSpacing(8)
         self.notes_title = QLabel("更新日志")
         ft = QFont("Microsoft YaHei UI")
-        ft.setPixelSize(11)
+        ft.setPixelSize(12)
         ft.setWeight(QFont.DemiBold)
         self.notes_title.setFont(ft)
         # 用可滚动的只读文本框：长 release notes 直接塞 QLabel 会把列表行撑成巨型卡片
         self.notes_text = QPlainTextEdit()
         self.notes_text.setObjectName("notesText")
         self.notes_text.setReadOnly(True)
-        self.notes_text.setMaximumHeight(180)
+        # 高度按内容行数自适应（150~520px），超长日志仍可在框内滚动
+        self.notes_text.setMinimumHeight(150)
+        self.notes_text.setMaximumHeight(520)
         self.notes_text.setFrameShape(QFrame.NoFrame)
         fnt = QFont("Microsoft YaHei UI")
-        fnt.setPixelSize(12)
+        fnt.setPixelSize(13)
         self.notes_text.setFont(fnt)
         nl.addWidget(self.notes_title)
         nl.addWidget(self.notes_text)
@@ -917,12 +921,15 @@ class ProgramRow(QFrame):
         it = self.item
         # 作用域样式：别让 QPlainTextEdit 的白色视口在深色主题里变成一块白板
         self.notes_text.setStyleSheet(
-            f"#notesText{{background: transparent; border: none; color: {p.text};}}")
+            f"#notesText{{background: {rgba(p.text, 0.04)}; border: none;"
+            f"color: {p.text}; padding: 8px 10px;}}")
         self.name_lbl.setText(it.name)
         tint(self.name_lbl, p.text)
         if it.state == "running":
             pct = int(max(0.0, min(1.0, it.progress)) * 100)
             self.detail_lbl.setText(f"{it.message or '更新中'}… {pct}%")
+        elif getattr(it, "scanning", False):
+            self.detail_lbl.setText("正在检查新版本…")
         else:
             self.detail_lbl.setText(it.detail or it.path)
         self.detail_lbl.setToolTip(it.path)
@@ -941,8 +948,11 @@ class ProgramRow(QFrame):
             "running": ("更新中", "accent"),
         }
         text, color = status_map.get(it.status, ("—", "dim"))
-        if not it.scanned and it.state == "idle":
-            text, color = "待确认", "dim"
+        if getattr(it, "scanning", False) and it.state == "idle":
+            # 重启会自动触发检查；并发扫描期间每一行都应明确显示「检查中」
+            text, color = "检查中", "accent"
+        elif not it.scanned and it.state == "idle":
+            text, color = "待检查", "dim"
         if it.state == "running":
             text, color = "更新中", "accent"
         elif it.state == "done":
@@ -984,6 +994,11 @@ class ProgramRow(QFrame):
                 f"更新日志 · {it.published}" if it.published and it.kind != "git"
                 else ("提交记录" if it.kind == "git" else "更新日志"))
             self.notes_text.setPlainText(it.notes or "")
+            # 按行数给高度：短日志不再挤成两三行，长日志最多 520px 后内部滚动
+            lines = len((it.notes or "").splitlines())
+            h = min(520, max(150, lines * 18 + 30))
+            self.notes_text.setMinimumHeight(h)
+            self.notes_text.setMaximumHeight(h)
 
         # 按钮状态
         if it.status == "unbound":
