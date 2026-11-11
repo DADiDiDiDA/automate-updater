@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -1135,6 +1135,9 @@ class Engine:
         it.remote = (git(repo, ["rev-parse", "--short", uref]).stdout or "").strip()
         it.detail = f"{branch} · {how}" + (f" · 本地领先 {ahead}" if ahead else "")
         it.repo = origin_slug(repo)
+        # 不论有没有更新都记下远端最新一次提交的日期，供「最近发布 / 最早发布」排序。
+        # 以前只在「有更新」时赋值，已是最新的一大半 Git 程序没有日期，按发布时间排全乱。
+        it.published = (git(repo, ["log", "-1", "--format=%ad", "--date=short", uref]).stdout or "").strip()
         if behind == 0:
             it.status = "latest"
             return it
@@ -1144,7 +1147,6 @@ class Engine:
         it.detail = f"落后 {behind} 个提交 · {branch}"
         it.message = f"落后 {behind} 个提交"
         it.notes = self._git_changelog(repo, uref, limit=20)
-        it.published = (git(repo, ["log", "-1", "--format=%ad", "--date=short", uref]).stdout or "").strip()
         if dirty:
             it.status = "skip"
             it.detail = f"落后 {behind} 个提交，但本地有未提交改动"

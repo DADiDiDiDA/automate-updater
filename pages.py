@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 from PySide6.QtCore import QPoint, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
@@ -19,6 +20,27 @@ from theme import (GLYPH, PRESET_HINTS, PRESET_LABELS, PRESET_ORDER, THEME, flat
 from widgets import (Card, Chip, ExpandSetting, Glyph, NumberStepper, ProgramRow, ProgressLine,
                      SearchBox, SegmentedControl, SettingGroup, SettingRow, StatTile, TabButton,
                      ThemedCombo, ToggleSwitch, WrapLabel)
+
+
+def _date_ord(s: str) -> int:
+    """日期字符串 → YYYYMMDD 整数；空 / 非法值返回 0。
+
+    Git 用 `git log --date=short`（YYYY-MM-DD），Release 用 `published_at[:10]`，
+    上次更新时间是 `YYYY-MM-DD HH:MM:SS`。统一成数字比较，避免字符串字典序
+    在「2024-3-5」「2024-11-05」这类非补零格式上出错。
+    """
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", (s or "").strip())
+    if not m:
+        return 0
+    return int(m.group(1)) * 10000 + int(m.group(2)) * 100 + int(m.group(3))
+
+
+def _time_ord(s: str) -> int:
+    """`YYYY-MM-DD HH:MM:SS` 的时分秒部分 → HHMMSS 整数。"""
+    m = re.match(r"^\d{4}-\d{1,2}-\d{1,2}[ T](\d{1,2}):(\d{2}):(\d{2})", (s or "").strip())
+    if not m:
+        return 0
+    return int(m.group(1)) * 10000 + int(m.group(2)) * 100 + int(m.group(3))
 
 
 class _DingTestWorker(QThread):
@@ -215,36 +237,56 @@ class ItemListView(QWidget):
         self._update_counts()
         self.apply_filter()
 
+    def _prior_rank(self, i) -> int:
+        """特殊规则的优先级（0 提到前面）。"""
+        pri = self.prior
+        if pri == "update":
+            return 0 if self.is_update(i) else 1
+        if pri == "git":
+            return 0 if i.kind == "git" else 1
+        if pri == "release":
+            return 0 if i.kind == "release" else 1
+        return 0
+
     def sorted_items(self) -> list:
-        """两级排序：先按基础规则排，再用特殊规则把某一类提到最前（稳定排序）。"""
+        """两级排序：基础规则决定整体顺序，特殊规则把某一类提到最前。
+
+        时间类排序（发布 / 更新时间）必须保持**全局时间顺序**：以前先按时间排、
+        再被「有更新最先」整体分组，选了「最近发布」看起来却不是按时间排的。
+        现在这类排序把特殊规则降级为「同一天之内」的次要键；没有时间的永远垫底。
+        """
         k = self.sort_key
+        pr = self._prior_rank
+        if k == "recent":
+            return sorted(self.items, key=lambda i: (
+                0 if _date_ord(i.published) else 1,
+                -_date_ord(i.published), pr(i), i.name.lower()))
+        if k == "old":
+            return sorted(self.items, key=lambda i: (
+                0 if _date_ord(i.published) else 1,
+                _date_ord(i.published), pr(i), i.name.lower()))
+        if k == "updated_desc":
+            return sorted(self.items, key=lambda i: (
+                0 if _date_ord(i.updated_at) else 1,
+                -_date_ord(i.updated_at), -_time_ord(i.updated_at),
+                pr(i), i.name.lower()))
+        if k == "updated_asc":
+            return sorted(self.items, key=lambda i: (
+                0 if _date_ord(i.updated_at) else 1,
+                _date_ord(i.updated_at), _time_ord(i.updated_at),
+                pr(i), i.name.lower()))
+
+        # 名称 / 体积：特殊规则仍在整体上把某一类提到最前（保持原有行为）
         if k == "name_desc":
             items = sorted(self.items, key=lambda i: i.name.lower(), reverse=True)
         elif k == "size_desc":
             items = sorted(self.items, key=lambda i: (-(i.local_size or 0), i.name.lower()))
         elif k == "size_asc":
             items = sorted(self.items, key=lambda i: (i.local_size or 0, i.name.lower()))
-        elif k == "recent":
-            items = sorted(self.items, key=lambda i: (i.published or "", i.name.lower()),
-                           reverse=True)
-        elif k == "old":
-            items = sorted(self.items, key=lambda i: (i.published or "9999-99-99",
-                                                      i.name.lower()))
-        elif k == "updated_desc":
-            # 没记录更新时间的排在最后（"0" 最小，反向后落在尾部）
-            items = sorted(self.items, key=lambda i: (i.updated_at or "0", i.name.lower()),
-                           reverse=True)
-        elif k == "updated_asc":
-            items = sorted(self.items, key=lambda i: (i.updated_at or "9999", i.name.lower()))
         else:
             items = sorted(self.items, key=lambda i: i.name.lower())
-        pri = self.prior
-        if pri == "update":
-            items = sorted(items, key=lambda i: 0 if self.is_update(i) else 1)
-        elif pri == "git":
-            items = sorted(items, key=lambda i: 0 if i.kind == "git" else 1)
-        elif pri == "release":
-            items = sorted(items, key=lambda i: 0 if i.kind == "release" else 1)
+        if self.prior != "none":
+            items = sorted(items, key=pr)
         return items
 
     def _on_sort(self, key: str = "") -> None:
