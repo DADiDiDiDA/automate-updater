@@ -1797,22 +1797,17 @@ class SettingsPage(QWidget):
                   "每天抓取一次；不依赖你开着本地加速：直连不通就用已缓存的最快线路转发",
                   nbox, self.node_lbl)
 
-        # 下载过慢自动切换
+        # 下载卡住自动切换（默认关闭）
         sbox = QWidget()
         flat(sbox)
         sbl = QHBoxLayout(sbox)
         sbl.setContentsMargins(0, 0, 0, 0)
         sbl.setSpacing(10)
-        self.slow_toggle = ToggleSwitch(bool(mcfg.get("slow_switch", True)))
+        self.slow_toggle = ToggleSwitch(bool(mcfg.get("slow_switch", False)))
         self.slow_toggle.toggled.connect(self._save_mirrors)
-        self.speed_step = NumberStepper(
-            int(mcfg.get("min_speed_kbps") or core.DEFAULT_MIN_SPEED_KBPS),
-            10, 2048, 10, " KB/s", 116)
-        self.speed_step.valueChanged.connect(self._save_mirrors)
         sbl.addWidget(self.slow_toggle)
-        sbl.addWidget(self.speed_step)
-        self._row(lay, "link", "下载过慢自动切换",
-                  "连续约 6 秒低于这个速度（或下载失败）才换线路，瞬时变慢不切；断点续传不丢进度",
+        self._row(lay, "link", "下载卡住自动切换",
+                  "开启后连续 20 秒没有数据写入才换线路；默认关闭，关闭时只有连接失败才会换源",
                   sbox)
 
     def _on_sync_nodes(self):
@@ -1836,8 +1831,6 @@ class SettingsPage(QWidget):
             m["auto_nodes"] = self.node_toggle.isChecked()
         if hasattr(self, "slow_toggle"):
             m["slow_switch"] = self.slow_toggle.isChecked()
-        if hasattr(self, "speed_step"):
-            m["min_speed_kbps"] = int(self.speed_step.value())
         m["ranking_sig"] = ""          # 候选/开关变了，下次检查重新测速
         self.mirror_lbl.setText(self._mirror_summary())
         self.config_changed.emit()

@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.5"
+APP_VERSION = "1.6.6"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -75,12 +75,9 @@ DEFAULT_PROXY_PORTS = [7890, 7891, 1080, 10809, 10808, 8080, 2080, 33210, 7897, 
 # 社区维护的 GitHub 加速节点列表（hubporg/ghproxy-next），每天自动同步一次
 NODES_URL = ("https://raw.githubusercontent.com/hubporg/ghproxy-next/"
              "main/components/nodes.ts")
-# 低速换源：必须「持续」过慢才切，一次抖动就换线路会让节点列表来回跳
-DEFAULT_MIN_SPEED_KBPS = 50         # 默认阈值（KB/s）
-SLOW_SAMPLE_SEC = 2.0               # 每 2 秒统计一次实际速度
-SLOW_SAMPLES_TO_SWITCH = 3          # 连续 3 个窗口（约 6 秒）过低才换源
-SLOW_WARMUP_BYTES = 512 * 1024      # 先下满 512KB 再开始判速，避开首包慢启动
-DOWNLOAD_READ_TIMEOUT = 30          # 单次读超时：卡死 30 秒就换线路，不必等 3 分钟
+# 换源策略：默认不因速度切换；开启后只有「连续 20 秒没有任何数据写入」才换线路
+STALL_TIMEOUT = 20                 # 无写入多久算卡住（秒）
+DOWNLOAD_READ_TIMEOUT = 180        # 未开启卡住切换时的单次读超时，仅作失败兜底
 
 # 程序 → GitHub 仓库的预置映射（按文件夹名匹配，跨根目录通用）
 BUILTIN_PROGRAMS = [
@@ -162,9 +159,8 @@ def default_config() -> dict:
             "nodes_attempt": "",             # 上次尝试日期（失败也记，避免每次扫描重试拖慢）
             "nodes_error": "",
             "probe_before": True,            # 下载前确保测速结果可用
-            "slow_switch": True,             # 下载过慢时自动切换加速地址
-            "min_speed_kbps": DEFAULT_MIN_SPEED_KBPS,
-            "speed_policy": 2,               # 阈值策略版本：1=旧版 100 KB/s 单窗口判定
+            "slow_switch": False,            # 连续 20 秒无写入才换线路；默认关闭
+            "stall_policy": 2,               # 换源策略版本：1=旧版按速度阈值切换
         },
         # clean 保留指定文件夹 | overwrite 直接覆盖
         # retry_on_locked：目标文件被其它进程占用时自动暂停并重试，而不是直接判失败
@@ -190,8 +186,9 @@ def default_config() -> dict:
 def _normalize(cfg: dict) -> dict:
     """兼容旧版配置：mirrors 曾是纯数组，update 段可能缺失。"""
     m = cfg.get("mirrors")
-    # v1.6.5 起默认阈值 100 → 50 KB/s；旧配置里仍是旧默认值的自动跟随一次
-    legacy_speed = isinstance(m, dict) and "speed_policy" not in m
+    # v1.6.6 换源条件改为「20 秒无写入」；旧的「按速度切换」开关不再沿用，
+    # 升级后统一回到默认关闭，避免一升级就又开始切线路
+    legacy_stall = isinstance(m, dict) and "stall_policy" not in m
     base = default_config()["mirrors"]
     if isinstance(m, list):
         base.update({"list": [x for x in m if isinstance(x, str) and x], "seeded": 0})
@@ -208,20 +205,13 @@ def _normalize(cfg: dict) -> dict:
     for key in ("nodes", "ranking"):
         if not isinstance(mm.get(key), list):
             mm[key] = []
-    for key in ("auto_nodes", "probe_before", "slow_switch"):
+    for key in ("auto_nodes", "probe_before"):
         if not isinstance(mm.get(key), bool):
             mm[key] = True
-    try:
-        mm["min_speed_kbps"] = max(0, min(99999, int(mm.get("min_speed_kbps")
-                                                     or DEFAULT_MIN_SPEED_KBPS)))
-    except Exception:
-        mm["min_speed_kbps"] = DEFAULT_MIN_SPEED_KBPS
-    if legacy_speed:
-        if mm["min_speed_kbps"] == 100:
-            mm["min_speed_kbps"] = DEFAULT_MIN_SPEED_KBPS
-        mm["speed_policy"] = 2
-    elif not isinstance(mm.get("speed_policy"), int):
-        mm["speed_policy"] = 2
+    if legacy_stall or not isinstance(mm.get("slow_switch"), bool):
+        mm["slow_switch"] = False       # 新策略默认关闭，用户需要时再手动开
+    if legacy_stall or not isinstance(mm.get("stall_policy"), int):
+        mm["stall_policy"] = 2
     if not str(mm.get("nodes_url") or "").strip():
         mm["nodes_url"] = NODES_URL
     try:
@@ -566,10 +556,6 @@ class UpdateTimeout(Exception):
     """单个程序更新超过设定时限。"""
 
 
-class TooSlow(Exception):
-    """当前线路下载速度低于阈值，换下一个加速地址。"""
-
-
 def detect_proxy(ports) -> str | None:
     for p in ports or []:
         # 1080/1081 是常见的 SOCKS 端口，ProxyHandler 根本用不了，别误判成 HTTP 代理
@@ -768,16 +754,16 @@ def http_json(url: str, proxy: str | None, mirrors=None, retries: int = 1,
 
 def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
              deadline: float = 0, expect_size: int = 0, sha256: str = "",
-             min_kbps: int = 0, on_source=None) -> bool:
-    """下载到 dest，支持断点续传、sha256 校验与「过慢自动换源」。
+             stall_sec: int = 0, on_source=None) -> bool:
+    """下载到 dest，支持断点续传、sha256 校验与「卡住自动换源」。
 
     实际写入 dest.part：下载中断时保留已传字节，下一次（或换下一个候选源）
     带 Range 头从断点继续；服务器不支持 Range（返回非 206）时自动从头重下。
     只有所有候选源都失败才返回 False，.part 仍保留待续传。
 
     mirrors 已按测速结果排序，所以这里是「最快线路优先」，官方直连只作兜底。
-    min_kbps > 0 时每 2 秒采样一次实际速率，先下满 512KB 预热，且必须连续
-    3 个窗口（约 6 秒）都低于阈值才中断换下一个地址，瞬时抖动不再触发切换。
+    stall_sec > 0 时，连接建立后连续这么多秒收不到任何数据才断开换下一个候选；
+    为 0 时不启用卡住切换，仅用 180 秒读超时作失败兜底。不再按下载速度判断。
 
     内容可信性：expect_size 只能证明「大小完整」，不能证明「内容可信」。有 sha256
     时下载后必须校验哈希；校验失败会删除 .part 并失败（防止恶意镜像用同尺寸包替换）。
@@ -800,12 +786,6 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
     for px, u in cands:
         if deadline and time.time() > deadline:
             return False
-        if on_source:
-            try:
-                host = urllib.parse.urlsplit(u).hostname or (u[:40])
-                on_source("本地代理" if px else str(host))
-            except Exception:
-                pass
         try:
             have = os.path.getsize(part) if os.path.exists(part) else 0
             # 已完成的 .part：完整大小与预期一致时直接校验收尾，别再发 Range 触发 416
@@ -816,8 +796,8 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
                 os.remove(part)
                 have = 0
             headers = {"Range": f"bytes={have}-"} if have > 0 else None
-            with http_get(u, proxy=px, timeout=DOWNLOAD_READ_TIMEOUT,
-                          headers=headers) as r:
+            read_timeout = int(stall_sec) if stall_sec > 0 else DOWNLOAD_READ_TIMEOUT
+            with http_get(u, proxy=px, timeout=read_timeout, headers=headers) as r:
                 code = int(getattr(r, "status", 0) or 200)
                 if have > 0 and code == 416:
                     # 服务器认为断点越界：可能文件已完成。若大小/哈希匹配则收尾，否则重下。
@@ -838,10 +818,14 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
                 cl = int(r.headers.get("Content-Length") or 0)
                 total = have + cl if code == 206 else cl
                 done = have
+                # 连接成功、确认可读后才上报线路：连接失败的候选不会在界面上闪一下
+                if on_source:
+                    try:
+                        host = urllib.parse.urlsplit(u).hostname or u[:40]
+                        on_source("本地代理" if px else str(host))
+                    except Exception:
+                        pass
                 mode = "ab" if have > 0 else "wb"
-                win_t, win_done = time.time(), done
-                warm = min_kbps <= 0          # 关闭低速检测时不需要预热
-                low_streak = 0                # 连续低速窗口计数
                 with open(part, mode) as f:
                     while True:
                         if cancel is not None and cancel.is_set():
@@ -853,21 +837,7 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
                             break
                         f.write(chunk)
                         done += len(chunk)
-                        # 低速换源：预热后每 2 秒采样一次，连续多个窗口都过低才切
-                        now = time.time()
-                        if min_kbps > 0:
-                            if not warm:
-                                if done >= SLOW_WARMUP_BYTES:
-                                    warm = True
-                                    win_t, win_done = now, done
-                            elif now - win_t >= SLOW_SAMPLE_SEC:
-                                kbps = (done - win_done) / (now - win_t) / 1024
-                                low_streak = low_streak + 1 if kbps < min_kbps else 0
-                                if low_streak >= SLOW_SAMPLES_TO_SWITCH:
-                                    raise TooSlow(
-                                        f"连续 {low_streak * SLOW_SAMPLE_SEC:.0f} 秒低于 "
-                                        f"{min_kbps} KB/s（当前 {kbps:.0f} KB/s）")
-                                win_t, win_done = now, done
+                        # 不再按速度判定；卡住与否由 http_get 的读超时（stall_sec）控制
                         if progress_cb and total:
                             progress_cb(min(1.0, done / total))
                 if total and done < total:
@@ -1716,15 +1686,14 @@ class Engine:
             safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{it.name}_{it.asset or 'package.zip'}")
             archive = os.path.join(cache_dir, safe)
             # 下载前测速：当天没测过（或候选变过）就在这里补测，之后按速度顺序尝试，
-            # 失败 / 过慢由 download 自动切换到下一个加速地址。
+            # 连接失败会换下一个候选；卡住换源默认关闭，开启后要求连续 20 秒无写入。
             mcfg = self.cfg.get("mirrors") or {}
             if mcfg.get("probe_before", True):
                 try:
                     self.ensure_mirror()
                 except Exception:
                     pass
-            min_kbps = (int(mcfg.get("min_speed_kbps") or 0)
-                        if mcfg.get("slow_switch", True) else 0)
+            stall_sec = STALL_TIMEOUT if mcfg.get("slow_switch", False) else 0
             pr(0.02, "下载中（支持断点续传）")
             ok = download(it.download_url, archive, self.proxy, self.top_mirrors(12),
                           # 不覆盖 message：保留 on_source 写入的「下载中 · 当前线路」
@@ -1732,7 +1701,7 @@ class Engine:
                           cancel=self.cancel, deadline=deadline,
                           expect_size=int(it.asset_size or 0),
                           sha256=it.asset_digest,
-                          min_kbps=min_kbps,
+                          stall_sec=stall_sec,
                           on_source=lambda host: pr(0.02, f"下载中 · {host}"))
             if self.cancel.is_set():
                 it.state, it.status = "failed", "error"
