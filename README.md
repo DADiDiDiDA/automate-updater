@@ -139,6 +139,14 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed `
 
 ## 更新记录
 
+### v1.6.3
+
+- **修复 Release 类程序更新必定失败**：v1.6.1 的「回滚重试」里把异常变量命名为 `re`，
+  与正则模块同名，导致 `_update_release` 整个函数里的 `re.sub(...)` 被 Python 判为
+  「局部变量未赋值」，一进入更新就抛 `cannot access local variable 're' ...`，
+  所有 Release 类程序（如 OneDragon ScriptChainer）都显示「失败」。异常变量已改名，
+  并加入静态检查防止模块名再被局部变量遮蔽
+
 ### v1.6.2
 
 - **数值步进器可以直接键入**：设置页「单个程序更新超时」等数值框以前只能点上下箭头，

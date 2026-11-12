@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -1525,8 +1525,10 @@ class Engine:
                             clean_replace(it.archived, it.path, it.preserve)
                             rolled = "，已自动回滚到更新前备份"
                             break
-                        except Exception as re:
-                            if not is_locked_error(re) or _try == 2:
+                        except Exception as lock_err:
+                            # 别把异常变量叫 re：同名会让整个 _update_release 里的
+                            # re.sub(...) 被判为「局部变量未赋值」而抛 UnboundLocalError
+                            if not is_locked_error(lock_err) or _try == 2:
                                 rolled = "，回滚也失败，请手动点「撤销上次更新」"
                                 break
                             time.sleep(1.0)
