@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.8"
+APP_VERSION = "1.6.9"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -1066,7 +1066,9 @@ class Item:
     asset: str = ""
     asset_size: int = 0
     asset_digest: str = ""          # GitHub 提供的 sha256（若有），用于下载后校验内容可信性
-    asset_regex: str = ""
+    asset_regex: str = ""           # 用户/内置的「下载文件筛选」正则
+    asset_pick: str = ""            # 用户从弹窗里选中的文件名（优先级高于自动规则）
+    asset_options: list = field(default_factory=list)   # 多候选时给弹窗用的清单
     download_url: str = ""
     anchor: str = ""
     preserve: list = field(default_factory=list)
@@ -1432,7 +1434,8 @@ class Engine:
                           anchor=(spec or {}).get("anchor") or guess_anchor(cand),
                           preserve=self.preserve_for(name, spec or {}),
                           version_spec=(spec or {}).get("version") or guess_version_spec(cand),
-                          asset_regex=(spec or {}).get("asset_regex") or "")
+                          asset_regex=(spec or {}).get("asset_regex") or "",
+                          asset_pick=(spec or {}).get("asset_pick") or "")
                 it.repo = (spec or {}).get("repo") or ""
                 if not it.repo:
                     it.repo = sniff_repo(cand)
@@ -1618,7 +1621,17 @@ class Engine:
             return it
         tag = latest.get("tag_name", "") or ""
         assets = latest.get("assets") or []
-        asset = pick_asset(assets, it.asset_regex or (it.version_spec or {}).get("asset_regex", ""))
+        pattern = it.asset_regex or (it.version_spec or {}).get("asset_regex", "")
+        picked = it.asset_pick or ""
+        asset = pick_asset(assets, pattern, picked)
+        cands = asset_candidates(assets)
+        it.asset_options = [{"name": a.get("name", ""),
+                             "size": int(a.get("size") or 0),
+                             "url": a.get("browser_download_url", "")}
+                            for a in cands] if len(cands) > 1 else []
+        # 没指定筛选也没选过、而同一个 release 里有多份安装包 → 让用户自己挑，
+        # 否则「取体积最大」很容易把 -debug/-full 之类下错
+        need_choose = bool(it.asset_options) and not pattern and not picked
         it.remote = tag
         it.published = (latest.get("published_at") or "")[:10]
         it.notes_url = latest.get("html_url", "")
@@ -1644,8 +1657,19 @@ class Engine:
             return it
         if not asset:
             it.status = "error"
-            it.detail = f"最新版 {tag} 没有可下载的压缩包"
+            if pattern:
+                it.detail = f"最新版 {tag} 没有文件匹配筛选正则「{pattern}」"
+            else:
+                it.detail = f"最新版 {tag} 没有可下载的压缩包"
             return it
+        if need_choose:
+            # 只在「确实有东西要装」时才要求选择：已是最新的程序不该被这个拦住
+            names = "、".join(a["name"] for a in it.asset_options[:3])
+            more = f" 等 {len(it.asset_options)} 个" if len(it.asset_options) > 3 else ""
+            if not it.local or ver_gt(tag, it.local):
+                it.status = "choose"
+                it.detail = f"{tag} 有多个安装包（{names}{more}），右键选择要下载的文件"
+                return it
         if not it.local:
             it.status = "unknown"
             it.detail = f"本地版本未知，最新 {tag}（可直接更新）"
@@ -2267,9 +2291,51 @@ def read_local_version(target: str, spec: dict, name: str, records: dict, record
     return ""
 
 
-def pick_asset(assets, pattern: str = ""):
-    """挑出 Windows 压缩包。显式正则（asset_regex）是「严格匹配」：零匹配/非法正则
-    都返回 None 让调用方报错，绝不悄悄退回通用 ZIP/7z 选一个（可能选到 Linux 包）。"""
+_ARC_RE = re.compile(r"\.(zip|7z)$", re.I)
+_SKIP_ASSET_RE = re.compile(r"(source|sha256|checksum|symbol)", re.I)
+_WIN_ASSET_RE = re.compile(r"(win|x64|x86_64|windows)", re.I)
+
+
+def asset_candidates(assets) -> list:
+    """自动规则下的候选安装包：只认 zip/7z，排除源码/校验/符号包。
+
+    返回按「Windows 包优先 + 体积降序」排好的列表，**第一个就是自动规则会选中的
+    那个**。多个候选（例如同一个 release 同时有 -full / -slim / -debug）时由界面
+    弹窗让用户挑，避免「取体积最大」猜错。
+    """
+    arcs = [a for a in (assets or [])
+            if _ARC_RE.search(a.get("name", ""))
+            and not _SKIP_ASSET_RE.search(a.get("name", ""))]
+    if not arcs:
+        return []
+    win = [a for a in arcs if _WIN_ASSET_RE.search(a.get("name", ""))]
+    pool = win or arcs
+    return sorted(pool, key=lambda a: -int(a.get("size") or 0))
+
+
+def _picked_pattern(name: str) -> str:
+    """把用户选中的文件名变成「跨版本可复用」的正则：版本数字段换成通配。
+
+    ``xxx-v1.5.1-win-x64.zip`` → ``xxx-v\\d+(?:\\.\\d+)+-win-x64\\.zip$``，
+    这样下一版变成 ``v1.5.2`` 时同一个选择依然生效。
+    """
+    if not name:
+        return ""
+    marker = "\x00"
+    part = re.sub(r"\d+(?:\.\d+)+", marker, name)
+    pieces = [re.escape(p) for p in part.split(marker)]
+    return r"\d+(?:\.\d+)+".join(pieces) + "$"
+
+
+def pick_asset(assets, pattern: str = "", picked: str = ""):
+    """挑出要下载的文件。优先级：**用户正则 > 用户选中的文件 > 自动规则**。
+
+    * ``pattern``：用户填的「下载文件筛选」正则，严格匹配；零匹配/非法正则返回
+      None，绝不悄悄退回通用规则（那可能选到别的包）。
+    * ``picked``：弹窗里选中的文件名。新版本里名字变了（版本号）时，用
+      ``_picked_pattern`` 生成的模糊正则再试一次，选中记录不会因升级失效。
+    * 两者都没给：Windows 包中体积最大的那个。
+    """
     if not assets:
         return None
     if pattern:
@@ -2281,14 +2347,18 @@ def pick_asset(assets, pattern: str = ""):
         if not hit:
             return None
         return max(hit, key=lambda a: int(a.get("size") or 0))
-    arcs = [a for a in assets
-            if re.search(r"\.(zip|7z)$", a.get("name", ""), re.I)
-            and not re.search(r"(source|sha256|checksum|symbol)", a.get("name", ""), re.I)]
-    if not arcs:
-        return None
-    win = [a for a in arcs if re.search(r"(win|x64|x86_64|windows)", a.get("name", ""), re.I)]
-    pool = win or arcs
-    return max(pool, key=lambda a: int(a.get("size") or 0))
+    if picked:
+        hit = [a for a in assets if a.get("name") == picked]
+        if not hit:
+            rx = _picked_pattern(picked)
+            try:
+                hit = [a for a in assets if rx and re.search(rx, a.get("name", ""), re.I)]
+            except re.error:
+                hit = []
+        if hit:
+            return max(hit, key=lambda a: int(a.get("size") or 0))
+    cs = asset_candidates(assets)
+    return cs[0] if cs else None
 
 
 def _safe_join(dest: str, member: str) -> str | None:

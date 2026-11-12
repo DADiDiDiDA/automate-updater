@@ -132,6 +132,7 @@ class ItemListView(QWidget):
     row_mark = Signal(str)
     row_undo = Signal(str)
     row_preserve = Signal(str)
+    row_asset = Signal(str)
     sort_changed = Signal(str)
     prior_changed = Signal(str)
 
@@ -232,6 +233,7 @@ class ItemListView(QWidget):
             row.mark_requested.connect(self.row_mark)
             row.undo_requested.connect(self.row_undo)
             row.preserve_requested.connect(self.row_preserve)
+            row.asset_requested.connect(self.row_asset)
             self.rows[it.key] = row
             self.list_lay.insertWidget(self.list_lay.count() - 1, row)
         self._update_counts()
@@ -406,6 +408,7 @@ class HomePage(QWidget):
     row_mark = Signal(str)
     row_undo = Signal(str)
     row_preserve = Signal(str)
+    row_asset = Signal(str)
     sort_changed = Signal(str)
     prior_changed = Signal(str)
 
@@ -477,6 +480,7 @@ class HomePage(QWidget):
         self.list.row_mark.connect(self.row_mark)
         self.list.row_undo.connect(self.row_undo)
         self.list.row_preserve.connect(self.row_preserve)
+        self.list.row_asset.connect(self.row_asset)
         self.list.sort_changed.connect(self.sort_changed)
         self.list.prior_changed.connect(self.prior_changed)
         lay.addWidget(self.list, 1)
@@ -1862,7 +1866,7 @@ class SettingsPage(QWidget):
                   self._small_btn("打开", self._open_backup))
         self._row(lay, "check", "便携模式", "配置与备份都在 exe 同目录，整个文件夹可随意移动")
         self._row(lay, "apps", "快捷键",
-                  "Ctrl+1/2/3 切换页面　F5 重新检查　右键程序行可绑定仓库、标记版本、排除文件夹")
+                  "Ctrl+1/2/3 切换页面　F5 重新检查　右键程序行可绑定仓库、标记版本、下载文件筛选、排除文件夹")
 
     def _small_btn(self, text: str, slot) -> QPushButton:
         b = QPushButton(text)

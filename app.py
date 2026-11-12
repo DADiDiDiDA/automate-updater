@@ -8,6 +8,7 @@ import html
 import json
 import math
 import os
+import re
 import sys
 import time
 import winreg
@@ -16,15 +17,16 @@ from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QThread, 
 from PySide6.QtGui import (QColor, QFont, QGuiApplication, QIcon, QLinearGradient, QPainter,
                            QPainterPath, QPen, QPixmap)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-                               QStackedWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QPushButton, QStackedWidget, QVBoxLayout,
+                               QWidget)
 
 import core
 import autostart
 from backdrop import BACKDROP
 from pages import (HomePage, ItemListView, MirrorDialog, PreserveDialog, SettingsPage,
                    ThemedDialog, VersionDialog, _label)
-from theme import GLYPH, THEME, build_qss, glyph_font, qc, tint
+from theme import GLYPH, THEME, build_qss, glyph_font, qc, rgba, scoped, tint
 from tray import TrayIcon
 from widgets import NavButton, Toast
 
@@ -333,6 +335,113 @@ class BindDialog(ThemedDialog):
         return self.edit.text().strip().strip("/")
 
 
+# ---------------------------------------------------------------- 下载文件筛选
+
+def _fmt_size(n: int) -> str:
+    n = int(n or 0)
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.2f} GB"
+    if n >= 1024 ** 2:
+        return f"{n / 1024 ** 2:.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n} B"
+
+
+class AssetDialog(ThemedDialog):
+    """指定从 Release 里下载哪一个文件：列表点选，或用正则长期筛选。
+
+    优先级由 core.pick_asset 决定：**用户正则 > 列表选中的文件 > 自动规则**。
+    同一个 release 同时提供 -full / -slim / -debug 时，光靠「体积最大」很容易猜错，
+    所以扫描到多个候选会先把程序标成「待选择」，由这里让用户定。
+    """
+
+    def __init__(self, parent, name: str, options=None, pattern: str = "",
+                 picked: str = ""):
+        super().__init__(parent, "下载文件筛选", 600)
+        p = THEME.p
+        self.options = [o for o in (options or []) if o.get("name")]
+        self.body.addWidget(_label(f"「{name}」要从 Release 里下载哪个文件？", 13, "text",
+                                   bold=True))
+        self.body.addWidget(_label(
+            "填了正则就一定用正则（严格匹配，匹配不到会直接报错，不会乱选别的包）；"
+            "正则留空则用下面列表中选中的文件；两者都没有时自动挑体积最大的 Windows 包。",
+            11, "text_muted", wrap=True))
+
+        self.lst = None
+        if self.options:
+            self.lst = QListWidget()
+            # 固定高度：候选少时不留大片空白，多了就在列表内滚动
+            self.lst.setFixedHeight(max(74, min(196, 36 * len(self.options) + 12)))
+            for a in self.options:
+                item = QListWidgetItem(f"{a['name']}    ·    {_fmt_size(a.get('size'))}")
+                item.setData(Qt.UserRole, a["name"])
+                self.lst.addItem(item)
+                if picked and a["name"] == picked:
+                    self.lst.setCurrentItem(item)
+            if self.lst.currentItem() is None:
+                self.lst.setCurrentRow(0)
+            # QListWidget 的 viewport 默认仍用调色板底色（深色主题下会是一块白），
+            # 只写 background:transparent 不够，必须连 viewport 一起透明
+            self.lst.setFrameShape(QFrame.NoFrame)
+            self.lst.viewport().setAutoFillBackground(False)
+            scoped(self.lst, (
+                f"QListWidget{{background:transparent;border:1px solid {rgba(p.text, 0.14)};"
+                f"border-radius:{p.radius_btn}px;outline:none;padding:4px;}}"
+                f"QListWidget QWidget{{background:transparent;}}"
+                f"QListWidget::item{{color:{p.text};padding:7px 8px;border-radius:6px;}}"
+                f"QListWidget::item:hover{{background:{rgba(p.text, 0.06)};}}"
+                f"QListWidget::item:selected{{background:{rgba(p.accent, 0.28)};"
+                f"color:{p.text};}}"))
+            self.body.addWidget(self.lst)
+        else:
+            self.body.addWidget(_label("这次没拿到候选清单（可先点「重新检查」），"
+                                       "也可以只填正则。", 11, "text_dim", wrap=True))
+
+        cap = _label("下载文件筛选（正则）", 12, "text", bold=True)
+        self.body.addWidget(cap)
+        self.pattern_edit = QLineEdit(pattern)
+        self.pattern_edit.setPlaceholderText(r"例如 MAA-v.*-win-x64\.zip$")
+        self.pattern_edit.setMinimumHeight(32)
+        self.body.addWidget(self.pattern_edit)
+        self.hint = _label("", 11, "text_muted", wrap=True)
+        self.body.addWidget(self.hint)
+        self.pattern_edit.textChanged.connect(self._refresh_hint)
+        self._refresh_hint()
+        self.add_footer()
+
+    def _refresh_hint(self) -> None:
+        pat = self.pattern_edit.text().strip()
+        if not pat:
+            self.hint.setText("留空：使用上面选中的文件（未选则自动挑体积最大的 Windows 包）")
+            return
+        try:
+            rx = re.compile(pat, re.I)
+        except Exception as e:
+            self.hint.setText(f"正则无效：{e}")
+            return
+        if not self.options:
+            self.hint.setText("正则已填写，下次检查时生效")
+            return
+        hit = [a["name"] for a in self.options if rx.search(a["name"])]
+        self.hint.setText(
+            f"匹配到 {len(hit)} 个：{'、'.join(hit[:3])}{'…' if len(hit) > 3 else ''}"
+            if hit else "没有文件匹配这个正则，更新时会直接报错")
+
+    def values(self):
+        """返回 (模式, 正则, 选中文件名)；正则非法时返回 None。"""
+        pat = self.pattern_edit.text().strip()
+        if pat:
+            try:
+                re.compile(pat)
+            except Exception:
+                return None
+            return ("pattern", pat, "")
+        if self.lst is not None and self.lst.currentItem() is not None:
+            return ("pick", "", str(self.lst.currentItem().data(Qt.UserRole)))
+        return ("auto", "", "")
+
+
 # ---------------------------------------------------------------- 主窗口
 
 class MainWindow(QWidget):
@@ -527,13 +636,14 @@ class MainWindow(QWidget):
         self.page_home.row_mark.connect(self.mark_version)
         self.page_home.row_undo.connect(self.undo_update)
         self.page_home.row_preserve.connect(self.edit_preserve)
+        self.page_home.row_asset.connect(self.edit_asset)
 
         self.page_progs = QWidget()
         pl = QVBoxLayout(self.page_progs)
         pl.setContentsMargins(22, 4, 22, 18)
         self.progs_header = _label("所有程序", 17, "text", bold=True)
         pl.addWidget(self.progs_header)
-        pl.addWidget(_label("双击一行可打开所在文件夹；右键可绑定仓库、标记版本或排除", 12, "text_muted"))
+        pl.addWidget(_label("双击一行可打开所在文件夹；右键可绑定仓库、标记版本、下载文件筛选或排除", 12, "text_muted"))
         pl.addSpacing(8)
         self.progs_list = ItemListView()
         self.progs_list.row_update.connect(self.update_one)
@@ -544,6 +654,7 @@ class MainWindow(QWidget):
         self.progs_list.row_mark.connect(self.mark_version)
         self.progs_list.row_undo.connect(self.undo_update)
         self.progs_list.row_preserve.connect(self.edit_preserve)
+        self.progs_list.row_asset.connect(self.edit_asset)
         pl.addWidget(self.progs_list, 1)
 
         ui = self.cfg.get("ui") or {}
@@ -1146,6 +1257,12 @@ class MainWindow(QWidget):
             self.tray.set_tooltip(self.engine.records.get("last_scan", ""), len(upd))
         self._update_brand()
         if not getattr(self, "_scan_silent", False):
+            # 同一 release 里有多个安装包：先问清楚要哪一个，避免按体积猜错
+            choose = [i for i in self.items if i.status == "choose"]
+            if choose and not cancelled:
+                self.toast.show_text(f"{len(choose)} 个程序有多个安装包，请选择要下载的文件")
+                QTimer.singleShot(250, lambda: self._ask_assets(choose))
+                return
             if cancelled:
                 self.toast.show_text("已停止检查，结果不完整", ok=False)
             elif errs and not upd:
@@ -1205,12 +1322,75 @@ class MainWindow(QWidget):
             return
         self._start_update(targets, background=True, from_user=True)
 
+    def edit_asset(self, key: str) -> None:
+        """右键「下载文件筛选…」：指定这个程序要从 Release 里下哪个文件。"""
+        it = next((i for i in self.items if i.key == key), None)
+        if it is None:
+            return
+        if it.kind == "git":
+            self.toast.show_text("Git 类程序按提交更新，不需要选择下载文件")
+            return
+        if self._ask_asset(it):
+            self.toast.show_text("已保存，重新检查中…")
+            QTimer.singleShot(200, self.start_scan)
+
+    def _ask_asset(self, it, quiet: bool = False) -> bool:
+        """弹一次选择框并落盘；返回是否真的存了东西。"""
+        dlg = AssetDialog(self, it.name, it.asset_options, it.asset_regex, it.asset_pick)
+        if not dlg.exec():
+            return False
+        vals = dlg.values()
+        if vals is None:
+            if not quiet:
+                self.toast.show_text("正则写法无效，未保存", ok=False)
+            return False
+        mode, pat, picked = vals
+        fields = {"asset_regex": pat if mode == "pattern" else "",
+                  "asset_pick": picked if mode == "pick" else ""}
+        if mode == "auto":
+            fields["asset_regex"] = ""        # 回到自动规则：两个字段都清空
+        self._set_program_fields(it, fields)
+        it.asset_regex = fields["asset_regex"]
+        it.asset_pick = fields["asset_pick"]
+        return True
+
+    def _set_program_fields(self, it, fields: dict) -> None:
+        """把字段写进 cfg.programs 里对应的程序项（没有就补一条）。"""
+        programs = self.cfg.setdefault("programs", [])
+        for i, p in enumerate(programs):
+            if (p.get("match") or p.get("name") or "").lower() == it.name.lower():
+                programs[i] = {**p, **fields}
+                break
+        else:
+            programs.append({"name": it.name, "match": it.name,
+                             "repo": it.repo,
+                             "anchor": it.anchor or core.guess_anchor(it.path),
+                             "version": it.version_spec or core.guess_version_spec(it.path),
+                             **fields})
+        self._save_cfg()
+
+    def _ask_assets(self, items) -> None:
+        """扫描结束后处理「待选择」：逐个弹窗，最后统一重扫一次。"""
+        changed = False
+        for it in items:
+            if it.status != "choose":
+                continue
+            if self._ask_asset(it, quiet=True):
+                changed = True
+        if changed:
+            self.toast.show_text("下载文件已选定，重新检查中…")
+            QTimer.singleShot(250, self.start_scan)
+
     def update_one(self, key: str) -> None:
         it = next((i for i in self.items if i.key == key), None)
         if it is None:
             return
         if it.status == "unbound":
             self.bind_repo(key)
+            return
+        if it.status == "choose":
+            # 多个安装包还没选定：先让用户挑，不能拿「体积最大」硬猜
+            self.edit_asset(key)
             return
         if it.status == "latest":
             self.toast.show_text(f"{it.name} 已是最新版")

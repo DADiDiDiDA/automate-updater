@@ -796,6 +796,7 @@ class ProgramRow(QFrame):
     mark_requested = Signal(str)
     undo_requested = Signal(str)
     preserve_requested = Signal(str)
+    asset_requested = Signal(str)
 
     def __init__(self, item, parent=None):
         super().__init__(parent)
@@ -944,6 +945,7 @@ class ProgramRow(QFrame):
             "error": ("失败", "danger"),
             "skip": ("跳过", "warning"),
             "unbound": ("未绑定", "dim"),
+            "choose": ("待选择", "warning"),
             "unknown": ("待确认", "warning"),
             "running": ("更新中", "accent"),
         }
@@ -1077,6 +1079,8 @@ class ProgramRow(QFrame):
                                else "打开 GitHub 仓库（未绑定）")
         act_repo.setEnabled(bool(it.repo))
         act_mark = m.addAction("手动标记本地版本…")
+        act_asset = m.addAction("下载文件筛选…")
+        act_asset.setEnabled(it.kind != "git")
         act_preserve = m.addAction("更新时保留的文件夹…")
         act_preserve.setEnabled(it.kind != "git")
         m.addSeparator()
@@ -1100,6 +1104,8 @@ class ProgramRow(QFrame):
             self.repo_requested.emit(it.key)
         elif act is act_mark:
             self.mark_requested.emit(it.key)
+        elif act is act_asset:
+            self.asset_requested.emit(it.key)
         elif act is act_preserve:
             self.preserve_requested.emit(it.key)
         elif act is act_open:
