@@ -8,7 +8,7 @@
 | --- | --- |
 | 平台 | Windows 10 / 11 |
 | 技术栈 | Python 3 · PySide6 · pillow · PyInstaller（单文件 exe，便携） |
-| 当前版本 | **v1.6.11** |
+| 当前版本 | **v1.6.12** |
 | 仓库 | [DADiDiDiDA/automate-updater](https://github.com/DADiDiDiDA/automate-updater) |
 | 外部依赖 | `git`（仓库类程序）、`7-Zip` 或 `py7zr`（`.7z` 包） |
 
@@ -115,7 +115,7 @@
 | 文件 | 内容 |
 | --- | --- |
 | `config.json` | 全部设置、根目录、镜像与测速结果、程序定制（**含钉钉凭证，已加入 `.gitignore`**）。exe 同目录；目录不可写时退回 `%APPDATA%\AutomateUpdater` |
-| `records.json` | 版本记录、更新时间、上次检查时间，以及供离线还原用的 `snapshot` 快照 |
+| `records.json` | 版本记录、更新时间、上次检查时间，以及供离线还原用的 `snapshot` 快照（启动先离线铺列表；更新成功或扫描完成会刷新它） |
 | `crash.log` | Qt 事件循环异常的兜底日志 |
 
 配置采用「默认值 + 归一化升级」加载，旧版本字段自动兼容/清理。整个文件夹可随意复制或移动，配置跟着走。

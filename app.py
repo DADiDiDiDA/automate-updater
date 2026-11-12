@@ -1516,6 +1516,12 @@ class MainWindow(QWidget):
             return
         all_items = self._queue_results
         self._queue_results = []
+        # 更新成功后的状态已写进 records.versions 并清了手动标记，但快照还停在更新前；
+        # 这里把最新结果回写快照，否则下次重启又会把刚装好的新版显示成「待更新」。
+        try:
+            self.engine.save_snapshot(self.items)
+        except Exception:
+            pass
         ok = sum(1 for i in all_items if i.state == "done")
         bad = sum(1 for i in all_items if i.state == "failed")
         detail = "\n".join(f"- {i.name}：{i.detail}" for i in all_items[:20])

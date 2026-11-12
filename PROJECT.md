@@ -140,6 +140,11 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 - `set_manual_version()` 会被扫描 worker 线程调用（自愈）和主线程调用（右键标记），写配置必须走 `Engine._cfg_lock` 串行化。
 - 自愈的方向别写反：只有 `ver_gt(recorded, mv)` 才清；用户在程序外降级后手动标旧版本、或标记比记录新时，都要尊重标记。
 
+**检查结果快照（`snapshot`）也会过期，别只修「读取」那条路**
+- 启动先离线铺列表：`_load_cached_items()` 调 `apply_snapshot()` 把 `records.snapshot` 套回界面；只有当天没检查过才联网重扫（`scan_pending()` 看 `mirrors.daily.scan`）。所以**更新成功若不刷新快照，且当天扫描闸门已满足，重启后一定会把刚装好的新版又显示成「待更新」**——v1.6.12 之前就栽在这。
+- 两处都要刷新快照：① `apply_snapshot()` 用 `records.versions`（更新后的权威版本）纠正过期快照项（记录版本比快照本地版本新即以「已更新」处理，并立刻 `save_snapshot()` 回写）；② 更新收尾 `_on_update_all_done()` 调 `save_snapshot(self.items)` 持久化最新结果。
+- `apply_snapshot()` 纠正的方向同样别写反：只在 `ver_gt(记录版本, 快照本地版本)` 时改；记录缺失或记录比快照旧时一律不动，避免把盘上真实的新版误判、或向下篡改。**新增需离线还原的 `Item` 字段必须加进 `SNAP_FIELDS`**（否则 `save_snapshot` 不存、下次还原丢数据）。
+
 **Python / Qt 通用**
 - **别拿模块名当局部变量**：`except Exception as re` 会让整个函数的 `re.sub(...)` 抛 `UnboundLocalError`（v1.6.1 让所有 Release 更新全废，v1.6.3 改名 `lock_err`）。可用 AST 静态检查守卫。
 - `QLineEdit.end()` 在 PySide6 需显式 bool，按数字键可能抛异常 → 用 `setCursorPosition()`。

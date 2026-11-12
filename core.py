@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.11"
+APP_VERSION = "1.6.12"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -1356,9 +1356,16 @@ class Engine:
             pass
 
     def apply_snapshot(self, items) -> int:
-        """把上次检查结果套回新收集的列表（不联网），返回命中数量。"""
+        """把上次检查结果套回新收集的列表（不联网），返回命中数量。
+
+        更新成功后 ``records.versions`` 才是最权威的「已安装版本」，但快照可能还没
+        刷新（更新流程不重扫；且当天扫描闸门已满足时启动不会重扫）。若发现记录版本
+        比快照里的本地版本新，说明快照过期——以记录为准纠正状态，并把刚装好的新版
+        从「待更新」改回「已最新」，纠正过的项会立刻回写快照，避免重启后又误报。
+        """
         rows = (self.records.get("snapshot") or {}).get("items") or {}
         hit = 0
+        changed = False
         for it in items:
             row = rows.get(it.key)
             if not isinstance(row, dict):
@@ -1366,8 +1373,25 @@ class Engine:
             for k in self.SNAP_FIELDS:
                 if k in row:
                     setattr(it, k, row[k])
+            rec = str(self.records["versions"].get(self._record_key(it), "") or "").strip()
+            snap_local = str(row.get("local") or "").strip()
+            if rec and snap_local and ver_gt(rec, snap_local):
+                it.local = rec
+                it.local_manual = False
+                rem = str(row.get("remote") or "").strip()
+                # 记录版本 ≥ 快照里记录的最新版：确实已更新，改成最新；
+                # 记录版本反而比快照 remote 还新（更不可能有待更新）
+                if not rem or not ver_gt(rem, rec):
+                    it.status = "latest"
+                    it.detail = f"{rec}（最新 {rem or rec}）"
+                changed = True
             it.scanned = True
             hit += 1
+        if changed:
+            try:
+                self.save_snapshot(items)
+            except Exception:
+                pass
         return hit
 
     # ---------- 镜像 ----------
