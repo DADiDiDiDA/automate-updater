@@ -110,6 +110,7 @@ def set_rounded_corners(hwnd: int) -> None:
 class ScanWorker(QThread):
     item_ready = Signal(object)
     progress = Signal(int, int, str)
+    stage = Signal(str)
     finished_all = Signal(list)
 
     def __init__(self, engine: core.Engine, items):
@@ -119,10 +120,10 @@ class ScanWorker(QThread):
 
     def run(self):
         try:
-            # 扫描前先落地镜像测速（以前 ensure_mirror 只在 git fetch 里被调到，
-            # 设置页的「chosen」形同虚设，界面一直显示「检测中…」）
+            # 每天一次的准备工作：内置加速地址测速 → 拉社区节点 → 全量测速。
+            # 当天已经做过就立刻返回，不会每次开程序都重跑一遍。
             try:
-                self.engine.ensure_mirror()
+                self.engine.daily_bootstrap(progress=lambda m: self.stage.emit(m))
             except Exception:
                 pass
             self.engine.scan_all(
@@ -398,10 +399,10 @@ class MainWindow(QWidget):
         if shot:
             QTimer.singleShot(2600, lambda: self._dev_shot(shot))
         if not start_hidden:
-            QTimer.singleShot(600, lambda: self.start_scan(silent=False))
+            QTimer.singleShot(600, lambda: self._startup_check(silent=False))
         else:
             # 后台启动：稍等片刻再静默检查，避免和开机时的磁盘/网络高峰抢资源
-            QTimer.singleShot(4000, lambda: self.start_scan(silent=True))
+            QTimer.singleShot(4000, lambda: self._startup_check(silent=True))
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -901,13 +902,15 @@ class MainWindow(QWidget):
             return
         self.sched_timer.stop()
         if bg.get("check_enabled", True):
-            minutes = max(5, int(bg.get("interval_min", 60) or 60))
-            self.sched_timer.start(minutes * 60_000)
+            # 自动检查本身是「每天一次」，定时器只负责守着跨天（程序常驻时次日补一次）
+            self.sched_timer.start(30 * 60_000)
 
     def _on_schedule_tick(self) -> None:
         if (self.scan_worker and self.scan_worker.isRunning()) or \
                 (self.update_worker and self.update_worker.isRunning()):
             return
+        if not self.engine.scan_pending():
+            return                        # 今天已经检查过，不再重复联网
         self.start_scan(silent=True)
 
     def show_main(self, page: str | None = None) -> None:
@@ -1008,6 +1011,50 @@ class MainWindow(QWidget):
         if not self.isVisible() and self.tray is not None:
             self.tray.notify("正在检查", "正在检查程序更新，完成后托盘角标会更新")
 
+    def _startup_check(self, silent: bool = False) -> None:
+        """启动时：先把上次结果铺到界面，再判断今天是否还需要联网检查。
+
+        每天只自动做一次「内置地址测速 → 拉社区节点 → 全量测速 → 检查更新」；
+        当天已经做过就只展示上次的结论，避免每次开程序都白跑一遍网络。
+        """
+        if not self.items:
+            self._load_cached_items()
+        last = self.engine.records.get("last_scan", "—") or "—"
+        if not (self.cfg.get("background") or {}).get("check_enabled", True):
+            self.page_home.last_scan_time = last
+            self.page_home.refresh_stats()
+            self._update_brand()
+            if not silent:
+                self.toast.show_text("自动检查已关闭，点「立即检查」才会联网")
+            return
+        if self.engine.scan_pending():
+            self.start_scan(silent=silent)
+            return
+        self.page_home.last_scan_time = last
+        self.page_home.refresh_stats()
+        self._update_brand()
+        if not silent:
+            self.toast.show_text(f"今天已检查过（{last}），需要时可点「立即检查」")
+
+    def _load_cached_items(self) -> None:
+        """离线铺列表：只读磁盘 + 上次检查快照，不发任何网络请求。"""
+        try:
+            items = self.engine.collect()
+        except Exception:
+            items = []
+        if not items:
+            return
+        self.engine.apply_snapshot(items)
+        self.items = items
+        self.page_home.set_items(items)
+        self.progs_list.set_items(items)
+        self.page_home.last_scan_time = self.engine.records.get("last_scan", "—") or "—"
+        self.page_home.refresh_stats()
+        if self.tray is not None:
+            upd = sum(1 for i in items if i.status == "update")
+            self.tray.set_tooltip(self.engine.records.get("last_scan", ""), upd)
+        self._update_brand()
+
     def start_scan(self, silent: bool = False) -> None:
         if self.scan_worker and self.scan_worker.isRunning():
             return
@@ -1053,8 +1100,13 @@ class MainWindow(QWidget):
         self.scan_worker = ScanWorker(self.engine, items)
         self.scan_worker.item_ready.connect(self._on_item_scanned)
         self.scan_worker.progress.connect(self._on_scan_progress)
+        self.scan_worker.stage.connect(self._on_scan_stage)
         self.scan_worker.finished_all.connect(self._on_scan_finished)
         self.scan_worker.start()
+
+    def _on_scan_stage(self, msg: str) -> None:
+        """每日准备阶段的提示（测速 / 拉取节点），复用检查进度条那一行文字。"""
+        self.page_home.set_scan_state(True, 0, len(self.items), msg)
 
     def _on_item_scanned(self, item) -> None:
         self.page_home.update_item(item)
@@ -1078,6 +1130,13 @@ class MainWindow(QWidget):
                if i.status == "update" or (i.status == "unknown" and i.scanned)]
         errs = [i for i in items if i.status == "error"]
         cancelled = self.engine.cancel.is_set()
+        # 完整跑完一轮才记为「今天已检查」：中途取消/失败的话，下次启动还会补一次
+        if not cancelled:
+            try:
+                self.engine.save_snapshot(items)
+                self.engine.mark_scan_done()
+            except Exception:
+                pass
         if self.tray is not None:
             self.tray.set_busy(False)
             self.tray.set_tooltip(self.engine.records.get("last_scan", ""), len(upd))

@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.6"
+APP_VERSION = "1.6.7"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -75,9 +75,12 @@ DEFAULT_PROXY_PORTS = [7890, 7891, 1080, 10809, 10808, 8080, 2080, 33210, 7897, 
 # 社区维护的 GitHub 加速节点列表（hubporg/ghproxy-next），每天自动同步一次
 NODES_URL = ("https://raw.githubusercontent.com/hubporg/ghproxy-next/"
              "main/components/nodes.ts")
-# 换源策略：默认不因速度切换；开启后只有「连续 20 秒没有任何数据写入」才换线路
-STALL_TIMEOUT = 20                 # 无写入多久算卡住（秒）
-DOWNLOAD_READ_TIMEOUT = 180        # 未开启卡住切换时的单次读超时，仅作失败兜底
+# 下载策略：不看速度，只看「有没有数据进来」。连续 STALL_TIMEOUT 秒一个字节都没有，
+# 就认为这条连接已经死了，关掉并从 .part 断点续传；同一条线路先自己重试，
+# 连续 DOWNLOAD_ATTEMPTS 次都续不上才换下一个加速地址。
+STALL_TIMEOUT = 20                 # 无数据多少秒算断流（秒）
+DOWNLOAD_ATTEMPTS = 3              # 同一条线路最多尝试次数（每次都从断点续传）
+DOWNLOAD_CHUNK = 128 * 1024        # 单次读取块大小（越小越不容易被慢速误判断流）
 
 # 程序 → GitHub 仓库的预置映射（按文件夹名匹配，跨根目录通用）
 BUILTIN_PROGRAMS = [
@@ -159,8 +162,9 @@ def default_config() -> dict:
             "nodes_attempt": "",             # 上次尝试日期（失败也记，避免每次扫描重试拖慢）
             "nodes_error": "",
             "probe_before": True,            # 下载前确保测速结果可用
-            "slow_switch": False,            # 连续 20 秒无写入才换线路；默认关闭
-            "stall_policy": 2,               # 换源策略版本：1=旧版按速度阈值切换
+            # 每天一次的准备工作：内置加速地址测速 → 拉取社区节点 → 全量测速 → 检查更新。
+            # 只用日期做闸门，当天做过就不再重复，避免每次开程序都把网络跑一遍。
+            "daily": {},
         },
         # clean 保留指定文件夹 | overwrite 直接覆盖
         # retry_on_locked：目标文件被其它进程占用时自动暂停并重试，而不是直接判失败
@@ -169,8 +173,8 @@ def default_config() -> dict:
         "background": {
             "close_to_tray": True,           # 关闭窗口时最小化到托盘
             "run_at_startup": False,         # 开机自启（后台静默）
-            "check_enabled": True,           # 定时检查
-            "interval_min": 60,              # 检查间隔（分钟）
+            "check_enabled": True,           # 每天自动检查一次（当天已检查则跳过）
+            "interval_min": 60,              # 旧版检查间隔，v1.6.7 起不再使用（仅保留兼容）
             "auto_mode": "off",              # off 只通知 | silent 静默更新 | notify 静默更新后提示
             "notify_methods": ["tray"],      # tray 系统通知 | dingtalk 钉钉 | window 弹出主界面
         },
@@ -186,9 +190,6 @@ def default_config() -> dict:
 def _normalize(cfg: dict) -> dict:
     """兼容旧版配置：mirrors 曾是纯数组，update 段可能缺失。"""
     m = cfg.get("mirrors")
-    # v1.6.6 换源条件改为「20 秒无写入」；旧的「按速度切换」开关不再沿用，
-    # 升级后统一回到默认关闭，避免一升级就又开始切线路
-    legacy_stall = isinstance(m, dict) and "stall_policy" not in m
     base = default_config()["mirrors"]
     if isinstance(m, list):
         base.update({"list": [x for x in m if isinstance(x, str) and x], "seeded": 0})
@@ -208,10 +209,8 @@ def _normalize(cfg: dict) -> dict:
     for key in ("auto_nodes", "probe_before"):
         if not isinstance(mm.get(key), bool):
             mm[key] = True
-    if legacy_stall or not isinstance(mm.get("slow_switch"), bool):
-        mm["slow_switch"] = False       # 新策略默认关闭，用户需要时再手动开
-    if legacy_stall or not isinstance(mm.get("stall_policy"), int):
-        mm["stall_policy"] = 2
+    if not isinstance(mm.get("daily"), dict):
+        mm["daily"] = {}
     if not str(mm.get("nodes_url") or "").strip():
         mm["nodes_url"] = NODES_URL
     try:
@@ -503,6 +502,28 @@ def candidate_signature(urls) -> str:
     return hashlib.md5(joined.encode("utf-8")).hexdigest()[:12]
 
 
+# ---------------------------------------------------------------- 每日流程
+def _today() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def daily_state(cfg: dict) -> dict:
+    """「每天一次」的准备阶段状态，跨天自动清空。
+
+    记在 mirrors.daily 上：date / builtin（内置地址已测）/ nodes（节点已拉）/
+    ranked（全量已测）/ scan（更新已检查）。任一阶段没打勾，下次启动就只补这一段。
+    """
+    m = cfg.setdefault("mirrors", {})
+    st = m.get("daily")
+    if not isinstance(st, dict):
+        st = {}
+        m["daily"] = st
+    if st.get("date") != _today():
+        st.clear()
+        st["date"] = _today()
+    return st
+
+
 def load_config() -> dict:
     cfg = default_config()
     p = config_path()
@@ -752,30 +773,44 @@ def http_json(url: str, proxy: str | None, mirrors=None, retries: int = 1,
     return None
 
 
+class _BadSource(Exception):
+    """这条线路返回的不是目标文件（错误页 / 大小对不上），直接换下一个。"""
+
+
+def _parse_content_range(value: str) -> tuple[int, int]:
+    """解析 ``bytes 100-999/1000`` → (起点, 总长)；无法解析返回 (-1, -1)。"""
+    m = re.match(r"\s*bytes\s+(\d+)-(\d+)/(\d+|\*)\s*$", value or "")
+    if not m:
+        return -1, -1
+    total = int(m.group(3)) if m.group(3) != "*" else -1
+    return int(m.group(1)), total
+
+
 def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
              deadline: float = 0, expect_size: int = 0, sha256: str = "",
              stall_sec: int = 0, on_source=None) -> bool:
-    """下载到 dest，支持断点续传、sha256 校验与「卡住自动换源」。
+    """下载到 dest，支持断点续传、sha256 校验与「断流自救」。
 
-    实际写入 dest.part：下载中断时保留已传字节，下一次（或换下一个候选源）
-    带 Range 头从断点继续；服务器不支持 Range（返回非 206）时自动从头重下。
-    只有所有候选源都失败才返回 False，.part 仍保留待续传。
+    写入 dest.<urlhash>.part：连接中断时保留已传字节，下一次（或下一条线路）
+    带 Range 头从断点继续；服务器不支持 Range（返回 200）时从头重下。
+
+    换源规则：连续 ``stall_sec``（默认 STALL_TIMEOUT=20）秒一个字节都收不到，就
+    认为这条连接死了，关掉后**先在同一条线路上续传重试**（最多 DOWNLOAD_ATTEMPTS
+    次）。只有一条线路连续续不上、或返回的内容根本不是这个文件时才换下一个候选，
+    因此不会再出现「下到一半突然换线路、进度归零」。
 
     mirrors 已按测速结果排序，所以这里是「最快线路优先」，官方直连只作兜底。
-    stall_sec > 0 时，连接建立后连续这么多秒收不到任何数据才断开换下一个候选；
-    为 0 时不启用卡住切换，仅用 180 秒读超时作失败兜底。不再按下载速度判断。
+    失败原因写在 ``download.last_error`` 上，供界面显示。
 
     内容可信性：expect_size 只能证明「大小完整」，不能证明「内容可信」。有 sha256
-    时下载后必须校验哈希；校验失败会删除 .part 并失败（防止恶意镜像用同尺寸包替换）。
+    时下载后必须校验哈希；校验失败会删除 .part 并换源（防止镜像返回同尺寸的假包）。
     """
-    part = dest + ".part"
     # 续传缓存必须绑定 URL：同资产名跨版本/跨源会复用同一 .part，换源后内容可能 A/B 拼接。
     # 用 URL 哈希做缓存键，源变了就从头下，避免拼接出错误文件。
     url_key = hashlib.sha256((url or "").encode("utf-8")).hexdigest()[:16]
     part = dest + "." + url_key + ".part"
     # 只允许 https 的镜像（明文 http 的镜像/代理会暴露内容，且无法信任）
     # 顺序：本地代理 → 测速胜出的加速地址 → 官方直连兜底。
-    # 以前直连排在镜像前面，慢速直连会把整个下载拖死，测速结果等于白测。
     cands = []
     if proxy:
         cands.append((proxy, url))
@@ -783,81 +818,122 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
         if str(m).lower().startswith("https://"):
             cands.append((None, m.rstrip("/") + "/" + url))
     cands.append((None, url))
+
+    idle = int(stall_sec) if stall_sec and stall_sec > 0 else STALL_TIMEOUT
+    last_err = "网络/镜像均不可用"
+    download.last_error = ""
+
     for px, u in cands:
-        if deadline and time.time() > deadline:
-            return False
-        try:
-            have = os.path.getsize(part) if os.path.exists(part) else 0
-            # 已完成的 .part：完整大小与预期一致时直接校验收尾，别再发 Range 触发 416
-            if have > 0 and expect_size and have == expect_size:
-                if _verify_digest(part, sha256):
-                    shutil.move(part, dest)
-                    return True
-                os.remove(part)
-                have = 0
-            headers = {"Range": f"bytes={have}-"} if have > 0 else None
-            read_timeout = int(stall_sec) if stall_sec > 0 else DOWNLOAD_READ_TIMEOUT
-            with http_get(u, proxy=px, timeout=read_timeout, headers=headers) as r:
-                code = int(getattr(r, "status", 0) or 200)
-                if have > 0 and code == 416:
-                    # 服务器认为断点越界：可能文件已完成。若大小/哈希匹配则收尾，否则重下。
+        attempt = 0
+        while attempt < DOWNLOAD_ATTEMPTS:
+            attempt += 1
+            if deadline and time.time() > deadline:
+                download.last_error = "下载超时"
+                return False
+            progressed = False
+            try:
+                have = os.path.getsize(part) if os.path.exists(part) else 0
+                if have and expect_size and have > expect_size:
+                    os.remove(part)          # 残留文件比目标还大，肯定不对
+                    have = 0
+                # 已下满：直接校验收尾，别再发 Range 触发 416
+                if have and expect_size and have == expect_size:
+                    if _verify_digest(part, sha256):
+                        shutil.move(part, dest)
+                        download.last_error = ""
+                        return True
                     os.remove(part)
                     have = 0
-                    continue
-                if have > 0 and code != 206:
-                    # 服务器不支持续传：丢弃旧数据从头下
-                    have = 0
-                # 校验 Content-Range 起点：换源后若服务器从非 have 处返回，会拼出错误文件
-                cr = r.headers.get("Content-Range") or ""
-                if have > 0 and code == 206 and cr:
-                    m = re.match(r"bytes\s+(\d+)-", cr)
-                    if m and int(m.group(1)) != have:
-                        os.remove(part)
-                        have = 0
+                headers = {"Accept-Encoding": "identity"}
+                if have:
+                    headers["Range"] = f"bytes={have}-"
+                total = done = 0
+                with http_get(u, proxy=px, timeout=idle, headers=headers) as r:
+                    code = int(getattr(r, "status", 0) or 200)
+                    if code == 416:
+                        # .part 与服务器上的文件对不上（换了内容/已完成），从头来
+                        if os.path.exists(part):
+                            os.remove(part)
+                        last_err = "断点位置失效，重新下载"
                         continue
-                cl = int(r.headers.get("Content-Length") or 0)
-                total = have + cl if code == 206 else cl
-                done = have
-                # 连接成功、确认可读后才上报线路：连接失败的候选不会在界面上闪一下
-                if on_source:
-                    try:
-                        host = urllib.parse.urlsplit(u).hostname or u[:40]
-                        on_source("本地代理" if px else str(host))
-                    except Exception:
-                        pass
-                mode = "ab" if have > 0 else "wb"
-                with open(part, mode) as f:
-                    while True:
-                        if cancel is not None and cancel.is_set():
-                            return False          # 保留 .part，下次继续
-                        if deadline and time.time() > deadline:
-                            raise UpdateTimeout("下载超时")
-                        chunk = r.read(256 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        done += len(chunk)
-                        # 不再按速度判定；卡住与否由 http_get 的读超时（stall_sec）控制
-                        if progress_cb and total:
-                            progress_cb(min(1.0, done / total))
+                    if code not in (200, 206):
+                        raise _BadSource(f"HTTP {code}")
+                    cl = int(r.headers.get("Content-Length") or 0)
+                    if code == 206:
+                        start, ctotal = _parse_content_range(
+                            r.headers.get("Content-Range") or "")
+                        if start >= 0 and start != have:
+                            if os.path.exists(part):
+                                os.remove(part)
+                            last_err = "断点位置不符，重新下载"
+                            continue
+                        if expect_size and ctotal > 0 and ctotal != expect_size:
+                            raise _BadSource(f"文件大小不符（{ctotal} 字节）")
+                        total = ctotal if ctotal > 0 else have + cl
+                    else:
+                        have = 0             # 服务器无视 Range：从头写
+                        # 错误页/引导页通常只有几百字节，一眼就能看出来，别写进 .part
+                        if expect_size and cl and cl != expect_size:
+                            raise _BadSource(f"返回的不是安装包（{cl} 字节）")
+                        total = cl
+                    done = have
+                    # 连接成功、确认是有效响应后才上报线路：失败候选不会在界面上闪
+                    if on_source:
+                        try:
+                            host = urllib.parse.urlsplit(u).hostname or u[:40]
+                            on_source("本地代理" if px else str(host))
+                        except Exception:
+                            pass
+                    mode = "ab" if have > 0 else "wb"
+                    with open(part, mode) as f:
+                        reader = getattr(r, "read1", None) or r.read
+                        while True:
+                            if cancel is not None and cancel.is_set():
+                                return False          # 保留 .part，下次继续
+                            if deadline and time.time() > deadline:
+                                raise UpdateTimeout("下载超时")
+                            chunk = reader(DOWNLOAD_CHUNK)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            done += len(chunk)
+                            progressed = True
+                            if progress_cb and total:
+                                progress_cb(min(1.0, done / total))
+                # 连接正常结束，但字节数不够：说明对面提前收尾，续传接着下
                 if total and done < total:
-                    # 连接提前中断：抛错换下一个候选源（.part 保留，下次续传）
-                    raise IOError(f"连接中断于 {done}/{total}")
-            got = os.path.getsize(part) if os.path.exists(part) else 0
-            if expect_size and got != expect_size:
-                # GitHub API 给了 asset.size，用来挡住「无 Content-Length 时断连也当成功」
-                os.remove(part)
-                raise IOError(f"文件大小不符：{got}/{expect_size}")
-            if not _verify_digest(part, sha256):
-                os.remove(part)
-                raise IOError("文件 sha256 校验失败（内容可能被镜像篡改）")
-            # 小文件（如 <1KB 的合法 zip）也应能成功：以哈希/大小为准，不再要求 >1024
-            shutil.move(part, dest)
-            return True
-        except UpdateTimeout:
-            return False
-        except Exception:
-            continue
+                    last_err = f"连接中断（{done}/{total}）"
+                    if progressed:
+                        continue
+                    break
+                got = os.path.getsize(part) if os.path.exists(part) else 0
+                if expect_size and got != expect_size:
+                    last_err = f"文件大小不符（{got}/{expect_size}）"
+                    if got > expect_size:
+                        os.remove(part)
+                        break                    # 内容不对，换源从头下
+                    if progressed:
+                        continue                 # 小了：可能只是断流，续传
+                    break
+                if not _verify_digest(part, sha256):
+                    os.remove(part)
+                    last_err = "文件校验失败（可能被镜像替换）"
+                    break
+                shutil.move(part, dest)
+                download.last_error = ""
+                return True
+            except UpdateTimeout:
+                download.last_error = "下载超时"
+                return False
+            except _BadSource as e:
+                last_err = str(e)
+                break                            # 这个源给的不是目标文件
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"[:120]
+                if progressed:
+                    continue                     # 已经下了一部分：同源续传
+                break                            # 连都连不上：换下一个候选
+    download.last_error = last_err
     return False
 
 
@@ -1090,6 +1166,131 @@ class Engine:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.records_path)
+
+    # ---------- 每日流程 ----------
+    def daily_pending(self) -> bool:
+        """今天的准备流程（内置测速 → 拉节点 → 全量测速）是否还没跑完。"""
+        st = daily_state(self.cfg)
+        return not all(st.get(k) for k in ("builtin", "nodes", "ranked"))
+
+    def scan_pending(self) -> bool:
+        """今天是否还没检查过更新：启动/定时自动检查都用它做闸门。"""
+        return str(daily_state(self.cfg).get("scan") or "")[:10] != _today()
+
+    def mark_scan_done(self) -> None:
+        st = daily_state(self.cfg)
+        st["scan"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            save_config(self.cfg)
+        except Exception:
+            pass
+
+    def daily_bootstrap(self, progress=None) -> dict:
+        """每天一次：① 测内置加速地址 ② 拉取项目加速地址 ③ 全量测速。
+
+        顺序不能颠倒：② 拉节点要用 ① 里跑通的加速地址去转发 GitHub 原始链接，
+        ③ 才能把刚抓到的节点一起测排名。整个流程按日期记在 mirrors.daily 上，
+        当天跑过就直接跳过，所以开多少次程序都只执行一遍。
+        """
+        def rep(msg):
+            if progress:
+                try:
+                    progress(msg)
+                except Exception:
+                    pass
+
+        with self._mirror_lock:
+            st = daily_state(self.cfg)
+            mcfg = self.cfg.setdefault("mirrors", {})
+            if not st.get("builtin"):
+                rep("测速内置加速地址…")
+                builtin = mirror_list(self.cfg)
+                ranked = probe_mirrors(builtin, per_timeout=4)
+                ms_map = {u.rstrip("/"): ms for ms, u in ranked}
+                merged, seen = [], set()
+                for u in builtin:
+                    key = u.rstrip("/")
+                    seen.add(key)
+                    merged.append([int(ms_map.get(key, -1)), u])
+                # 社区节点这一轮还没测，先把旧排名里剩下的保留下来（下次全量会覆盖）
+                for row in (mcfg.get("ranking") or []):
+                    if isinstance(row, (list, tuple)) and len(row) >= 2:
+                        key = str(row[1]).rstrip("/")
+                        if key and key not in seen:
+                            seen.add(key)
+                            try:
+                                merged.append([int(row[0]), row[1]])
+                            except Exception:
+                                continue
+                mcfg["ranking"] = merged
+                mcfg["ranking_sig"] = candidate_signature(all_mirror_candidates(self.cfg))
+                best = sorted([r for r in merged if r[0] >= 0], key=lambda r: r[0])
+                mcfg["chosen"] = best[0][1] if best else ""
+                self.mirror = mcfg["chosen"] or None
+                st["builtin"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    save_config(self.cfg)
+                except Exception:
+                    pass
+            if not st.get("nodes"):
+                rep("拉取项目加速地址…")
+                try:
+                    self.sync_nodes(force=False)
+                except Exception:
+                    pass
+                st["nodes"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    save_config(self.cfg)
+                except Exception:
+                    pass
+            if not st.get("ranked"):
+                rep("测速全部加速地址…")
+                ranked = []
+                try:
+                    ranked, _ = self._probe_daily(force=True)
+                    self.mirror = ranked[0][1] if ranked else ""
+                except Exception:
+                    pass
+                # 一个能用的线路都没有（比如此时断网）就先不算完成，
+                # 下次手动检查/重启还会再试一遍，而不是整天都用空排名
+                if ranked or not all_mirror_candidates(self.cfg):
+                    st["ranked"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    save_config(self.cfg)
+                except Exception:
+                    pass
+            return dict(st)
+
+    # ---------- 上次检查快照 ----------
+    SNAP_FIELDS = ("status", "local", "remote", "detail", "published", "local_manual",
+                   "local_size", "asset", "asset_size", "asset_digest", "download_url",
+                   "anchor", "updated_at")
+
+    def save_snapshot(self, items) -> None:
+        """把本次检查结果存下来：当天不再重复联网时，界面仍显示上次的结论。"""
+        snap = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "items": {}}
+        for it in items:
+            snap["items"][it.key] = {k: getattr(it, k, None) for k in self.SNAP_FIELDS}
+        self.records["snapshot"] = snap
+        try:
+            self.save_records(update_last_scan=False)
+        except Exception:
+            pass
+
+    def apply_snapshot(self, items) -> int:
+        """把上次检查结果套回新收集的列表（不联网），返回命中数量。"""
+        rows = (self.records.get("snapshot") or {}).get("items") or {}
+        hit = 0
+        for it in items:
+            row = rows.get(it.key)
+            if not isinstance(row, dict):
+                continue
+            for k in self.SNAP_FIELDS:
+                if k in row:
+                    setattr(it, k, row[k])
+            it.scanned = True
+            hit += 1
+        return hit
 
     # ---------- 镜像 ----------
     def mirrors(self) -> list:
@@ -1685,23 +1886,22 @@ class Engine:
                 cache_dir = tmp
             safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{it.name}_{it.asset or 'package.zip'}")
             archive = os.path.join(cache_dir, safe)
-            # 下载前测速：当天没测过（或候选变过）就在这里补测，之后按速度顺序尝试，
-            # 连接失败会换下一个候选；卡住换源默认关闭，开启后要求连续 20 秒无写入。
+            # 下载前测速：当天没测过（或候选变过）就在这里补测，之后按速度顺序尝试。
+            # 不按速度换源：断流才会续传/换线路，判定逻辑全在 download() 里。
             mcfg = self.cfg.get("mirrors") or {}
             if mcfg.get("probe_before", True):
                 try:
                     self.ensure_mirror()
                 except Exception:
                     pass
-            stall_sec = STALL_TIMEOUT if mcfg.get("slow_switch", False) else 0
             pr(0.02, "下载中（支持断点续传）")
             ok = download(it.download_url, archive, self.proxy, self.top_mirrors(12),
                           # 不覆盖 message：保留 on_source 写入的「下载中 · 当前线路」
-                          progress_cb=lambda p: pr(0.02 + p * 0.6),
+                          progress_cb=lambda p: pr(0.02 + p * 0.63),
                           cancel=self.cancel, deadline=deadline,
                           expect_size=int(it.asset_size or 0),
                           sha256=it.asset_digest,
-                          stall_sec=stall_sec,
+                          stall_sec=STALL_TIMEOUT,
                           on_source=lambda host: pr(0.02, f"下载中 · {host}"))
             if self.cancel.is_set():
                 it.state, it.status = "failed", "error"
@@ -1712,7 +1912,8 @@ class Engine:
                 if self.expired(deadline):
                     it.detail = f"更新超时（超过 {mins} 分钟），已中止"
                 else:
-                    it.detail = "下载失败（网络/镜像均不可用或文件不完整）"
+                    why = getattr(download, "last_error", "") or "网络/镜像均不可用"
+                    it.detail = f"下载失败：{why}"
                 return it
             if self.expired(deadline):
                 it.state, it.status = "failed", "error"

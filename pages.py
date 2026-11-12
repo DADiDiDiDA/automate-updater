@@ -1305,24 +1305,14 @@ class SettingsPage(QWidget):
                   "开机后在后台静默运行，不弹出主界面；移动文件夹后重新打开本开关即可",
                   self.startup_toggle)
 
-        mins_opts = [(15, "15 分钟"), (30, "30 分钟"), (60, "1 小时"), (180, "3 小时"),
-                     (360, "6 小时"), (720, "12 小时"), (1440, "24 小时")]
-        cur = int(bg.get("interval_min", 60) or 60)
-        near = min(mins_opts, key=lambda kv: abs(kv[0] - cur))[0]
-        self.interval_combo = ThemedCombo([(str(m), t) for m, t in mins_opts], str(near), 118)
-        self.interval_combo.changed.connect(self._save_background)
-
-        box = QWidget()
-        flat(box)
-        bl = QHBoxLayout(box)
-        bl.setContentsMargins(0, 0, 0, 0)
-        bl.setSpacing(10)
+        # 自动检查是「每天一次」：准备流程（测速 / 拉节点）+ 检查更新都按天记，
+        # 所以这里不再提供间隔选项，避免选了 15 分钟却因为当天已检查而不执行。
         self.sched_toggle = ToggleSwitch(bool(bg.get("check_enabled", True)))
         self.sched_toggle.toggled.connect(self._save_background)
-        bl.addWidget(self.sched_toggle)
-        bl.addWidget(self.interval_combo)
-        self.sched_row = self._row(lay, "clock", "定时检查更新",
-                                   "按间隔自动检查所有程序的新版本", box)
+        self.sched_row = self._row(
+            lay, "clock", "每天自动检查一次",
+            "启动时若当天还没检查过，会依次测速内置加速地址、拉取项目加速地址、"
+            "测速，然后检查程序更新；当天已检查则只显示上次结果", self.sched_toggle)
 
         self.auto_combo = ThemedCombo(
             [("off", "只通知，不自动更新"), ("notify", "静默更新，完成后提示"),
@@ -1397,17 +1387,16 @@ class SettingsPage(QWidget):
         lay.addWidget(self.notify_card)
 
         self._refresh_bg_hint()
-        self.interval_combo.setEnabled(self.sched_toggle.isChecked())
         self._sync_ding_visibility()
 
     def _refresh_bg_hint(self) -> None:
         bg = self.cfg.get("background", {})
         if not bg.get("check_enabled", True):
-            self.sched_row.set_desc("定时检查已关闭，只能在托盘右键或主界面手动检查")
+            self.sched_row.set_desc("自动检查已关闭，只能在托盘右键或主界面手动检查")
             return
-        mins = int(bg.get("interval_min", 60) or 60)
-        span = f"{mins} 分钟" if mins < 60 else f"{mins // 60} 小时"
-        self.sched_row.set_desc(f"每 {span}自动检查一次；关闭主窗口不会退出程序")
+        self.sched_row.set_desc(
+            "启动时若当天还没检查过，会依次测速内置加速地址、拉取项目加速地址、测速，"
+            "然后检查程序更新；当天已检查则只显示上次结果；关闭主窗口不会退出程序")
 
     def _toggle_notify(self, key: str, chip) -> None:
         on = not self._notify_state.get(key, False)
@@ -1457,13 +1446,8 @@ class SettingsPage(QWidget):
         bg = self.cfg.setdefault("background", {})
         bg["close_to_tray"] = self.tray_toggle.isChecked()
         bg["check_enabled"] = self.sched_toggle.isChecked()
-        try:
-            bg["interval_min"] = int(self.interval_combo.value() or 60)
-        except Exception:
-            bg["interval_min"] = 60
         bg["auto_mode"] = self.auto_combo.value() or "off"
         bg["notify_methods"] = [k for k, on in self._notify_state.items() if on] or ["tray"]
-        self.interval_combo.setEnabled(bg["check_enabled"])
         self._refresh_bg_hint()
         self.config_changed.emit()
 
@@ -1797,18 +1781,10 @@ class SettingsPage(QWidget):
                   "每天抓取一次；不依赖你开着本地加速：直连不通就用已缓存的最快线路转发",
                   nbox, self.node_lbl)
 
-        # 下载卡住自动切换（默认关闭）
-        sbox = QWidget()
-        flat(sbox)
-        sbl = QHBoxLayout(sbox)
-        sbl.setContentsMargins(0, 0, 0, 0)
-        sbl.setSpacing(10)
-        self.slow_toggle = ToggleSwitch(bool(mcfg.get("slow_switch", False)))
-        self.slow_toggle.toggled.connect(self._save_mirrors)
-        sbl.addWidget(self.slow_toggle)
-        self._row(lay, "link", "下载卡住自动切换",
-                  "开启后连续 20 秒没有数据写入才换线路；默认关闭，关闭时只有连接失败才会换源",
-                  sbox)
+        # 断流续传：不按速度判断，也不做成开关（以前那个阈值反而更容易来回切源）
+        self._row(lay, "link", "断流自动续传",
+                  "连续 20 秒没有数据才判定断流：先在当前线路从断点续传，连续 3 次续不上"
+                  "才换下一个加速地址；返回错误页或大小不符的线路会被直接跳过")
 
     def _on_sync_nodes(self):
         self.node_btn.setEnabled(False)
@@ -1829,8 +1805,6 @@ class SettingsPage(QWidget):
         # 控件是逐个创建的，构造期间若开关信号提前触发，后面的控件可能还不存在
         if hasattr(self, "node_toggle"):
             m["auto_nodes"] = self.node_toggle.isChecked()
-        if hasattr(self, "slow_toggle"):
-            m["slow_switch"] = self.slow_toggle.isChecked()
         m["ranking_sig"] = ""          # 候选/开关变了，下次检查重新测速
         self.mirror_lbl.setText(self._mirror_summary())
         self.config_changed.emit()
