@@ -201,6 +201,24 @@ class MirrorWorker(QThread):
             self.done.emit([], f"{type(e).__name__}: {e}")
 
 
+class NodesSyncWorker(QThread):
+    """后台抓取社区加速节点，别卡住界面。"""
+
+    done = Signal(list, str)
+
+    def __init__(self, engine: core.Engine, force: bool = True):
+        super().__init__()
+        self.engine = engine
+        self.force = force
+
+    def run(self):
+        try:
+            nodes, err, _ = self.engine.sync_nodes(force=self.force)
+            self.done.emit(nodes, err)
+        except Exception as e:
+            self.done.emit([], f"{type(e).__name__}: {e}")
+
+
 # ---------------------------------------------------------------- 窗口按钮
 
 class WinBtn(QPushButton):
@@ -549,6 +567,7 @@ class MainWindow(QWidget):
         page.autostart_requested.connect(self._set_autostart)
         page.mirror_probe_requested.connect(self._probe_mirrors)
         page.mirror_manage_requested.connect(self._manage_mirrors)
+        page.nodes_sync_requested.connect(lambda: self._sync_nodes(force=True))
         page.proxy_changed.connect(self._on_proxy_changed)
         page.mirrors_changed.connect(self._on_mirrors_changed)
 
@@ -578,16 +597,46 @@ class MainWindow(QWidget):
                                       or (i.status == "unknown" and i.scanned)))
         self._refresh_net_info()
 
+    def _sync_nodes(self, force: bool = True) -> None:
+        """立即同步社区加速节点（设置页按钮 / 镜像对话框）。"""
+        if getattr(self, "_nodes_worker", None) and self._nodes_worker.isRunning():
+            return
+        self._nodes_worker = NodesSyncWorker(self.engine, force)
+        self._nodes_worker.done.connect(self._on_nodes_synced)
+        self._nodes_worker.start()
+
+    def _on_nodes_synced(self, nodes, error) -> None:
+        self._save_cfg()
+        self.engine.mirror = None        # 候选变了，下次检查重新测速
+        if hasattr(self, "page_settings"):
+            self.page_settings.set_nodes_info()
+        dlg = getattr(self, "_mirror_dlg", None)
+        if dlg is not None:
+            try:
+                dlg.set_nodes_info()
+            except RuntimeError:
+                pass
+        if error:
+            self.toast.show_text(f"节点同步失败：{error[:70]}", ok=False)
+        else:
+            self.toast.show_text(f"已同步 {len(nodes)} 个社区加速节点，下次测速生效")
+
     def _manage_mirrors(self) -> None:
-        """设置页「镜像地址 · 管理」：增删 GitHub 镜像 / 手填代理地址。"""
+        """设置页「镜像地址 · 管理」：按测速结果排序展示，可增删 / 同步节点。"""
         mcfg = self.cfg.setdefault("mirrors", {})
         dlg = MirrorDialog(self, [x for x in (mcfg.get("list") or [])
-                                  if isinstance(x, str)], mcfg.get("chosen") or "")
+                                  if isinstance(x, str)], mcfg.get("chosen") or "",
+                           ranking=mcfg.get("ranking") or [], cfg=self.cfg)
+        dlg.sync_requested.connect(lambda: self._sync_nodes(force=True))
+        self._mirror_dlg = dlg
         if not dlg.exec():
+            self._mirror_dlg = None
             return
+        self._mirror_dlg = None
         before = len(mcfg.get("list") or [])
         left = core.set_mirrors(self.cfg, dlg.values())
-        self.engine.mirror = None            # 列表变了，下次检查重新测速
+        mcfg["ranking_sig"] = ""             # 候选变了，下次检查重新测速
+        self.engine.mirror = None
         self._save_cfg()
         if hasattr(self, "page_settings"):
             self.page_settings.refresh_mirror_row()

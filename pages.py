@@ -689,18 +689,28 @@ class ExcludeDialog(ThemedDialog):
 
 
 class MirrorDialog(ThemedDialog):
-    """管理 GitHub 镜像 / 代理地址：可以删内置的，也可以手动加自己的。"""
+    """管理 GitHub 镜像 / 代理地址：按当天测速结果排序，可增删、可同步社区节点。"""
 
-    def __init__(self, parent, mirrors: list[str], chosen: str = ""):
-        super().__init__(parent, "GitHub 镜像地址", 580)
-        self.items = [m for m in (mirrors or []) if m]
+    sync_requested = Signal()
+
+    def __init__(self, parent, mirrors: list[str], chosen: str = "",
+                 ranking=None, cfg: dict | None = None):
+        super().__init__(parent, "GitHub 镜像地址", 620)
+        self.cfg = cfg if isinstance(cfg, dict) else {}
+        self.ranking = {}
+        for row in (ranking or []):
+            try:
+                self.ranking[str(row[1]).rstrip("/")] = int(row[0])
+            except Exception:
+                continue
+        self.items = self._sorted([m for m in (mirrors or []) if m])
         self.chosen = chosen or ""
         self._rows: list[QWidget] = []
 
         self.body.addWidget(_label(
-            "下载时按「镜像地址 + 原始 GitHub 地址」转发；测速后自动挑最快的。"
-            "填域名或完整地址都行，例如 gh-proxy.com 或 https://gh-proxy.com/ 。"
-            "自建反代、公司内网代理都可以加进来。", 11, "text_muted", wrap=True))
+            "下载时按「镜像地址 + 原始 GitHub 地址」转发；每天自动测速一次，"
+            "列表按测速结果从快到慢排列，失败的排最后。填域名或完整地址都行。",
+            11, "text_muted", wrap=True))
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -736,6 +746,29 @@ class MirrorDialog(ThemedDialog):
         self.hint.setVisible(False)
         self.body.addWidget(self.hint)
 
+        # 社区加速节点：单独存放，不混进上面可手动增删的列表
+        mcfg = self.cfg.get("mirrors") or {}
+        node_bar = QWidget()
+        flat(node_bar)
+        nl = QHBoxLayout(node_bar)
+        nl.setContentsMargins(0, 6, 0, 0)
+        nl.setSpacing(8)
+        self.node_toggle = ToggleSwitch(bool(mcfg.get("auto_nodes", True)))
+        self.node_toggle.setToolTip("每天从 hubporg/ghproxy-next 自动抓取一次公共加速节点")
+        self.node_toggle.toggled.connect(self._on_auto_nodes)
+        self.node_btn = QPushButton("立即同步")
+        self.node_btn.setObjectName("soft")
+        self.node_btn.setCursor(Qt.PointingHandCursor)
+        self.node_btn.setFixedHeight(30)
+        self.node_btn.clicked.connect(self._on_sync_clicked)
+        nl.addWidget(self.node_toggle)
+        nl.addWidget(_label("社区节点", 11, "text"))
+        nl.addStretch(1)
+        nl.addWidget(self.node_btn)
+        self.body.addWidget(node_bar)
+        self.node_lbl = _label(self._nodes_desc(), 11, "text_muted", wrap=True)
+        self.body.addWidget(self.node_lbl)
+
         restore = QPushButton("恢复内置")
         restore.setObjectName("ghost")
         restore.setCursor(Qt.PointingHandCursor)
@@ -745,7 +778,47 @@ class MirrorDialog(ThemedDialog):
         self.add_footer(restore)
         self._rebuild()
 
+    # ---------- 社区节点 ----------
+    def _nodes_desc(self) -> str:
+        m = self.cfg.get("mirrors") or {}
+        n = len(m.get("nodes") or [])
+        when = str(m.get("nodes_fetched") or "")[:16]
+        err = str(m.get("nodes_error") or "")
+        if not self.node_toggle.isChecked():
+            return "自动同步已关闭，只使用上面手动维护的地址"
+        if err:
+            return f"社区节点 {n} 个 · 上次同步失败：{err[-70:]}"
+        if when:
+            return f"已同步 {n} 个社区节点 · 上次 {when} · 每天自动更新一次并参与测速"
+        return "尚未同步社区加速节点，点「立即同步」或等下次自动检查（不需要开本地加速）"
+
+    def _on_auto_nodes(self, *_):
+        self.cfg.setdefault("mirrors", {})["auto_nodes"] = self.node_toggle.isChecked()
+        self.node_lbl.setText(self._nodes_desc())
+
+    def _on_sync_clicked(self):
+        self.node_btn.setEnabled(False)
+        self.node_btn.setText("同步中…")
+        self.sync_requested.emit()
+
+    def set_nodes_info(self):
+        """后台同步完成后由主窗口调用。"""
+        self.node_btn.setEnabled(True)
+        self.node_btn.setText("立即同步")
+        self.node_lbl.setText(self._nodes_desc())
+
     # ---------- 列表 ----------
+    def _order_key(self, u):
+        ms = self.ranking.get(str(u).rstrip("/"))
+        if ms is None:
+            return (2, 0, str(u).lower())
+        if ms < 0:
+            return (1, 0, str(u).lower())
+        return (0, ms, str(u).lower())
+
+    def _sorted(self, urls):
+        return sorted([u for u in urls if u], key=self._order_key)
+
     def _clear(self) -> None:
         while self.rows_lay.count():
             item = self.rows_lay.takeAt(0)
@@ -781,6 +854,10 @@ class MirrorDialog(ThemedDialog):
             lbl = _label(url, 12, "text")
             lbl.setToolTip(url)
             h.addWidget(lbl, 1)
+            ms = self.ranking.get(url.rstrip("/"))
+            if ms is not None:
+                h.addWidget(self._tag("未响应" if ms < 0 else f"{ms} ms",
+                                      tp.text_dim if ms < 0 else tp.accent))
             if url.rstrip("/") in {x.rstrip("/") for x in core.DEFAULT_MIRRORS}:
                 h.addWidget(self._tag("内置", tp.text_dim))
             if self.chosen and self.chosen.rstrip("/") == url.rstrip("/"):
@@ -813,13 +890,13 @@ class MirrorDialog(ThemedDialog):
             return
         self.items.append(u)
         self.edit.clear()
-        self._note(f"已添加 {u}，保存后会一起参与测速")
+        self._note(f"已添加 {u}，下次测速后按速度排到对应位置")
         self._rebuild()
         bar = self.scroll.verticalScrollBar()
         bar.setValue(bar.maximum())
 
     def _restore(self) -> None:
-        self.items = list(core.DEFAULT_MIRRORS)
+        self.items = self._sorted(core.DEFAULT_MIRRORS)
         self.chosen = ""
         self._note("已恢复成内置镜像列表，点保存生效")
         self._rebuild()
@@ -1057,6 +1134,7 @@ class SettingsPage(QWidget):
     mirrors_changed = Signal()
     mirror_probe_requested = Signal()
     mirror_manage_requested = Signal()
+    nodes_sync_requested = Signal()
     autostart_requested = Signal(bool)
     proxy_changed = Signal()
 
@@ -1598,8 +1676,7 @@ class SettingsPage(QWidget):
     # ---------- 网络 ----------
     def _mirror_summary(self) -> str:
         m = self.cfg.get("mirrors", {})
-        lst = core.mirror_list(self.cfg)
-        n = len(m.get("list") or [])
+        n = len(core.all_mirror_candidates(self.cfg))
         chosen = (m.get("chosen") or "").strip()
         if not m.get("enabled", True):
             return f"镜像加速已关闭，全部走直连 / 本地代理（{n} 个候选已停用）"
@@ -1613,11 +1690,35 @@ class SettingsPage(QWidget):
         builtin = {x.rstrip("/") for x in core.DEFAULT_MIRRORS}
         n_custom = sum(1 for x in lst if x.rstrip("/") not in builtin)
         head = f"共 {len(lst)} 个（内置 {len(lst) - n_custom} · 自定义 {n_custom}）"
-        return head + "；可以手动添加自己的 GitHub 代理地址，保存后一起参与测速"
+        nodes = len(m.get("nodes") or []) if m.get("auto_nodes", True) else 0
+        return (head + f" · 社区节点 {nodes} 个"
+                + "；每天按测速结果排序，可以手动添加自己的代理地址")
+
+    def _nodes_desc(self) -> str:
+        m = self.cfg.get("mirrors") or {}
+        n = len(m.get("nodes") or [])
+        when = str(m.get("nodes_fetched") or "")[:16]
+        err = str(m.get("nodes_error") or "")
+        if not self.node_toggle.isChecked():
+            return "自动同步已关闭，只使用手动维护的镜像地址"
+        if err:
+            return f"社区节点 {n} 个 · 上次同步失败：{err[-70:]}"
+        if when:
+            return f"已同步 {n} 个社区节点 · 上次 {when} · 每天自动更新一次"
+        return "尚未同步社区加速节点，点「立即同步」或等下次自动检查"
+
+    def set_nodes_info(self):
+        """后台同步结束后由主窗口调用。"""
+        self.node_btn.setEnabled(True)
+        self.node_btn.setText("立即同步")
+        self.node_lbl.setText(self._nodes_desc())
+        self.refresh_mirror_row()
 
     def refresh_mirror_row(self) -> None:
         self.mirror_row.set_desc(self._mirror_addr_desc())
         self.mirror_lbl.setText(self._mirror_summary())
+        if hasattr(self, "node_lbl"):
+            self.node_lbl.setText(self._nodes_desc())
 
     def _build_network(self, lay: QVBoxLayout) -> None:
         self._group(lay, "网络")
@@ -1673,8 +1774,51 @@ class SettingsPage(QWidget):
         bl.addWidget(self.daily_toggle)
         bl.addWidget(self.probe_btn)
         self.mirror_lbl = _label(self._mirror_summary(), 11, "text_muted", wrap=True)
-        self._row(lay, "refresh", "每天自动测速一次", "始终保持使用最快的线路", box, self.mirror_lbl)
+        self._row(lay, "refresh", "每天自动测速一次",
+                  "每天抓取一次社区节点并对全部线路测速，下载前按速度择优", box, self.mirror_lbl)
 
+        # 社区节点：每天自动同步一次，和手动列表一起参与测速
+        nbox = QWidget()
+        flat(nbox)
+        nbl = QHBoxLayout(nbox)
+        nbl.setContentsMargins(0, 0, 0, 0)
+        nbl.setSpacing(10)
+        self.node_toggle = ToggleSwitch(bool(mcfg.get("auto_nodes", True)))
+        self.node_toggle.toggled.connect(self._save_mirrors)
+        self.node_btn = QPushButton("立即同步")
+        self.node_btn.setObjectName("soft")
+        self.node_btn.setCursor(Qt.PointingHandCursor)
+        self.node_btn.setFixedHeight(30)
+        self.node_btn.clicked.connect(self._on_sync_nodes)
+        nbl.addWidget(self.node_toggle)
+        nbl.addWidget(self.node_btn)
+        self.node_lbl = _label(self._nodes_desc(), 11, "text_muted", wrap=True)
+        self._row(lay, "download", "社区加速节点",
+                  "每天抓取一次；不依赖你开着本地加速：直连不通就用已缓存的最快线路转发",
+                  nbox, self.node_lbl)
+
+        # 下载过慢自动切换
+        sbox = QWidget()
+        flat(sbox)
+        sbl = QHBoxLayout(sbox)
+        sbl.setContentsMargins(0, 0, 0, 0)
+        sbl.setSpacing(10)
+        self.slow_toggle = ToggleSwitch(bool(mcfg.get("slow_switch", True)))
+        self.slow_toggle.toggled.connect(self._save_mirrors)
+        self.speed_step = NumberStepper(
+            int(mcfg.get("min_speed_kbps") or core.DEFAULT_MIN_SPEED_KBPS),
+            10, 2048, 10, " KB/s", 116)
+        self.speed_step.valueChanged.connect(self._save_mirrors)
+        sbl.addWidget(self.slow_toggle)
+        sbl.addWidget(self.speed_step)
+        self._row(lay, "link", "下载过慢自动切换",
+                  "下载失败或持续低于这个速度时，自动换下一个加速地址（断点续传不丢进度）",
+                  sbox)
+
+    def _on_sync_nodes(self):
+        self.node_btn.setEnabled(False)
+        self.node_btn.setText("同步中…")
+        self.nodes_sync_requested.emit()
 
     def _save_ding(self, *_):
         self.cfg.setdefault("dingtalk", {})
@@ -1687,6 +1831,14 @@ class SettingsPage(QWidget):
         m = self.cfg.setdefault("mirrors", {})
         m["enabled"] = self.mirror_toggle.isChecked()
         m["daily_check"] = self.daily_toggle.isChecked()
+        # 控件是逐个创建的，构造期间若开关信号提前触发，后面的控件可能还不存在
+        if hasattr(self, "node_toggle"):
+            m["auto_nodes"] = self.node_toggle.isChecked()
+        if hasattr(self, "slow_toggle"):
+            m["slow_switch"] = self.slow_toggle.isChecked()
+        if hasattr(self, "speed_step"):
+            m["min_speed_kbps"] = int(self.speed_step.value())
+        m["ranking_sig"] = ""          # 候选/开关变了，下次检查重新测速
         self.mirror_lbl.setText(self._mirror_summary())
         self.config_changed.emit()
         self.mirrors_changed.emit()
@@ -1725,7 +1877,9 @@ class SettingsPage(QWidget):
             self.mirror_lbl.setText("所有镜像都没有响应，将回退到直连 / 本地代理")
             return
         top = "　".join(f"{m.replace('https://', '')}（{ms} ms）" for ms, m in ranked[:4])
-        self.mirror_lbl.setText(f"测速完成，可用 {len(ranked)} 个：{top}")
+        msg = f"测速完成，可用 {len(ranked)} 个：{top}"
+        self.refresh_mirror_row()      # 顺带刷新候选数量 / 节点状态说明
+        self.mirror_lbl.setText(msg)
 
     def set_network_info(self, text: str) -> None:
         """把当前代理与镜像状态接在「本地代理」行的说明后面。"""

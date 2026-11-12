@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.6.4"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -71,6 +71,11 @@ DEFAULT_MIRRORS = [
     "https://gh.api.99988866.xyz/",
 ]
 DEFAULT_PROXY_PORTS = [7890, 7891, 1080, 10809, 10808, 8080, 2080, 33210, 7897, 10801]
+
+# 社区维护的 GitHub 加速节点列表（hubporg/ghproxy-next），每天自动同步一次
+NODES_URL = ("https://raw.githubusercontent.com/hubporg/ghproxy-next/"
+             "main/components/nodes.ts")
+DEFAULT_MIN_SPEED_KBPS = 100        # 低于这个速度（KB/s）就换下一个加速地址
 
 # 程序 → GitHub 仓库的预置映射（按文件夹名匹配，跨根目录通用）
 BUILTIN_PROGRAMS = [
@@ -143,6 +148,17 @@ def default_config() -> dict:
             "daily_check": True,             # 每天自动测速一次
             "last_check": "",
             "chosen": "",
+            "ranking": [],                  # 当天测速结果 [[毫秒, 地址]]，毫秒 -1 = 未响应
+            "ranking_sig": "",              # 测速时候选集合的指纹，候选变了就重测
+            "auto_nodes": True,              # 每天自动抓取社区加速节点
+            "nodes_url": NODES_URL,
+            "nodes": [],                    # 自动抓取到的加速地址
+            "nodes_fetched": "",             # 上次成功同步时间
+            "nodes_attempt": "",             # 上次尝试日期（失败也记，避免每次扫描重试拖慢）
+            "nodes_error": "",
+            "probe_before": True,            # 下载前确保测速结果可用
+            "slow_switch": True,             # 下载过慢时自动切换加速地址
+            "min_speed_kbps": DEFAULT_MIN_SPEED_KBPS,
         },
         # clean 保留指定文件夹 | overwrite 直接覆盖
         # retry_on_locked：目标文件被其它进程占用时自动暂停并重试，而不是直接判失败
@@ -181,6 +197,19 @@ def _normalize(cfg: dict) -> dict:
         cfg["mirrors"] = base
     # 版本升级后自动补充新增的内置镜像（删掉的旧镜像不会被加回来）
     mm = cfg["mirrors"]
+    for key in ("nodes", "ranking"):
+        if not isinstance(mm.get(key), list):
+            mm[key] = []
+    for key in ("auto_nodes", "probe_before", "slow_switch"):
+        if not isinstance(mm.get(key), bool):
+            mm[key] = True
+    try:
+        mm["min_speed_kbps"] = max(0, min(99999, int(mm.get("min_speed_kbps")
+                                                     or DEFAULT_MIN_SPEED_KBPS)))
+    except Exception:
+        mm["min_speed_kbps"] = DEFAULT_MIN_SPEED_KBPS
+    if not str(mm.get("nodes_url") or "").strip():
+        mm["nodes_url"] = NODES_URL
     try:
         seeded = int(mm.get("seeded") or 0)
     except Exception:
@@ -377,7 +406,97 @@ def reset_mirrors(cfg: dict) -> list:
     m["seeded"] = len(DEFAULT_MIRRORS)
     m["chosen"] = ""
     m["last_check"] = ""
+    m["ranking"] = []
+    m["ranking_sig"] = ""
     return m["list"]
+
+
+# ---------------------------------------------------------------- 社区节点
+def parse_nodes_ts(text: str) -> list[str]:
+    """解析 ghproxy-next 的 PROXY_NODES，把 value 里的域名整理成镜像地址。
+
+    文件格式形如 ``{ label: "contribute", value: "gh.dpik.top" }``。
+    中文域名要转 punycode，否则 urllib 发请求时会抛 IDNA 编码错误。
+    """
+    m = re.search(r"PROXY_NODES[^=]*=\s*\[(.*?)\]", text or "", re.S)
+    body = m.group(1) if m else (text or "")
+    out, seen = [], set()
+    for raw in re.findall(r"\bvalue\s*:\s*[\"']([^\"']+)[\"']", body):
+        host = str(raw).strip()
+        if not host or len(host) > 253:
+            continue
+        if re.match(r"^https?://", host, re.I):
+            u = normalize_mirror(host)
+        else:
+            host = host.rstrip("/")
+            if not re.match(r"^[A-Za-z0-9\u0080-\uffff.-]+$", host):
+                continue
+            try:
+                host = ".".join(p.encode("idna").decode("ascii") if not p.isascii() else p
+                                for p in host.split("."))
+            except Exception:
+                continue
+            u = normalize_mirror("https://" + host + "/")
+        if not u or u.rstrip("/") in seen:
+            continue
+        seen.add(u.rstrip("/"))
+        out.append(u)
+    return out
+
+
+def all_mirror_candidates(cfg: dict) -> list[str]:
+    """参与测速/下载的全部加速地址：手动列表 + 每天自动同步的社区节点。"""
+    m = cfg.get("mirrors") or {}
+    out, seen = [], set()
+    for u in mirror_list(cfg):
+        key = u.rstrip("/")
+        if key not in seen:
+            seen.add(key)
+            out.append(u)
+    if not isinstance(m, dict) or not m.get("enabled", True):
+        return out                      # 总开关关掉时社区节点也一并停用
+    if m.get("auto_nodes", True):
+        for u in (m.get("nodes") or []):
+            if not isinstance(u, str) or not u:
+                continue
+            key = u.rstrip("/")
+            if key not in seen:
+                seen.add(key)
+                out.append(u)
+    return out
+
+
+def mirror_ranking(cfg: dict) -> dict:
+    """{地址: 毫秒}；-1 表示当天测速未响应。"""
+    out = {}
+    for row in ((cfg.get("mirrors") or {}).get("ranking") or []):
+        if isinstance(row, (list, tuple)) and len(row) >= 2 and isinstance(row[1], str):
+            try:
+                out[row[1].rstrip("/")] = int(row[0])
+            except Exception:
+                continue
+    return out
+
+
+def sort_by_ranking(cfg: dict, urls) -> list:
+    """按当天测速结果排序：快的在前，未响应的次之，没测过的最后。"""
+    rank = mirror_ranking(cfg)
+
+    def key(u):
+        ms = rank.get(str(u).rstrip("/"))
+        if ms is None:
+            return (2, 0, str(u).lower())
+        if ms < 0:
+            return (1, 0, str(u).lower())
+        return (0, ms, str(u).lower())
+
+    return sorted([u for u in urls if u], key=key)
+
+
+def candidate_signature(urls) -> str:
+    """候选集合指纹：节点每天更新或用户改了列表后要重新测速。"""
+    joined = "|".join(sorted(str(u).rstrip("/").lower() for u in urls))
+    return hashlib.md5(joined.encode("utf-8")).hexdigest()[:12]
 
 
 def load_config() -> dict:
@@ -433,6 +552,10 @@ class UpdateTimeout(Exception):
     """单个程序更新超过设定时限。"""
 
 
+class TooSlow(Exception):
+    """当前线路下载速度低于阈值，换下一个加速地址。"""
+
+
 def detect_proxy(ports) -> str | None:
     for p in ports or []:
         # 1080/1081 是常见的 SOCKS 端口，ProxyHandler 根本用不了，别误判成 HTTP 代理
@@ -480,10 +603,76 @@ def http_get(url: str, proxy: str | None = None, timeout: int = 25, headers: dic
     return opener.open(urllib.request.Request(url, headers=hdr), timeout=timeout)
 
 
-def _probe(session_url: str) -> float | None:
+def fetch_nodes_text(url: str, proxy: str | None = None, mirrors=None,
+                     timeout: int = 6, max_wait: float = 24) -> str:
+    """抓节点列表：本地代理 → 官方直连 → 已缓存的最快加速线路。
+
+    **不要求用户开着 GitHub 加速**：raw.githubusercontent.com 连不上时，用已有的
+    加速地址转发这个地址本身（``镜像/https://raw.githubusercontent.com/...``）。
+    mirrors 由 Engine 按当天测速结果排序传入，包含上次抓到的社区节点，所以即使
+    内置镜像被删光、本地代理没开，也能靠上次缓存的节点把新列表取回来。
+    整条回退链有总时限，避免某个来源卡住把后台线程拖死。
+    """
+    ms = [str(m).rstrip("/") for m in (mirrors or []) if m]
+    cands = []
+    if proxy:
+        cands.append((proxy, url))
+    cands.append((None, url))
+    for m in ms[:8]:
+        cands.append((None, m + "/" + url))
+    last = ""
+    deadline = time.time() + max_wait
+    for px, u in cands:
+        if time.time() > deadline:
+            break
+        try:
+            with http_get(u, proxy=px, timeout=timeout) as r:
+                txt = r.read(512 * 1024).decode("utf-8", "replace")
+            if "PROXY_NODES" in txt or re.search(r"\bvalue\s*:", txt):
+                return txt
+            last = "返回内容不是节点列表"
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+    raise RuntimeError(last or "所有来源都不可用")
+
+
+def sync_nodes(cfg: dict, proxy: str | None = None, mirrors=None,
+               force: bool = False, fetcher=None) -> tuple:
+    """每天同步一次社区加速节点，返回 (节点列表, 错误文本, 本次是否发起抓取)。
+
+    抓取失败时保留上次的节点，不让一次网络抖动把加速线路清空。
+    fetcher 供测试注入，签名 (url, proxy, mirrors) -> str。
+    """
+    m = cfg.setdefault("mirrors", {})
+    nodes = [x for x in (m.get("nodes") or []) if isinstance(x, str) and x]
+    if not m.get("auto_nodes", True) and not force:
+        return nodes, "", False
+    today = time.strftime("%Y-%m-%d")
+    # 成功或失败，一天都只试一次；否则网络不通时每次扫描都要白等一轮回退
+    if not force and (str(m.get("nodes_fetched") or "")[:10] == today
+                      or str(m.get("nodes_attempt") or "")[:10] == today):
+        return nodes, "", False
+    url = str(m.get("nodes_url") or NODES_URL).strip() or NODES_URL
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    m["nodes_attempt"] = now
+    try:
+        text = fetcher(url, proxy, mirrors) if fetcher else fetch_nodes_text(url, proxy, mirrors)
+        found = parse_nodes_ts(text)
+        if not found:
+            raise RuntimeError("节点列表为空或格式已变")
+        m["nodes"] = found
+        m["nodes_fetched"] = now
+        m["nodes_error"] = ""
+        return found, "", True
+    except Exception as e:
+        m["nodes_error"] = f"{now} {type(e).__name__}: {short(str(e), 120)}"
+        return nodes, m["nodes_error"], True
+
+
+def _probe(session_url: str, timeout: int = 5) -> float | None:
     t0 = time.time()
     try:
-        with http_get(session_url, timeout=5) as r:
+        with http_get(session_url, timeout=timeout) as r:
             # 读 64KB 才是「测速」；只读 128 字节测的其实是首字节延迟
             r.read(65536)
         return time.time() - t0
@@ -491,15 +680,25 @@ def _probe(session_url: str) -> float | None:
         return None
 
 
-def probe_mirrors(mirrors, wait: float = 12) -> list:
-    """并行测速所有镜像，返回 [(毫秒, 镜像)]，按速度升序；失败的镜像被丢弃。"""
+def probe_mirrors(mirrors, wait: float | None = None, workers: int = 0,
+                  per_timeout: int = 5) -> list:
+    """并行测速所有镜像，返回 [(毫秒, 镜像)]，按速度升序；失败的镜像被丢弃。
+
+    workers / wait 会随候选数量自适应：社区节点有几十个，固定 10 并发 + 12 秒
+    窗口会让大半节点根本没机会被测到。
+    """
     mirrors = [m for m in (mirrors or []) if m]
     if not mirrors:
         return []
+    n = len(mirrors)
+    w = max(1, int(workers) if workers else min(24, n))
+    if wait is None:
+        wait = min(45, 8 + n * (per_timeout / w) * 1.2)
     tail = "https://raw.githubusercontent.com/git/git/master/README.md"
     out = []
-    with ThreadPoolExecutor(max_workers=min(10, len(mirrors))) as ex:
-        futs = {ex.submit(_probe, m.rstrip("/") + "/" + tail): m for m in mirrors}
+    with ThreadPoolExecutor(max_workers=w) as ex:
+        futs = {ex.submit(_probe, m.rstrip("/") + "/" + tail, per_timeout): m
+                for m in mirrors}
         try:
             for fut in as_completed(futs, timeout=wait):
                 try:
@@ -510,7 +709,7 @@ def probe_mirrors(mirrors, wait: float = 12) -> list:
                     out.append((int(dt * 1000), futs[fut]))
         except Exception:
             pass
-    out.sort(key=lambda x: x[0])
+    out.sort(key=lambda x: (x[0], str(x[1])))
     return out
 
 
@@ -554,12 +753,16 @@ def http_json(url: str, proxy: str | None, mirrors=None, retries: int = 1,
 
 
 def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
-             deadline: float = 0, expect_size: int = 0, sha256: str = "") -> bool:
-    """下载到 dest，支持断点续传，支持 sha256 内容校验。
+             deadline: float = 0, expect_size: int = 0, sha256: str = "",
+             min_kbps: int = 0, on_source=None) -> bool:
+    """下载到 dest，支持断点续传、sha256 校验与「过慢自动换源」。
 
     实际写入 dest.part：下载中断时保留已传字节，下一次（或换下一个候选源）
     带 Range 头从断点继续；服务器不支持 Range（返回非 206）时自动从头重下。
     只有所有候选源都失败才返回 False，.part 仍保留待续传。
+
+    mirrors 已按测速结果排序，所以这里是「最快线路优先」，官方直连只作兜底。
+    min_kbps > 0 时按 2 秒滑动窗口测实际速率，低于阈值就中断换下一个地址。
 
     内容可信性：expect_size 只能证明「大小完整」，不能证明「内容可信」。有 sha256
     时下载后必须校验哈希；校验失败会删除 .part 并失败（防止恶意镜像用同尺寸包替换）。
@@ -570,16 +773,24 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
     url_key = hashlib.sha256((url or "").encode("utf-8")).hexdigest()[:16]
     part = dest + "." + url_key + ".part"
     # 只允许 https 的镜像（明文 http 的镜像/代理会暴露内容，且无法信任）
+    # 顺序：本地代理 → 测速胜出的加速地址 → 官方直连兜底。
+    # 以前直连排在镜像前面，慢速直连会把整个下载拖死，测速结果等于白测。
     cands = []
     if proxy:
         cands.append((proxy, url))
-    cands.append((None, url))
     for m in mirrors or []:
         if str(m).lower().startswith("https://"):
             cands.append((None, m.rstrip("/") + "/" + url))
+    cands.append((None, url))
     for px, u in cands:
         if deadline and time.time() > deadline:
             return False
+        if on_source:
+            try:
+                host = urllib.parse.urlsplit(u).hostname or (u[:40])
+                on_source("本地代理" if px else str(host))
+            except Exception:
+                pass
         try:
             have = os.path.getsize(part) if os.path.exists(part) else 0
             # 已完成的 .part：完整大小与预期一致时直接校验收尾，别再发 Range 触发 416
@@ -612,6 +823,7 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
                 total = have + cl if code == 206 else cl
                 done = have
                 mode = "ab" if have > 0 else "wb"
+                win_t, win_done = time.time(), done
                 with open(part, mode) as f:
                     while True:
                         if cancel is not None and cancel.is_set():
@@ -623,6 +835,14 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
                             break
                         f.write(chunk)
                         done += len(chunk)
+                        # 2 秒滑动窗口测真实速率：小文件不判，避免首包慢被误杀
+                        now = time.time()
+                        if (min_kbps > 0 and done >= 512 * 1024
+                                and now - win_t >= 2.0):
+                            kbps = (done - win_done) / (now - win_t) / 1024
+                            if kbps < min_kbps:
+                                raise TooSlow(f"{kbps:.0f} KB/s < {min_kbps} KB/s")
+                            win_t, win_done = now, done
                         if progress_cb and total:
                             progress_cb(min(1.0, done / total))
                 if total and done < total:
@@ -878,66 +1098,75 @@ class Engine:
 
     # ---------- 镜像 ----------
     def mirrors(self) -> list:
-        """当前生效的镜像列表；把测速选出的最快镜像排到首位，让下载/查询真用上。"""
-        out = mirror_list(self.cfg)
-        chosen = str((self.cfg.get("mirrors") or {}).get("chosen") or "").strip()
-        if chosen and chosen in out:
-            out = [chosen] + [m for m in out if m != chosen]
-        return out
+        """全部候选（手动列表 + 社区节点），按当天测速结果排序。"""
+        return sort_by_ranking(self.cfg, all_mirror_candidates(self.cfg))
 
-    def ensure_mirror(self, force: bool = False) -> str | None:
-        """返回可用镜像：优先用上次测速记录的最快项，并按需每天重新测速一次。"""
-        with self._mirror_lock:
-            if self.mirror is not None and not force:
-                # 缓存值要连日期一起看：长期驻留进程跨天后也要重新测速，不能永远复用旧结果
-                mcfg = self.cfg.setdefault("mirrors", {})
-                today = time.strftime("%Y-%m-%d")
-                last = str(mcfg.get("last_check") or "")[:10]
-                if mcfg.get("daily_check", True) and last != today:
-                    self.mirror = None
-                else:
-                    return self.mirror or None
-            cands = self.mirrors()
-            if not cands:
-                self.mirror = ""
-                return None
-            mcfg = self.cfg.setdefault("mirrors", {})
-            chosen = (mcfg.get("chosen") or "").strip()
-            today = time.strftime("%Y-%m-%d")
-            fresh = (mcfg.get("last_check") or "")[:10] == today
-            if chosen and chosen in cands and fresh and not force:
-                self.mirror = chosen
-                return chosen
-            if not mcfg.get("daily_check", True) and chosen in cands and not force:
-                self.mirror = chosen
-                return chosen
-            ranked = probe_mirrors(cands)
-            best = ranked[0][1] if ranked else (chosen if chosen in cands else "")
-            if best and ranked:
-                mcfg["chosen"] = best
-                mcfg["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                try:
-                    save_config(self.cfg)
-                except Exception:
-                    pass
-            self.mirror = best or ""
-            return self.mirror or None
+    def top_mirrors(self, n: int = 6) -> list:
+        """API 查询只试最快的几个，避免几十个节点把总时限耗光。"""
+        return self.mirrors()[:n]
 
-    def measure_mirrors(self) -> list:
-        """测速全部镜像（设置页「立即测速」用），返回 [(毫秒, 镜像)] 并落盘。"""
-        ranked = probe_mirrors(self.mirrors())
+    def sync_nodes(self, force: bool = False) -> tuple:
+        """每天同步一次社区加速节点；同步成功后让排名失效以便重测。
+
+        抓取节点本身也走 GitHub，所以把「按测速排序的最快线路」（含上次抓到的
+        社区节点）传进去做转发，用户不开本地加速也能更新列表。
+        """
+        nodes, err, did = sync_nodes(self.cfg, self.proxy,
+                                     self.top_mirrors(8), force=force)
+        if did and not err:
+            self.cfg.setdefault("mirrors", {})["ranking_sig"] = ""
+        return nodes, err, did
+
+    def _probe_daily(self, force: bool = False) -> tuple:
+        """返回 (成功的 [(毫秒, 地址)], 完整排名含未响应项)。每天测一次。"""
         mcfg = self.cfg.setdefault("mirrors", {})
-        if ranked:
-            mcfg["chosen"] = ranked[0][1]
-            self.mirror = ranked[0][1]
-        else:
-            self.mirror = ""
+        # 节点每天抓一次；抓到新节点会让下面的指纹变化，从而触发重新测速
+        self.sync_nodes(force=False)
+        cands = all_mirror_candidates(self.cfg)
+        sig = candidate_signature(cands)
+        today = time.strftime("%Y-%m-%d")
+        fresh = str(mcfg.get("last_check") or "")[:10] == today
+        reuse = (not force and mcfg.get("ranking")
+                 and ((fresh and sig == mcfg.get("ranking_sig"))
+                      or not mcfg.get("daily_check", True)))
+        if reuse:
+            rank = mirror_ranking(self.cfg)
+            ranked = sorted([(ms, u) for u, ms in rank.items() if ms >= 0],
+                            key=lambda x: (x[0], x[1]))
+            return ranked, list(mcfg["ranking"])
+        ranked = probe_mirrors(cands, per_timeout=4)
+        ok = {u.rstrip("/") for _, u in ranked}
+        full = [[int(ms), u] for ms, u in ranked]
+        full += [[-1, u] for u in cands if u.rstrip("/") not in ok]
+        mcfg["ranking"] = full
+        mcfg["ranking_sig"] = sig
         mcfg["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        mcfg["chosen"] = ranked[0][1] if ranked else ""
         try:
             save_config(self.cfg)
         except Exception:
             pass
-        return ranked
+        return ranked, full
+
+    def ensure_mirror(self, force: bool = False) -> str | None:
+        """下载/扫描前调用：确保当天已有测速结果，返回最快线路。"""
+        with self._mirror_lock:
+            mcfg = self.cfg.setdefault("mirrors", {})
+            fresh = str(mcfg.get("last_check") or "")[:10] == time.strftime("%Y-%m-%d")
+            sig = candidate_signature(all_mirror_candidates(self.cfg))
+            if (not force and self.mirror is not None and fresh
+                    and sig == mcfg.get("ranking_sig")):
+                return self.mirror or None
+            ranked, _ = self._probe_daily(force=force)
+            self.mirror = ranked[0][1] if ranked else ""
+            return self.mirror or None
+
+    def measure_mirrors(self) -> list:
+        """设置页「立即测速」：强制重测全部候选，返回 [(毫秒, 镜像)]。"""
+        with self._mirror_lock:
+            ranked, _ = self._probe_daily(force=True)
+            self.mirror = ranked[0][1] if ranked else ""
+            return ranked
 
     # ---------- 程序映射 ----------
     def program_map(self) -> dict:
@@ -1164,7 +1393,7 @@ class Engine:
             return it
         prox = self.proxy
         latest = http_json(f"https://api.github.com/repos/{it.repo}/releases/latest", prox,
-                           self.mirrors(), deadline=time.time() + 45)
+                           self.top_mirrors(6), deadline=time.time() + 45)
         if not latest:
             it.status = "error"
             it.detail = f"查询 {it.repo} 失败（网络或限流）"
@@ -1461,12 +1690,24 @@ class Engine:
                 cache_dir = tmp
             safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{it.name}_{it.asset or 'package.zip'}")
             archive = os.path.join(cache_dir, safe)
+            # 下载前测速：当天没测过（或候选变过）就在这里补测，之后按速度顺序尝试，
+            # 失败 / 过慢由 download 自动切换到下一个加速地址。
+            mcfg = self.cfg.get("mirrors") or {}
+            if mcfg.get("probe_before", True):
+                try:
+                    self.ensure_mirror()
+                except Exception:
+                    pass
+            min_kbps = (int(mcfg.get("min_speed_kbps") or 0)
+                        if mcfg.get("slow_switch", True) else 0)
             pr(0.02, "下载中（支持断点续传）")
-            ok = download(it.download_url, archive, self.proxy, self.mirrors(),
+            ok = download(it.download_url, archive, self.proxy, self.top_mirrors(12),
                           progress_cb=lambda p: pr(0.02 + p * 0.6, "下载中"),
                           cancel=self.cancel, deadline=deadline,
                           expect_size=int(it.asset_size or 0),
-                          sha256=it.asset_digest)
+                          sha256=it.asset_digest,
+                          min_kbps=min_kbps,
+                          on_source=lambda host: pr(0.02, f"下载中 · {host}"))
             if self.cancel.is_set():
                 it.state, it.status = "failed", "error"
                 it.detail = "已取消"
