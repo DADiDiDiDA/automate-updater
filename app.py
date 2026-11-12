@@ -148,10 +148,14 @@ class UpdateWorker(QThread):
 
     def run(self):
         last_emit = [0.0]
+        peak = {}          # 每个程序已到达的最高进度：换源重下也不会让进度条往后退
 
         def on_prog(item, progress, msg=None):
             # 阶段/线路提示（解压中、下载中 · 当前线路）要立刻显示；
             # 纯进度刷新限流，避免每个 256KB 数据块都把两个列表重绘一遍
+            key = getattr(item, "key", id(item))
+            progress = max(progress, peak.get(key, 0.0))
+            peak[key] = progress
             now = time.monotonic()
             if msg or progress >= 1.0 or now - last_emit[0] >= 0.12:
                 last_emit[0] = now

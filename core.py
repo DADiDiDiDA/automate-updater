@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.7"
+APP_VERSION = "1.6.8"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -821,6 +821,7 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
 
     idle = int(stall_sec) if stall_sec and stall_sec > 0 else STALL_TIMEOUT
     last_err = "网络/镜像均不可用"
+    content_err = ""      # 「内容不对」类原因（错误页/大小不符/校验失败），优先级高于连接错误
     download.last_error = ""
 
     for px, u in cands:
@@ -917,7 +918,8 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
                     break
                 if not _verify_digest(part, sha256):
                     os.remove(part)
-                    last_err = "文件校验失败（可能被镜像替换）"
+                    last_err = "文件校验失败（内容与官方 sha256 不一致，可能被镜像替换）"
+                    content_err = last_err
                     break
                 shutil.move(part, dest)
                 download.last_error = ""
@@ -927,26 +929,46 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
                 return False
             except _BadSource as e:
                 last_err = str(e)
+                content_err = last_err
                 break                            # 这个源给的不是目标文件
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"[:120]
                 if progressed:
                     continue                     # 已经下了一部分：同源续传
                 break                            # 连都连不上：换下一个候选
-    download.last_error = last_err
+    download.last_error = content_err or last_err
     return False
 
 
+def _norm_digest(sha256: str) -> str:
+    """把各种写法的摘要统一成 64 位小写 hex；认不出来返回空串（表示不校验）。
+
+    GitHub API 的 ``assets[].digest`` 是 **带算法前缀** 的 ``sha256:<hex>``，
+    直接拿它和 ``hexdigest()`` 比会永远不相等。以前就是这么写的，导致每次下载到
+    100% 都判「校验失败」，然后删掉 .part 换源重下 —— 界面上表现为「下到 60 多
+    进度突然重置」。这里统一剥掉前缀，只认 64 位十六进制。
+    """
+    s = (sha256 or "").strip().lower()
+    if s.startswith("sha256:"):
+        s = s[7:].strip()
+    elif s.startswith("sha256="):
+        s = s[7:].strip()
+    if len(s) == 64 and all(c in "0123456789abcdef" for c in s):
+        return s
+    return ""
+
+
 def _verify_digest(path: str, sha256: str) -> bool:
-    """校验文件 sha256；未提供摘要时视为通过（大小校验由调用方负责）。"""
-    if not sha256:
+    """校验文件 sha256；摘要缺失或格式不认识时视为通过（大小校验由调用方负责）。"""
+    want = _norm_digest(sha256)
+    if not want:
         return True
     try:
         h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(256 * 1024), b""):
                 h.update(chunk)
-        return h.hexdigest().lower() == sha256.lower()
+        return h.hexdigest().lower() == want
     except Exception:
         return False
 
