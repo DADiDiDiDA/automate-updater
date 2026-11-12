@@ -146,14 +146,23 @@ class UpdateWorker(QThread):
         self.items = items
 
     def run(self):
+        last_emit = [0.0]
+
+        def on_prog(item, progress, msg=None):
+            # 阶段/线路提示（解压中、下载中 · 当前线路）要立刻显示；
+            # 纯进度刷新限流，避免每个 256KB 数据块都把两个列表重绘一遍
+            now = time.monotonic()
+            if msg or progress >= 1.0 or now - last_emit[0] >= 0.12:
+                last_emit[0] = now
+                self.item_progress.emit(item, progress)
+
         try:
             for it in self.items:
                 if self.engine.cancel.is_set():
                     it.detail = "已取消"
                     break
                 self.item_started.emit(it)
-                res = self.engine.update_item(
-                    it, on_progress=lambda i, p, m=None: self.item_progress.emit(i, p))
+                res = self.engine.update_item(it, on_progress=on_prog)
                 self.item_done.emit(res)
         finally:
             self.finished_all.emit(self.items)
@@ -1197,8 +1206,9 @@ class MainWindow(QWidget):
             if old.key == item.key:
                 self.items[i] = item
         # 等待文件释放时两个页面都要能看到最新提示，不只是首页
-        for view in (self.page_home, self.progs_list):
-            row = view.list.rows.get(item.key)
+        # page_home 是页面（内部才是 ItemListView），progs_list 本身就是列表
+        for view in (self.page_home.list, self.progs_list):
+            row = view.rows.get(item.key)
             if row is not None:
                 row.refresh()
 
@@ -1557,16 +1567,36 @@ def main() -> int:
     return app.exec()
 
 
+_EXC_LOG = {"sig": "", "at": 0.0, "repeat": 0}
+
+
 def _excepthook(exc_type, exc, tb):
-    """Qt 事件循环里的异常不会冒到 main()，必须挂 excepthook 才能留下日志。"""
+    """Qt 事件循环里的异常不会冒到 main()，必须挂 excepthook 才能留下日志。
+
+    同一个位置的异常 60 秒内只记一次，重复次数合并写入；否则槽函数里一个
+    每数据块都抛的错，能在几分钟内把 crash.log 刷到几百 MB。
+    """
     import traceback
     text = "".join(traceback.format_exception(exc_type, exc, tb))
+    frames = traceback.extract_tb(tb)
+    last_frame = frames[-1] if frames else None
+    sig = (f"{exc_type.__name__}:{exc}|"
+           f"{getattr(last_frame, 'filename', '')}:{getattr(last_frame, 'lineno', '')}")
+    now = time.time()
+    if sig == _EXC_LOG["sig"] and now - _EXC_LOG["at"] < 60:
+        _EXC_LOG["repeat"] += 1
+        sys.__excepthook__(exc_type, exc, tb)
+        return
     try:
         log_path = os.path.join(core.config_dir(), "crash.log")
         with open(log_path, "a", encoding="utf-8") as f:
+            if _EXC_LOG["repeat"]:
+                f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
+                        f"[上一条同类异常在 60 秒内又出现 {_EXC_LOG['repeat']} 次，已合并]\n")
             f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n{text}")
     except Exception:
         pass
+    _EXC_LOG.update(sig=sig, at=now, repeat=0)
     sys.__excepthook__(exc_type, exc, tb)
 
 

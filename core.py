@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.4"
+APP_VERSION = "1.6.5"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -75,7 +75,12 @@ DEFAULT_PROXY_PORTS = [7890, 7891, 1080, 10809, 10808, 8080, 2080, 33210, 7897, 
 # 社区维护的 GitHub 加速节点列表（hubporg/ghproxy-next），每天自动同步一次
 NODES_URL = ("https://raw.githubusercontent.com/hubporg/ghproxy-next/"
              "main/components/nodes.ts")
-DEFAULT_MIN_SPEED_KBPS = 100        # 低于这个速度（KB/s）就换下一个加速地址
+# 低速换源：必须「持续」过慢才切，一次抖动就换线路会让节点列表来回跳
+DEFAULT_MIN_SPEED_KBPS = 50         # 默认阈值（KB/s）
+SLOW_SAMPLE_SEC = 2.0               # 每 2 秒统计一次实际速度
+SLOW_SAMPLES_TO_SWITCH = 3          # 连续 3 个窗口（约 6 秒）过低才换源
+SLOW_WARMUP_BYTES = 512 * 1024      # 先下满 512KB 再开始判速，避开首包慢启动
+DOWNLOAD_READ_TIMEOUT = 30          # 单次读超时：卡死 30 秒就换线路，不必等 3 分钟
 
 # 程序 → GitHub 仓库的预置映射（按文件夹名匹配，跨根目录通用）
 BUILTIN_PROGRAMS = [
@@ -159,6 +164,7 @@ def default_config() -> dict:
             "probe_before": True,            # 下载前确保测速结果可用
             "slow_switch": True,             # 下载过慢时自动切换加速地址
             "min_speed_kbps": DEFAULT_MIN_SPEED_KBPS,
+            "speed_policy": 2,               # 阈值策略版本：1=旧版 100 KB/s 单窗口判定
         },
         # clean 保留指定文件夹 | overwrite 直接覆盖
         # retry_on_locked：目标文件被其它进程占用时自动暂停并重试，而不是直接判失败
@@ -184,6 +190,8 @@ def default_config() -> dict:
 def _normalize(cfg: dict) -> dict:
     """兼容旧版配置：mirrors 曾是纯数组，update 段可能缺失。"""
     m = cfg.get("mirrors")
+    # v1.6.5 起默认阈值 100 → 50 KB/s；旧配置里仍是旧默认值的自动跟随一次
+    legacy_speed = isinstance(m, dict) and "speed_policy" not in m
     base = default_config()["mirrors"]
     if isinstance(m, list):
         base.update({"list": [x for x in m if isinstance(x, str) and x], "seeded": 0})
@@ -208,6 +216,12 @@ def _normalize(cfg: dict) -> dict:
                                                      or DEFAULT_MIN_SPEED_KBPS)))
     except Exception:
         mm["min_speed_kbps"] = DEFAULT_MIN_SPEED_KBPS
+    if legacy_speed:
+        if mm["min_speed_kbps"] == 100:
+            mm["min_speed_kbps"] = DEFAULT_MIN_SPEED_KBPS
+        mm["speed_policy"] = 2
+    elif not isinstance(mm.get("speed_policy"), int):
+        mm["speed_policy"] = 2
     if not str(mm.get("nodes_url") or "").strip():
         mm["nodes_url"] = NODES_URL
     try:
@@ -762,7 +776,8 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
     只有所有候选源都失败才返回 False，.part 仍保留待续传。
 
     mirrors 已按测速结果排序，所以这里是「最快线路优先」，官方直连只作兜底。
-    min_kbps > 0 时按 2 秒滑动窗口测实际速率，低于阈值就中断换下一个地址。
+    min_kbps > 0 时每 2 秒采样一次实际速率，先下满 512KB 预热，且必须连续
+    3 个窗口（约 6 秒）都低于阈值才中断换下一个地址，瞬时抖动不再触发切换。
 
     内容可信性：expect_size 只能证明「大小完整」，不能证明「内容可信」。有 sha256
     时下载后必须校验哈希；校验失败会删除 .part 并失败（防止恶意镜像用同尺寸包替换）。
@@ -801,7 +816,8 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
                 os.remove(part)
                 have = 0
             headers = {"Range": f"bytes={have}-"} if have > 0 else None
-            with http_get(u, proxy=px, timeout=180, headers=headers) as r:
+            with http_get(u, proxy=px, timeout=DOWNLOAD_READ_TIMEOUT,
+                          headers=headers) as r:
                 code = int(getattr(r, "status", 0) or 200)
                 if have > 0 and code == 416:
                     # 服务器认为断点越界：可能文件已完成。若大小/哈希匹配则收尾，否则重下。
@@ -824,6 +840,8 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
                 done = have
                 mode = "ab" if have > 0 else "wb"
                 win_t, win_done = time.time(), done
+                warm = min_kbps <= 0          # 关闭低速检测时不需要预热
+                low_streak = 0                # 连续低速窗口计数
                 with open(part, mode) as f:
                     while True:
                         if cancel is not None and cancel.is_set():
@@ -835,14 +853,21 @@ def download(url: str, dest: str, proxy, mirrors, progress_cb=None, cancel=None,
                             break
                         f.write(chunk)
                         done += len(chunk)
-                        # 2 秒滑动窗口测真实速率：小文件不判，避免首包慢被误杀
+                        # 低速换源：预热后每 2 秒采样一次，连续多个窗口都过低才切
                         now = time.time()
-                        if (min_kbps > 0 and done >= 512 * 1024
-                                and now - win_t >= 2.0):
-                            kbps = (done - win_done) / (now - win_t) / 1024
-                            if kbps < min_kbps:
-                                raise TooSlow(f"{kbps:.0f} KB/s < {min_kbps} KB/s")
-                            win_t, win_done = now, done
+                        if min_kbps > 0:
+                            if not warm:
+                                if done >= SLOW_WARMUP_BYTES:
+                                    warm = True
+                                    win_t, win_done = now, done
+                            elif now - win_t >= SLOW_SAMPLE_SEC:
+                                kbps = (done - win_done) / (now - win_t) / 1024
+                                low_streak = low_streak + 1 if kbps < min_kbps else 0
+                                if low_streak >= SLOW_SAMPLES_TO_SWITCH:
+                                    raise TooSlow(
+                                        f"连续 {low_streak * SLOW_SAMPLE_SEC:.0f} 秒低于 "
+                                        f"{min_kbps} KB/s（当前 {kbps:.0f} KB/s）")
+                                win_t, win_done = now, done
                         if progress_cb and total:
                             progress_cb(min(1.0, done / total))
                 if total and done < total:
@@ -1702,7 +1727,8 @@ class Engine:
                         if mcfg.get("slow_switch", True) else 0)
             pr(0.02, "下载中（支持断点续传）")
             ok = download(it.download_url, archive, self.proxy, self.top_mirrors(12),
-                          progress_cb=lambda p: pr(0.02 + p * 0.6, "下载中"),
+                          # 不覆盖 message：保留 on_source 写入的「下载中 · 当前线路」
+                          progress_cb=lambda p: pr(0.02 + p * 0.6),
                           cancel=self.cancel, deadline=deadline,
                           expect_size=int(it.asset_size or 0),
                           sha256=it.asset_digest,

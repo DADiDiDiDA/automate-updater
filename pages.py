@@ -1812,7 +1812,7 @@ class SettingsPage(QWidget):
         sbl.addWidget(self.slow_toggle)
         sbl.addWidget(self.speed_step)
         self._row(lay, "link", "下载过慢自动切换",
-                  "下载失败或持续低于这个速度时，自动换下一个加速地址（断点续传不丢进度）",
+                  "连续约 6 秒低于这个速度（或下载失败）才换线路，瞬时变慢不切；断点续传不丢进度",
                   sbox)
 
     def _on_sync_nodes(self):
