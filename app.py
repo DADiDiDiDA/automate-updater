@@ -24,8 +24,8 @@ from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineE
 import core
 import autostart
 from backdrop import BACKDROP
-from pages import (HomePage, ItemListView, MirrorDialog, PreserveDialog, SettingsPage,
-                   ThemedDialog, VersionDialog, _label)
+from pages import (HomePage, ItemListView, MirrorDialog, NodesDialog, PreserveDialog,
+                   SettingsPage, ThemedDialog, VersionDialog, _label)
 from theme import GLYPH, THEME, build_qss, glyph_font, qc, rgba, scoped, tint
 from tray import TrayIcon
 from widgets import NavButton, Toast
@@ -693,6 +693,7 @@ class MainWindow(QWidget):
         page.mirror_probe_requested.connect(self._probe_mirrors)
         page.mirror_manage_requested.connect(self._manage_mirrors)
         page.nodes_sync_requested.connect(lambda: self._sync_nodes(force=True))
+        page.nodes_view_requested.connect(self._view_nodes)
         page.proxy_changed.connect(self._on_proxy_changed)
         page.mirrors_changed.connect(self._on_mirrors_changed)
 
@@ -741,10 +742,26 @@ class MainWindow(QWidget):
                 dlg.set_nodes_info()
             except RuntimeError:
                 pass
+        ndlg = getattr(self, "_nodes_dlg", None)
+        if ndlg is not None:
+            try:
+                ndlg.set_nodes_info()
+            except RuntimeError:
+                pass
         if error:
             self.toast.show_text(f"节点同步失败：{error[:70]}", ok=False)
         else:
             self.toast.show_text(f"已同步 {len(nodes)} 个社区加速节点，下次测速生效")
+
+    def _view_nodes(self) -> None:
+        """设置页「社区加速节点 · 查看…」：列出全部节点与当天测速明细（只读）。"""
+        dlg = NodesDialog(self, self.cfg)
+        dlg.sync_requested.connect(lambda: self._sync_nodes(force=True))
+        self._nodes_dlg = dlg
+        try:
+            dlg.exec()
+        finally:
+            self._nodes_dlg = None
 
     def _manage_mirrors(self) -> None:
         """设置页「镜像地址 · 管理」：按测速结果排序展示，可增删 / 同步节点。"""
@@ -1016,16 +1033,23 @@ class MainWindow(QWidget):
         if not hasattr(self, "sched_timer"):
             return
         self.sched_timer.stop()
-        if bg.get("check_enabled", True):
-            # 自动检查本身是「每天一次」，定时器只负责守着跨天（程序常驻时次日补一次）
-            self.sched_timer.start(30 * 60_000)
+        if not bg.get("check_enabled", True):
+            return
+        try:
+            minutes = max(5, min(1440, int(bg.get("interval_min") or 60)))
+        except (TypeError, ValueError):
+            minutes = 60
+        # v1.6.10：「每天一次」只约束准备流程（拉节点 + 全量测速）。
+        # 联网查版本由这个定时器按间隔反复执行；跨天时 daily_bootstrap 会
+        # 自己按天闸门补跑准备流程，所以常驻跨天也不需要额外处理。
+        self.sched_timer.start(minutes * 60_000)
 
     def _on_schedule_tick(self) -> None:
         if (self.scan_worker and self.scan_worker.isRunning()) or \
                 (self.update_worker and self.update_worker.isRunning()):
             return
-        if not self.engine.scan_pending():
-            return                        # 今天已经检查过，不再重复联网
+        # 每次到点都真的联网查一次版本，不再被 scan_pending() 拦成「一天一次」；
+        # 准备流程的按天闸门在 ScanWorker → daily_bootstrap 里自己把守。
         self.start_scan(silent=True)
 
     def show_main(self, page: str | None = None) -> None:
@@ -1129,19 +1153,13 @@ class MainWindow(QWidget):
     def _startup_check(self, silent: bool = False) -> None:
         """启动时：先把上次结果铺到界面，再判断今天是否还需要联网检查。
 
-        每天只自动做一次「内置地址测速 → 拉社区节点 → 全量测速 → 检查更新」；
-        当天已经做过就只展示上次的结论，避免每次开程序都白跑一遍网络。
+        启动首次检查是固定行为，不受「后台自动检查更新」开关影响：今天第一次
+        打开就跑一遍「内置测速 → 拉社区节点 → 全量测速 → 查更新」，其中三个准备
+        步骤分别由网络页那两个开关控制；当天已跑过就只展示上次的结论。
         """
         if not self.items:
             self._load_cached_items()
         last = self.engine.records.get("last_scan", "—") or "—"
-        if not (self.cfg.get("background") or {}).get("check_enabled", True):
-            self.page_home.last_scan_time = last
-            self.page_home.refresh_stats()
-            self._update_brand()
-            if not silent:
-                self.toast.show_text("自动检查已关闭，点「立即检查」才会联网")
-            return
         if self.engine.scan_pending():
             self.start_scan(silent=silent)
             return

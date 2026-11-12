@@ -914,6 +914,137 @@ class MirrorDialog(ThemedDialog):
         return list(self.items)
 
 
+class NodesDialog(ThemedDialog):
+    """社区加速节点详情：只读列表 + 当天测速明细，可立即重新同步。
+
+    观感和「镜像地址」的管理窗口一致；节点是自动抓取的，不提供增删，
+    想手动维护地址请用「镜像地址 · 管理…」。
+    """
+
+    sync_requested = Signal()
+
+    def __init__(self, parent, cfg: dict | None = None):
+        super().__init__(parent, "社区加速节点", 620)
+        self.cfg = cfg if isinstance(cfg, dict) else {}
+        self._rows: list[QWidget] = []
+
+        self.body.addWidget(_label(
+            "来自 hubporg/ghproxy-next 的公共加速节点，每天自动同步一次。"
+            "抓取不依赖你开着本地 GitHub 加速：直连不通就用已缓存的最快线路转发。",
+            11, "text_muted", wrap=True))
+        self.summary = _label("", 11, "text_dim", wrap=True)
+        self.body.addWidget(self.summary)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 7 行 × 38px + 6 个间距 × 6px = 302，正好显示整数行，不留半截
+        self.scroll.setFixedHeight(302)
+        # 深色主题下 viewport 默认会填一块白底，配浅字就看不清了
+        self.scroll.viewport().setStyleSheet(
+            "QScrollArea > QWidget { background: transparent; }")
+        holder = QWidget()
+        flat(holder)
+        self.rows_lay = QVBoxLayout(holder)
+        self.rows_lay.setContentsMargins(0, 0, 4, 0)
+        self.rows_lay.setSpacing(6)
+        self.scroll.setWidget(holder)
+        self.body.addWidget(self.scroll)
+
+        foot = QHBoxLayout()
+        foot.setSpacing(8)
+        self.sync_btn = QPushButton("立即同步")
+        self.sync_btn.setObjectName("soft")
+        self.sync_btn.setCursor(Qt.PointingHandCursor)
+        self.sync_btn.setFixedHeight(32)
+        self.sync_btn.clicked.connect(self._on_sync)
+        foot.addWidget(self.sync_btn)
+        foot.addStretch(1)
+        close = QPushButton("关闭")
+        close.setObjectName("primary")
+        close.setCursor(Qt.PointingHandCursor)
+        close.setFixedHeight(32)
+        close.clicked.connect(self.accept)
+        foot.addWidget(close)
+        self.body.addLayout(foot)
+        self._rebuild()
+
+    def _tag(self, text: str, color: str) -> QLabel:
+        b = QLabel(text)
+        f = QFont("Microsoft YaHei UI")
+        f.setPixelSize(10)
+        f.setWeight(QFont.DemiBold)
+        b.setFont(f)
+        scoped(b, f"background: {rgba(color, 0.16)}; color: {color};"
+                  f"border-radius: 8px; padding: 2px 8px;")
+        return b
+
+    def _rebuild(self) -> None:
+        while self.rows_lay.count():
+            item = self.rows_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+        self._rows.clear()
+        m = self.cfg.get("mirrors") or {}
+        nodes = [u for u in (m.get("nodes") or []) if isinstance(u, str) and u]
+        nodes = core.sort_by_ranking(self.cfg, nodes)
+        rank = core.mirror_ranking(self.cfg)
+        chosen = str(m.get("chosen") or "").rstrip("/")
+        tp = THEME.p
+        if not nodes:
+            self.rows_lay.addWidget(_label(
+                "还没有同步到节点，点「立即同步」或等下次自动检查", 12, "text_muted"))
+        for url in nodes:
+            row = QFrame()
+            row.setFixedHeight(38)
+            scoped(row, f"background: {rgba(tp.text, 0.05)}; border: none;"
+                        f"border-radius: 10px;")
+            h = QHBoxLayout(row)
+            h.setContentsMargins(12, 0, 10, 0)
+            h.setSpacing(8)
+            host = str(url).replace("https://", "").replace("http://", "").rstrip("/")
+            lbl = _label(host, 12, "text")
+            lbl.setToolTip(url)
+            h.addWidget(lbl, 1)
+            key = str(url).rstrip("/")
+            ms = rank.get(key)
+            if ms is None:
+                h.addWidget(self._tag("未测速", tp.text_dim))
+            elif ms < 0:
+                h.addWidget(self._tag("未响应", tp.text_dim))
+            else:
+                h.addWidget(self._tag(f"{ms} ms", tp.accent))
+            if chosen and chosen == key:
+                h.addWidget(self._tag("当前使用", tp.accent))
+            self.rows_lay.addWidget(row)
+            self._rows.append(row)
+        self.rows_lay.addStretch(1)
+        ok = 0
+        for u in nodes:
+            v = rank.get(str(u).rstrip("/"))
+            if v is not None and v >= 0:
+                ok += 1
+        when = str(m.get("nodes_fetched") or "")[:16] or "尚未同步"
+        err = str(m.get("nodes_error") or "")
+        self.summary.setText(
+            f"共 {len(nodes)} 个节点 · 测速可用 {ok} 个 · 上次同步 {when}"
+            + (f" · 上次失败：{err[-50:]}" if err else ""))
+
+    def _on_sync(self) -> None:
+        self.sync_btn.setEnabled(False)
+        self.sync_btn.setText("同步中…")
+        self.sync_requested.emit()
+
+    def set_nodes_info(self) -> None:
+        """后台同步完成后由主窗口调用。"""
+        self.sync_btn.setEnabled(True)
+        self.sync_btn.setText("立即同步")
+        self._rebuild()
+
+
 class VersionDialog(ThemedDialog):
     """手动标记本地版本：程序目录里读不到版本号时用它兜底比对。"""
 
@@ -957,8 +1088,9 @@ class PreserveDialog(ThemedDialog):
 
         self.body.addWidget(_label(f"「{name}」", 13, "text", bold=True))
         self.body.addWidget(_label(
-            "勾选的文件夹在更新时原样保留（不删除、也不被新版覆盖）；"
-            "未勾选的按设定的安装方式处理。", 11, "text_muted", wrap=True))
+            "勾选的名字会作为关键词：目标目录第一层里名字含该关键词的文件夹"
+            "原样保留（不删除、也不被新版覆盖），其余按安装方式处理。",
+            11, "text_muted", wrap=True))
 
         names = self._candidates(path, current)
         self.chips: dict[str, Chip] = {}
@@ -990,7 +1122,7 @@ class PreserveDialog(ThemedDialog):
             self.body.addWidget(_label("这个程序目录里还没有子文件夹。", 11, "text_muted"))
 
         self.extra = QLineEdit("")
-        self.extra.setPlaceholderText("还可以补充文件夹名，用逗号分隔（如 mods, plugins）")
+        self.extra.setPlaceholderText("还可以补充关键词，用逗号分隔（如 mods, plugins）")
         self.extra.setMinimumHeight(32)
         self.body.addWidget(self.extra)
 
@@ -1139,6 +1271,7 @@ class SettingsPage(QWidget):
     mirror_probe_requested = Signal()
     mirror_manage_requested = Signal()
     nodes_sync_requested = Signal()
+    nodes_view_requested = Signal()
     autostart_requested = Signal(bool)
     proxy_changed = Signal()
 
@@ -1309,14 +1442,19 @@ class SettingsPage(QWidget):
                   "开机后在后台静默运行，不弹出主界面；移动文件夹后重新打开本开关即可",
                   self.startup_toggle)
 
-        # 自动检查是「每天一次」：准备流程（测速 / 拉节点）+ 检查更新都按天记，
-        # 所以这里不再提供间隔选项，避免选了 15 分钟却因为当天已检查而不执行。
+        # v1.6.10：这个开关只管「常驻时按间隔查版本」，不再决定启动首次检查。
+        # 启动今天第一次打开固定跑完整流程，准备步骤由网络页那两个开关控制。
         self.sched_toggle = ToggleSwitch(bool(bg.get("check_enabled", True)))
         self.sched_toggle.toggled.connect(self._save_background)
         self.sched_row = self._row(
-            lay, "clock", "每天自动检查一次",
-            "启动时若当天还没检查过，会依次测速内置加速地址、拉取项目加速地址、"
-            "测速，然后检查程序更新；当天已检查则只显示上次结果", self.sched_toggle)
+            lay, "clock", "后台自动检查更新", "", self.sched_toggle)
+
+        self.interval_spin = NumberStepper(
+            int(bg.get("interval_min") or 60), 5, 1440, 5, " 分钟", 108)
+        self.interval_spin.valueChanged.connect(self._save_background)
+        self._row(lay, "timer", "后台检查间隔",
+                  "程序运行时每隔这么久联网查一次版本（窗口开着也查）；"
+                  "拉取社区节点和全量测速仍每天只做一次", self.interval_spin)
 
         self.auto_combo = ThemedCombo(
             [("off", "只通知，不自动更新"), ("notify", "静默更新，完成后提示"),
@@ -1394,13 +1532,21 @@ class SettingsPage(QWidget):
         self._sync_ding_visibility()
 
     def _refresh_bg_hint(self) -> None:
+        if not hasattr(self, "sched_row"):
+            return
         bg = self.cfg.get("background", {})
+        try:
+            mins = max(5, min(1440, int(bg.get("interval_min") or 60)))
+        except (TypeError, ValueError):
+            mins = 60
         if not bg.get("check_enabled", True):
-            self.sched_row.set_desc("自动检查已关闭，只能在托盘右键或主界面手动检查")
+            self.sched_row.set_desc(
+                "后台定时检查已关闭；今天第一次打开程序仍会自动检查一次，"
+                "之后只能在托盘右键或主界面手动检查")
             return
         self.sched_row.set_desc(
-            "启动时若当天还没检查过，会依次测速内置加速地址、拉取项目加速地址、测速，"
-            "然后检查程序更新；当天已检查则只显示上次结果；关闭主窗口不会退出程序")
+            f"程序运行时每隔 {mins} 分钟联网查一次版本（窗口可见时也查，关闭窗口不会退出）；"
+            "启动时今天第一次打开会先跑测速 / 拉节点，再查更新")
 
     def _toggle_notify(self, key: str, chip) -> None:
         on = not self._notify_state.get(key, False)
@@ -1449,9 +1595,15 @@ class SettingsPage(QWidget):
     def _save_background(self, *_):
         bg = self.cfg.setdefault("background", {})
         bg["close_to_tray"] = self.tray_toggle.isChecked()
-        bg["check_enabled"] = self.sched_toggle.isChecked()
-        bg["auto_mode"] = self.auto_combo.value() or "off"
-        bg["notify_methods"] = [k for k, on in self._notify_state.items() if on] or ["tray"]
+        if hasattr(self, "sched_toggle"):
+            bg["check_enabled"] = self.sched_toggle.isChecked()
+        if hasattr(self, "interval_spin"):
+            bg["interval_min"] = int(self.interval_spin.value())
+        if hasattr(self, "auto_combo"):
+            bg["auto_mode"] = self.auto_combo.value() or "off"
+        if hasattr(self, "_notify_state"):
+            bg["notify_methods"] = [k for k, on in self._notify_state.items()
+                                    if on] or ["tray"]
         self._refresh_bg_hint()
         self.config_changed.emit()
 
@@ -1480,7 +1632,7 @@ class SettingsPage(QWidget):
         self.preserve_chips: dict[str, Chip] = {}
         for name, text in core.COMMON_PRESERVE:
             c = Chip(text)
-            c.setToolTip(f"更新时保留 {name} 文件夹，不删除也不覆盖其内容")
+            c.setToolTip(f"更新时保留名字含「{name}」的文件夹，不删除也不覆盖其内容")
             c.set_active(self._preserve_on(name))
             c.clicked.connect(lambda _=False, n=name, cc=c: self._toggle_preserve(n, cc))
             self.preserve_chips[name] = c
@@ -1489,12 +1641,13 @@ class SettingsPage(QWidget):
         cl.addLayout(chip_row)
 
         self.extra_edit = QLineEdit("，".join(self._preserve_extras()))
-        self.extra_edit.setPlaceholderText("其他要保留的文件夹名，用逗号分隔（如 mods，plugins）")
+        self.extra_edit.setPlaceholderText("其他关键词，用逗号分隔（如 mods，plugins）")
         self.extra_edit.setMinimumHeight(32)
         self.extra_edit.editingFinished.connect(self._save_extras)
         cl.addWidget(self.extra_edit)
         self.preserve_row = self._row(lay, "folder", "默认保留的文件夹",
-                                      "更新时这些文件夹原样保留，其余按安装方式处理", None, chips_box)
+                                      "名字含这些关键词的文件夹原样保留（只匹配第一层文件夹，不区分大小写）",
+                                      None, chips_box)
         self.preserve_box = chips_box
         self._preserve_fx = QGraphicsOpacityEffect(chips_box)
         self._preserve_fx.setOpacity(1.0)
@@ -1551,7 +1704,7 @@ class SettingsPage(QWidget):
             "只保留指定文件夹：删除旧的无关文件后再解压新版" if clean
             else "直接覆盖：保留全部已有文件，只用新版同名内容替换")
         self.preserve_row.set_desc(
-            "更新时这些文件夹原样保留，其余按安装方式处理" if clean
+            "名字含这些关键词的文件夹原样保留（只匹配第一层文件夹，不区分大小写）" if clean
             else "直接覆盖模式下不生效；需要精细控制时可右键单个程序单独设置")
         self.preserve_box.setEnabled(clean)
         self._preserve_fx.setOpacity(1.0 if clean else 0.42)
@@ -1710,6 +1863,27 @@ class SettingsPage(QWidget):
 
     def _build_network(self, lay: QVBoxLayout) -> None:
         self._group(lay, "网络")
+        mcfg = self.cfg.setdefault("mirrors", {})
+
+        # ---- 每天自动测速一次：网络分组第一项，和社区节点开关一起决定启动准备流程 ----
+        box = QWidget()
+        flat(box)
+        bl = QHBoxLayout(box)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(10)
+        self.daily_toggle = ToggleSwitch(bool(mcfg.get("daily_check", True)))
+        self.daily_toggle.toggled.connect(self._save_mirrors)
+        self.probe_btn = QPushButton("立即测速")
+        self.probe_btn.setObjectName("soft")
+        self.probe_btn.setCursor(Qt.PointingHandCursor)
+        self.probe_btn.setFixedHeight(30)
+        self.probe_btn.clicked.connect(self._on_probe_mirrors)
+        bl.addWidget(self.daily_toggle)
+        bl.addWidget(self.probe_btn)
+        self.mirror_lbl = _label(self._mirror_summary(), 11, "text_muted", wrap=True)
+        self._row(lay, "refresh", "每天自动测速一次",
+                  "每天测速内置加速地址与全部线路，下载前按速度择优；"
+                  "关掉后启动检查会跳过测速步骤", box, self.mirror_lbl)
 
         # ---- 代理：自动探测 / 手动指定 / 不使用 ----
         pcfg = self.cfg.setdefault("proxy", {})
@@ -1735,7 +1909,6 @@ class SettingsPage(QWidget):
             self.proxy_edit)
         self.proxy_addr_row.setVisible(mode == "manual")
 
-        mcfg = self.cfg.setdefault("mirrors", {})
         self.mirror_toggle = ToggleSwitch(bool(mcfg.get("enabled", True)))
         self.mirror_toggle.toggled.connect(self._save_mirrors)
         self._row(lay, "download", "GitHub 镜像加速",
@@ -1747,43 +1920,28 @@ class SettingsPage(QWidget):
         self.mirror_row = self._row(lay, "link", "镜像地址", self._mirror_addr_desc(),
                                     self.mirror_btn)
 
-        box = QWidget()
-        flat(box)
-        bl = QHBoxLayout(box)
-        bl.setContentsMargins(0, 0, 0, 0)
-        bl.setSpacing(10)
-        self.daily_toggle = ToggleSwitch(bool(mcfg.get("daily_check", True)))
-        self.daily_toggle.toggled.connect(self._save_mirrors)
-        self.probe_btn = QPushButton("立即测速")
-        self.probe_btn.setObjectName("soft")
-        self.probe_btn.setCursor(Qt.PointingHandCursor)
-        self.probe_btn.setFixedHeight(30)
-        self.probe_btn.clicked.connect(self._on_probe_mirrors)
-        bl.addWidget(self.daily_toggle)
-        bl.addWidget(self.probe_btn)
-        self.mirror_lbl = _label(self._mirror_summary(), 11, "text_muted", wrap=True)
-        self._row(lay, "refresh", "每天自动测速一次",
-                  "每天抓取一次社区节点并对全部线路测速，下载前按速度择优", box, self.mirror_lbl)
-
-        # 社区节点：每天自动同步一次，和手动列表一起参与测速
+        # 社区节点：每天自动同步一次，和手动列表一起参与测速；「查看…」看全部节点明细
         nbox = QWidget()
         flat(nbox)
         nbl = QHBoxLayout(nbox)
         nbl.setContentsMargins(0, 0, 0, 0)
-        nbl.setSpacing(10)
+        nbl.setSpacing(8)
         self.node_toggle = ToggleSwitch(bool(mcfg.get("auto_nodes", True)))
         self.node_toggle.toggled.connect(self._save_mirrors)
+        self.node_view_btn = self._small_btn("查看…", self.nodes_view_requested.emit)
+        self.node_view_btn.setToolTip("查看全部社区节点与当天测速结果")
         self.node_btn = QPushButton("立即同步")
         self.node_btn.setObjectName("soft")
         self.node_btn.setCursor(Qt.PointingHandCursor)
         self.node_btn.setFixedHeight(30)
         self.node_btn.clicked.connect(self._on_sync_nodes)
         nbl.addWidget(self.node_toggle)
+        nbl.addWidget(self.node_view_btn)
         nbl.addWidget(self.node_btn)
         self.node_lbl = _label(self._nodes_desc(), 11, "text_muted", wrap=True)
         self._row(lay, "download", "社区加速节点",
-                  "每天抓取一次；不依赖你开着本地加速：直连不通就用已缓存的最快线路转发",
-                  nbox, self.node_lbl)
+                  "每天抓取一次；不依赖你开着本地加速：直连不通就用已缓存的最快线路转发；"
+                  "点「查看…」看全部节点与测速明细", nbox, self.node_lbl)
 
         # 断流续传：不按速度判断，也不做成开关（以前那个阈值反而更容易来回切源）
         self._row(lay, "link", "断流自动续传",
@@ -1804,13 +1962,27 @@ class SettingsPage(QWidget):
 
     def _save_mirrors(self, *_):
         m = self.cfg.setdefault("mirrors", {})
-        m["enabled"] = self.mirror_toggle.isChecked()
-        m["daily_check"] = self.daily_toggle.isChecked()
+        before_probe = bool(m.get("daily_check", True))
+        before_nodes = bool(m.get("auto_nodes", True))
         # 控件是逐个创建的，构造期间若开关信号提前触发，后面的控件可能还不存在
+        if hasattr(self, "mirror_toggle"):
+            m["enabled"] = self.mirror_toggle.isChecked()
+        if hasattr(self, "daily_toggle"):
+            m["daily_check"] = self.daily_toggle.isChecked()
         if hasattr(self, "node_toggle"):
             m["auto_nodes"] = self.node_toggle.isChecked()
+        # 准备流程按天记完成；开关变了要清掉对应标记，让下次检查立刻按新设置补跑，
+        # 否则「关掉时跳过」留下的完成标记会让重新打开后整天都不生效。
+        daily = m.get("daily")
+        if isinstance(daily, dict):
+            if bool(m.get("daily_check", True)) != before_probe:
+                daily.pop("builtin", None)
+                daily.pop("ranked", None)
+            if bool(m.get("auto_nodes", True)) != before_nodes:
+                daily.pop("nodes", None)
         m["ranking_sig"] = ""          # 候选/开关变了，下次检查重新测速
-        self.mirror_lbl.setText(self._mirror_summary())
+        if hasattr(self, "mirror_lbl"):
+            self.mirror_lbl.setText(self._mirror_summary())
         self.config_changed.emit()
         self.mirrors_changed.emit()
 

@@ -37,26 +37,30 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.9"
+APP_VERSION = "1.6.10"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
 SILENT = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
 
-# 常见用户数据目录（默认保留名单，可在设置里改；匹配时不区分大小写，无需重复写变体）
-DEFAULT_PRESERVE = ["User", "config", "configs", "data", "saves", "save", "logs",
-                    "profiles", "3rdparty"]
+# 常见用户数据目录关键词（默认保留名单，可在设置里改）。
+# v1.6.10 起按「文件夹名包含关键词」匹配，不区分大小写，所以写词根即可覆盖各种变体。
+DEFAULT_PRESERVE = ["User", "config", "configs", "saves", "save",
+                    "profiles", "settings"]
 
 # 设置页里做成「一键开关」的常见保留项（默认全部开启）
+# v1.6.10：移除 data / logs / 3rdparty（模糊匹配下太宽泛），加入 settings
 COMMON_PRESERVE = [
     ("User", "User"),
     ("config", "config"),
-    ("data", "data"),
     ("saves", "saves"),
-    ("logs", "logs"),
     ("profiles", "profiles"),
-    ("3rdparty", "3rdparty"),
+    ("settings", "settings"),
 ]
+
+# v1.6.9 及更早的默认保留名单，用于一次性配置迁移（见 _normalize）
+LEGACY_DEFAULT_PRESERVE = {"user", "config", "configs", "data", "saves", "save",
+                           "logs", "profiles", "3rdparty"}
 
 DEFAULT_MIRRORS = [
     "https://gh-proxy.com/",
@@ -138,7 +142,7 @@ def config_path() -> str:
 
 def default_config() -> dict:
     return {
-        "version": 3,
+        "version": 4,
         "roots": [{"path": "D:\\Automate", "exclude": ["My-maawork", "Cache", "_updater", "_backup", ".git"],
                    "depth": 4, "enabled": True}],
         "preserve": list(DEFAULT_PRESERVE),
@@ -173,8 +177,8 @@ def default_config() -> dict:
         "background": {
             "close_to_tray": True,           # 关闭窗口时最小化到托盘
             "run_at_startup": False,         # 开机自启（后台静默）
-            "check_enabled": True,           # 每天自动检查一次（当天已检查则跳过）
-            "interval_min": 60,              # 旧版检查间隔，v1.6.7 起不再使用（仅保留兼容）
+            "check_enabled": True,           # 常驻时按间隔自动检查更新（只管后台定时器，不影响启动首次检查）
+            "interval_min": 60,              # 后台检查间隔（分钟），v1.6.10 重新启用
             "auto_mode": "off",              # off 只通知 | silent 静默更新 | notify 静默更新后提示
             "notify_methods": ["tray"],      # tray 系统通知 | dingtalk 钉钉 | window 弹出主界面
         },
@@ -241,6 +245,20 @@ def _normalize(cfg: dict) -> dict:
         u["retry_wait_min"] = max(1, min(60, int(u.get("retry_wait_min") or 5)))
     except Exception:
         u["retry_wait_min"] = 5
+    # v1.6.10：默认保留名单改了（删 data/logs/3rdparty、加 settings），并且改成
+    # 关键词匹配。老配置里存着完整旧名单，不迁移的话这三个会跑到「其他关键词」
+    # 输入框里、settings 反而不会出现。只替换旧默认值，用户自己填的关键词原样保留。
+    try:
+        cver = int(cfg.get("version") or 0)
+    except Exception:
+        cver = 0
+    if cver < 4 and isinstance(cfg.get("preserve"), list):
+        cur = [str(x).strip() for x in cfg["preserve"] if str(x).strip()]
+        custom = [x for x in cur if x.lower() not in LEGACY_DEFAULT_PRESERVE]
+        taken = {x.lower() for x in custom}
+        cfg["preserve"] = [x for x in DEFAULT_PRESERVE
+                           if x.lower() not in taken] + custom
+    cfg["version"] = max(4, cver)
     if not isinstance(cfg.get("preserve"), list):
         cfg["preserve"] = list(DEFAULT_PRESERVE)
     seen, cleaned = set(), []
@@ -284,7 +302,8 @@ def _normalize(cfg: dict) -> dict:
         bg.update({k: v for k, v in cfg["background"].items() if k in bg})
         cfg["background"] = bg
     try:
-        cfg["background"]["interval_min"] = max(5, int(cfg["background"].get("interval_min") or 60))
+        cfg["background"]["interval_min"] = max(5, min(1440, int(
+            cfg["background"].get("interval_min") or 60)))
     except Exception:
         cfg["background"]["interval_min"] = 60
     if cfg["background"].get("auto_mode") not in ("off", "silent", "notify"):
@@ -511,7 +530,9 @@ def daily_state(cfg: dict) -> dict:
     """「每天一次」的准备阶段状态，跨天自动清空。
 
     记在 mirrors.daily 上：date / builtin（内置地址已测）/ nodes（节点已拉）/
-    ranked（全量已测）/ scan（更新已检查）。任一阶段没打勾，下次启动就只补这一段。
+    ranked（全量已测）/ scan（本轮更新已检查完）。
+    注意：v1.6.10 起「每天只一次」只约束准备流程；联网查版本由后台定时器
+    按间隔反复执行，scan 只用于启动时判断「今天是否已经跑过一轮」。
     """
     m = cfg.setdefault("mirrors", {})
     st = m.get("daily")
@@ -1215,6 +1236,10 @@ class Engine:
         顺序不能颠倒：② 拉节点要用 ① 里跑通的加速地址去转发 GitHub 原始链接，
         ③ 才能把刚抓到的节点一起测排名。整个流程按日期记在 mirrors.daily 上，
         当天跑过就直接跳过，所以开多少次程序都只执行一遍。
+
+        v1.6.10：① 和 ③ 受「每天自动测速一次」控制，② 受「社区加速节点」控制。
+        哪个开关关了就只跳过对应那一步，其余步骤照常，最后的检查更新始终执行；
+        被跳过的步骤也记「今天已处理」，改动开关时由设置页清标记让它立刻生效。
         """
         def rep(msg):
             if progress:
@@ -1226,63 +1251,74 @@ class Engine:
         with self._mirror_lock:
             st = daily_state(self.cfg)
             mcfg = self.cfg.setdefault("mirrors", {})
+            # 两个网络页开关各管各的步骤：关掉「每天自动测速一次」跳过 ①③，
+            # 关掉「社区加速节点」跳过 ②；只跳过被关的那一步，其余照常，
+            # 最后检查更新始终执行。被跳过的步骤也记「今天已处理」。
+            probe_on = bool(mcfg.get("daily_check", True))
+            nodes_on = bool(mcfg.get("auto_nodes", True))
+
+            def mark(key: str) -> None:
+                st[key] = time.strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    save_config(self.cfg)
+                except Exception:
+                    pass
+
             if not st.get("builtin"):
-                rep("测速内置加速地址…")
-                builtin = mirror_list(self.cfg)
-                ranked = probe_mirrors(builtin, per_timeout=4)
-                ms_map = {u.rstrip("/"): ms for ms, u in ranked}
-                merged, seen = [], set()
-                for u in builtin:
-                    key = u.rstrip("/")
-                    seen.add(key)
-                    merged.append([int(ms_map.get(key, -1)), u])
-                # 社区节点这一轮还没测，先把旧排名里剩下的保留下来（下次全量会覆盖）
-                for row in (mcfg.get("ranking") or []):
-                    if isinstance(row, (list, tuple)) and len(row) >= 2:
-                        key = str(row[1]).rstrip("/")
-                        if key and key not in seen:
-                            seen.add(key)
-                            try:
-                                merged.append([int(row[0]), row[1]])
-                            except Exception:
-                                continue
-                mcfg["ranking"] = merged
-                mcfg["ranking_sig"] = candidate_signature(all_mirror_candidates(self.cfg))
-                best = sorted([r for r in merged if r[0] >= 0], key=lambda r: r[0])
-                mcfg["chosen"] = best[0][1] if best else ""
-                self.mirror = mcfg["chosen"] or None
-                st["builtin"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                try:
-                    save_config(self.cfg)
-                except Exception:
-                    pass
+                if probe_on:
+                    rep("测速内置加速地址…")
+                    builtin = mirror_list(self.cfg)
+                    ranked = probe_mirrors(builtin, per_timeout=4)
+                    ms_map = {u.rstrip("/"): ms for ms, u in ranked}
+                    merged, seen = [], set()
+                    for u in builtin:
+                        key = u.rstrip("/")
+                        seen.add(key)
+                        merged.append([int(ms_map.get(key, -1)), u])
+                    # 社区节点这一轮还没测，先把旧排名里剩下的保留下来（下次全量会覆盖）
+                    for row in (mcfg.get("ranking") or []):
+                        if isinstance(row, (list, tuple)) and len(row) >= 2:
+                            key = str(row[1]).rstrip("/")
+                            if key and key not in seen:
+                                seen.add(key)
+                                try:
+                                    merged.append([int(row[0]), row[1]])
+                                except Exception:
+                                    continue
+                    mcfg["ranking"] = merged
+                    mcfg["ranking_sig"] = candidate_signature(all_mirror_candidates(self.cfg))
+                    best = sorted([r for r in merged if r[0] >= 0], key=lambda r: r[0])
+                    mcfg["chosen"] = best[0][1] if best else ""
+                    self.mirror = mcfg["chosen"] or None
+                else:
+                    rep("内置加速地址测速已关闭，跳过")
+                mark("builtin")
             if not st.get("nodes"):
-                rep("拉取项目加速地址…")
-                try:
-                    self.sync_nodes(force=False)
-                except Exception:
-                    pass
-                st["nodes"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                try:
-                    save_config(self.cfg)
-                except Exception:
-                    pass
+                if nodes_on:
+                    rep("拉取项目加速地址…")
+                    try:
+                        self.sync_nodes(force=False)
+                    except Exception:
+                        pass
+                else:
+                    rep("社区节点同步已关闭，跳过")
+                mark("nodes")
             if not st.get("ranked"):
-                rep("测速全部加速地址…")
-                ranked = []
-                try:
-                    ranked, _ = self._probe_daily(force=True)
-                    self.mirror = ranked[0][1] if ranked else ""
-                except Exception:
-                    pass
-                # 一个能用的线路都没有（比如此时断网）就先不算完成，
-                # 下次手动检查/重启还会再试一遍，而不是整天都用空排名
-                if ranked or not all_mirror_candidates(self.cfg):
-                    st["ranked"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                try:
-                    save_config(self.cfg)
-                except Exception:
-                    pass
+                if probe_on:
+                    rep("测速全部加速地址…")
+                    ranked = []
+                    try:
+                        ranked, _ = self._probe_daily(force=True)
+                        self.mirror = ranked[0][1] if ranked else ""
+                    except Exception:
+                        pass
+                    # 一个能用的线路都没有（比如此时断网）就先不算完成，
+                    # 下次手动检查/重启还会再试一遍，而不是整天都用空排名
+                    if ranked or not all_mirror_candidates(self.cfg):
+                        mark("ranked")
+                else:
+                    rep("全部加速地址测速已关闭，跳过")
+                    mark("ranked")
             return dict(st)
 
     # ---------- 上次检查快照 ----------
@@ -2487,17 +2523,43 @@ def is_locked_error(exc: BaseException) -> bool:
     ))
 
 
+def preserve_keywords(preserve) -> list[str]:
+    """保留名单 → 去重后的小写关键词。"""
+    out = []
+    for p in (preserve or []):
+        if p is None:
+            continue
+        k = str(p).strip().lower()
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
+def should_preserve(name: str, is_dir: bool, preserve) -> bool:
+    """v1.6.10：只对文件夹生效，名字里包含任一关键词就保留（不区分大小写）。
+
+    刻意只在目标目录第一层判断：深层目录随父目录一起按安装方式处理，
+    不递归整棵树找关键词，避免模糊匹配把一大堆旧版文件留下来。
+    """
+    if not is_dir:
+        return False
+    low = str(name).lower()
+    return any(k in low for k in preserve_keywords(preserve))
+
+
 def copy_over(src_root: str, dst: str, preserve) -> int:
     """写入失败必须抛错：旧版这里静默吞异常，调用方却照样报「更新成功」。"""
-    keep = {p.lower() for p in (preserve or [])}
+    keywords = preserve_keywords(preserve)
     failures = []
     locked = False
     n = 0
     for name in os.listdir(src_root):
         # _updater_undo.json 是备份目录里的内部元数据，不能随撤销拷回程序目录
-        if name.lower() in keep or name in ("__MACOSX", ".DS_Store", "_updater_undo.json"):
+        if name in ("__MACOSX", ".DS_Store", "_updater_undo.json"):
             continue
         s, d = os.path.join(src_root, name), os.path.join(dst, name)
+        if should_preserve(name, os.path.isdir(s), keywords):
+            continue
         try:
             if os.path.isdir(s):
                 shutil.copytree(s, d, dirs_exist_ok=True)
@@ -2519,7 +2581,7 @@ def clean_replace(src_root: str, dst: str, preserve) -> tuple[int, int]:
     rmtree 的 onerror 以前被 _force_remove 静默吞掉：文件被占用时删不掉却照样报成功，
     留下新旧混合的目录。现在把失败收集起来并抛出 FileLockedError，交给上层等待重试。
     """
-    keep = {p.lower() for p in (preserve or [])}
+    keywords = preserve_keywords(preserve)
     removed = 0
     failed: list[str] = []
     locked = False
@@ -2536,9 +2598,9 @@ def clean_replace(src_root: str, dst: str, preserve) -> tuple[int, int]:
             locked = locked or is_locked_error(err)
 
     for name in list(os.listdir(dst)):
-        if name.lower() in keep:
-            continue
         p = os.path.join(dst, name)
+        if should_preserve(name, os.path.isdir(p), keywords):
+            continue
         before = len(failed)
         try:
             if os.path.isdir(p) and not os.path.islink(p):
@@ -2551,7 +2613,7 @@ def clean_replace(src_root: str, dst: str, preserve) -> tuple[int, int]:
             failed.append(f"{name}: {e}")
             locked = locked or is_locked_error(e)
     try:
-        copied = copy_over(src_root, dst, preserve)
+        copied = copy_over(src_root, dst, keywords)
     except RuntimeError as e:
         if is_locked_error(e):
             raise FileLockedError(str(e)) from e

@@ -13,7 +13,7 @@
 | --- | --- |
 | 扫描本机若干根目录，识别其中的 git 仓库 / GitHub Release 绿色程序，比对版本并更新 | 不做游戏日常检查（那是姊妹项目 [daily-checker](https://github.com/DADiDiDiDA/daily-checker) 的职责） |
 | 自动代理探测、镜像测速、社区加速节点同步、断点续传、校验、备份与回滚 | 不碰未绑定的程序、不改动用户的文件夹名称、不安装系统级依赖 |
-| 托盘常驻、每天一次自动检查、通知与静默更新 | 不常驻联网轮询；每天一次用日期闸门控制 |
+| 托盘常驻、按间隔后台查版本、通知与静默更新 | 准备流程（拉节点 + 测速）每天一次，用日期闸门控制；查版本不按天限制 |
 
 两个仓库 `daily-checker` / `automate-updater` 的 `app.py` 前 ~110 行、`theme.py`、`backdrop.py`、`widgets.py` 大量代码同源；在一个项目修了通用控件的坑，评估是否同步到另一个。
 
@@ -30,7 +30,7 @@
 | --- | --- | --- |
 | `core.py` | 逻辑 | 常量与 `BUILTIN_PROGRAMS`、`default_config()` / `_normalize()`、镜像与节点管理、`Item` dataclass、`Engine`（扫描/更新/回滚/通知）、`download()`、解压与覆盖工具 |
 | `app.py` | 应用 | `ScanWorker` / `UpdateWorker` / `UndoWorker` / `MirrorWorker` / `NodesSyncWorker`；`MainWindow`、`AssetDialog`、`BindDialog`、单实例、`main()`、`_excepthook` |
-| `pages.py` | 页面 | `HomePage`、`ItemListView`（列表行直接持有 `rows`）、`SettingsPage`、各 `ThemedDialog`（`MirrorDialog` / `PreserveDialog` / `VersionDialog` / `ExcludeDialog`）、`_date_ord` / `_time_ord` 排序辅助 |
+| `pages.py` | 页面 | `HomePage`、`ItemListView`（列表行直接持有 `rows`）、`SettingsPage`、各 `ThemedDialog`（`MirrorDialog` / `NodesDialog` / `PreserveDialog` / `VersionDialog` / `ExcludeDialog`）、`_date_ord` / `_time_ord` 排序辅助 |
 | `widgets.py` | 控件 | 与姊妹项目同源的通用控件（`NumberStepper`、`WrapLabel`、`ThemedCombo`、`Card`、`Badge`…） |
 | `theme.py` / `backdrop.py` | 主题 | 3 套皮肤 × 明暗；`tint()` / `flat()` / `scoped()`；玻璃背景实时取景 |
 | `tray.py` | 托盘 | 图标（蓝紫渐变 + 白箭头 + 红点角标）、右键菜单、悬停提示 |
@@ -77,24 +77,26 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 | 段 | 关键键 |
 | --- | --- |
 | `roots[]` | `path` · `exclude[]`（只写文件夹名）· `depth` · `enabled` |
-| `preserve` / `preserve_map` | 全局保留名单；程序名(小写) → `{"custom": true, "list": [...]}` |
+| `preserve` / `preserve_map` | 全局保留关键词；程序名(小写) → `{"custom": true, "list": [...]}`。v1.6.10 起是「名字含关键词」模糊匹配，`config.version` 升到 4 时一次性替换旧默认名单 |
 | `proxy_ports` / `proxy` | 探测端口表；`mode` = auto / manual / off，`url`（**仅 `http://`**） |
 | `manual_versions` | 程序名(小写) → 手动标记的本地版本 |
 | `mirrors` | `enabled` · `list`（用户可编辑）· `seeded` · `daily_check` · `chosen` · `ranking`([[毫秒, url]]，`-1` = 未响应) · `ranking_sig`（候选 md5）· `auto_nodes` · `nodes_url` · `nodes` · `nodes_fetched` · `nodes_attempt` · `nodes_error` · `probe_before` · `daily` |
 | `update` | `timeout_min`(10) · `install_mode`(clean/overwrite) · `retry_on_locked` · `retry_wait_min` |
-| `background` | `close_to_tray` · `run_at_startup` · `check_enabled` · `auto_mode`(off/silent/notify) · `notify_methods[]` · `interval_min`（**v1.6.7 起不再使用，仅兼容**） |
+| `background` | `close_to_tray` · `run_at_startup` · `check_enabled`（**仅后台定时器**）· `interval_min`（后台查版本间隔，5–1440，默认 60）· `auto_mode`(off/silent/notify) · `notify_methods[]` |
 | `backup` / `dingtalk` / `ui` / `programs` / `last_scan` | 备份份数、通知凭证（默认全空）、`ui.sort` + `ui.prior`、程序定制 |
 
-**每日闸门**：`daily_state(cfg)` 读写 `mirrors.daily`，跨天自动清空，记录 `builtin` / `nodes` / `ranked` / `scan` 四段；`Engine.scan_pending()` 是启动与定时器的统一闸门，`mark_scan_done()` **只在未取消时**写。`background.interval_min` 与 `slow_switch` / `stall_policy` / `min_speed_kbps` 都是历史遗留，升级时清理，不要再读它们做决策。
+**每日闸门**：`daily_state(cfg)` 读写 `mirrors.daily`，跨天自动清空，记录 `builtin` / `nodes` / `ranked` / `scan` 四段；`mark_scan_done()` **只在未取消时**写。**v1.6.10 语义**：这四段只约束「准备流程 + 本轮检查是否跑完」；`scan_pending()` 现在只被启动流程用于判断「今天是否第一次打开」，后台定时查版本不受它限制。`background.interval_min` 已重新启用（后台查版本间隔）。`slow_switch` / `stall_policy` / `min_speed_kbps` 仍是历史遗留，升级时清理，不要再读它们做决策。
 
 ## 7. 主流程
 
 **启动（`app.py` / `MainWindow._startup_check`）**
 1. 先 `_load_cached_items()`：`Engine.collect()` 出本地目录 + `apply_snapshot()` 还原 `records.snapshot`，**离线**把上次的结论铺到界面。
-2. 当天已检查 → 结束，不联网；未检查 → `ScanWorker` 先 `daily_bootstrap()` 再 `scan_all()`。
-3. 定时器（30 分钟一跳）只负责跨天补一次检查。手动「立即检查」/ 托盘「立即检查」不受闸门限制。
+2. `scan_pending()` 为真（今天还没跑完一轮）→ `start_scan()` → `ScanWorker` 先 `daily_bootstrap()` 再 `scan_all()`；否则只展示上次结果。**这个判断不看 `background.check_enabled`**：启动首次检查是固定行为，后台开关管不到它。
+3. **后台定时器**：`_apply_schedule()` 按 `background.interval_min`（默认 60，夹到 5–1440 分钟）启动；`_on_schedule_tick()` 每次到点都 `start_scan(silent=True)` **真联网查版本**，不再用 `scan_pending()` 拦成一天一次。跨天时 `daily_bootstrap()` 靠 `daily_state()` 日期清空自动补跑准备流程；窗口可见时也照查。
+4. 手动「立即检查」/ 托盘「立即检查」不受任何闸门限制。
 
 **每日准备（`Engine.daily_bootstrap`，顺序固定）**：内置加速地址测速 → `sync_nodes()` → `_probe_daily(force=True)`。当天跑过直接返回。
+- **v1.6.10 起各步受设置页开关控制**：①③ 由 `mirrors.daily_check`（每天自动测速一次）控制，② 由 `mirrors.auto_nodes`（社区加速节点）控制。关哪个只跳过对应那一步，其余照常，`scan_all()` 始终执行；跳过的步骤也写 `st[...]` 完成标记，避免反复重判。`SettingsPage._save_mirrors()` 在开关变化时清掉对应的 `daily` 标记，让改动立刻生效。
 - `sync_nodes()`：从 `NODES_URL`（`hubporg/ghproxy-next/components/nodes.ts`）取 `value:` 域名，`parse_nodes_ts()` 做中文→punycode、过滤 `github.com`、去重；抓取走「代理 → 直连 → `top_mirrors(8)` 转发 `raw.githubusercontent.com`」，24 秒总时限，**不依赖用户开本地加速**。成功/失败都写 `nodes_attempt`（当天不重试），失败保留旧 `nodes`。节点单独存 `mirrors.nodes`，**不混入可编辑的 `list`**。
 - `_probe_daily()`：`probe_mirrors()` 并发自适应测速，结果写 `mirrors.ranking` + `ranking_sig`（候选集合指纹，变了就重测）；`sort_by_ranking()` 顺序 = 快 → `-1` 未响应 → 未测速；`top_mirrors(6/8/12)` 分别供 API / 抓取 / 下载。
 
@@ -119,7 +121,7 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 5. 失败原因写 `download.last_error`，界面显示「下载失败：<原因>」；内容类错误（`content_err`）优先于连接错误上报；进度映射 `0.02 + p*0.63 → 0.65` 留给解压。
 
 **安装 / 回滚（`Engine._update_release`）**
-`extract_archive()` → `locate_root()` 用 `anchor` 定位程序根目录（**解压后必须命中 anchor，否则中止且不动原目录**）→ `backup_dir()` 备份 → `clean_replace()`（clean）或 `copy_over()`（overwrite）→ `_stamp_update()` 写 records。
+`extract_archive()` → `locate_root()` 用 `anchor` 定位程序根目录（**解压后必须命中 anchor，否则中止且不动原目录**）→ `backup_dir()` 备份 → `clean_replace()`（clean）或 `copy_over()`（overwrite）→ `_stamp_update()` 写 records。两者都走 `should_preserve(name, is_dir, preserve)`：v1.6.10 起只匹配**第一层文件夹**且「名字含关键词即保留」（`preserve_keywords()` 小写去重），文件不参与、不递归深层；`__MACOSX` / `.DS_Store` / `_updater_undo.json` 仍单独跳过。
 `retry_on_locked` 时用 `_wait_for_process_close()` / `_install_with_retry()` 每 3 秒重试，超时行按钮变「重试」，**不误标「已最新」**。任何异常回滚到备份，**绝不写 records、不标 latest**；撤销走 `undo_update()`，不要把 `_updater_undo.json` 拷回程序目录。
 
 ## 8. 关键不变量与已知坑（改动前必读）
@@ -165,9 +167,11 @@ python app.py --tray          # 后台静默启动（开机自启用这个）
 2. 新增/修改的 `sha256` 校验是否走 `_norm_digest()`？
 3. 新增需离线还原的 `Item` 字段是否加进 `SNAP_FIELDS`？
 4. 进度回调有没有覆盖 `message`？换源时进度会不会回退？
-5. 每日闸门是否仍统一走 `daily_state()` / `scan_pending()` / `mark_scan_done()`（取消时不写）？
+5. 准备流程是否仍按天走 `daily_state()`、改动开关时有没有清对应标记？后台 tick 有没有被 `scan_pending()` 误拦？`mark_scan_done()` 是否只在未取消时写？
 6. 资产选择优先级是否仍是「用户正则 > 选中文件 > 自动规则」，且 `choose` 状态禁止更新？
 7. 失败路径是否回滚、不写 records、不标 `latest`？
 8. 解压后 anchor 校验、备份、占用重试是否都还在？
 9. Qt 槽里新增代码会不会抛异常？`crash.log` 是否干净？
 10. 新增配置键是否补进 `default_config()` 与 `_normalize()`，旧配置能否兼容？
+11. 保留名单改动是否仍只匹配第一层文件夹、不递归、不把同名文件当目录？
+12. 设置页控件构造顺序变了之后，槽函数里访问后面才创建的控件是否都有 `hasattr` 守卫？
