@@ -77,9 +77,9 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 | 段 | 关键键 |
 | --- | --- |
 | `roots[]` | `path` · `exclude[]`（只写文件夹名）· `depth` · `enabled` |
-| `preserve` / `preserve_map` | 全局保留关键词；程序名(小写) → `{"custom": true, "list": [...]}`。v1.6.10 起是「名字含关键词」模糊匹配，`config.version` 升到 4 时一次性替换旧默认名单 |
+| `preserve` / `preserve_map` | 全局保留关键词；程序名(小写) → `{"custom": true, "list": [...]}`。v1.6.10 起是「名字含关键词」模糊匹配；`config.version` 升到 4（删 data/logs/3rdparty、加 settings）、5（删 configs、saves 改 save）各做一次一次性替换，只换默认值、用户自定义原样保留 |
 | `proxy_ports` / `proxy` | 探测端口表；`mode` = auto / manual / off，`url`（**仅 `http://`**） |
-| `manual_versions` | 程序名(小写) → 手动标记的本地版本 |
+| `manual_versions` | 程序名(小写) → 手动标记的本地版本。**更新成功后必须清除**，否则会压住 `records.versions` 里的新版本（见第 8 节） |
 | `mirrors` | `enabled` · `list`（用户可编辑）· `seeded` · `daily_check` · `chosen` · `ranking`([[毫秒, url]]，`-1` = 未响应) · `ranking_sig`（候选 md5）· `auto_nodes` · `nodes_url` · `nodes` · `nodes_fetched` · `nodes_attempt` · `nodes_error` · `probe_before` · `daily` |
 | `update` | `timeout_min`(10) · `install_mode`(clean/overwrite) · `retry_on_locked` · `retry_wait_min` |
 | `background` | `close_to_tray` · `run_at_startup` · `check_enabled`（**仅后台定时器**）· `interval_min`（后台查版本间隔，5–1440，默认 60）· `auto_mode`(off/silent/notify) · `notify_methods[]` |
@@ -103,7 +103,7 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 **检查（`Engine.collect()` → `scan_all(workers=6)`）**
 - `find_git_repos()` / `find_program_dirs()` 按 roots + exclude + depth 收集目录；`sniff_program()` 匹配 `BUILTIN_PROGRAMS`（7 款内置精确规则）或从文件里 `sniff_repo()` 猜仓库。
 - `_scan_git()`：`fetch` 后比落后提交数，**不论 behind 是否为 0 都写 `it.published`**（否则「按发布时间」排序会把已是最新的一大半挤到末尾）；`_git_changelog()` 收集提交日志。
-- `_scan_release()`：`http_json()` 走镜像/直连回退拿 tag 与 assets，挑资产（下节），填 `download_url` / `asset_size` / `asset_digest` / `anchor`；`ver_gt()` 比较版本（数值分段）。
+- `_scan_release()`：`http_json()` 走镜像/直连回退拿 tag 与 assets，挑资产（下节），填 `download_url` / `asset_size` / `asset_digest` / `anchor`；`ver_gt()` 比较版本（数值分段）。本地版本取值顺序：**目录里读到的 `read_local_version()` > 手动标记 `manual_versions` > 更新记录 `records.versions`**；但 v1.6.11 起会先比对记录与标记，`ver_gt(recorded, mv)` 为真就判定标记已过期，清标记并改用记录值（存量状态自愈）。
 - 时间类排序用 `_date_ord()` 转 `YYYYMMDD` 数值、空日期垫底，特殊优先规则（`prior`）**降为同日次要键**，否则会整体打乱时间顺序。
 
 **资产选择（优先级固定：用户正则 > 选中文件 > 自动规则）**
@@ -121,7 +121,7 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 5. 失败原因写 `download.last_error`，界面显示「下载失败：<原因>」；内容类错误（`content_err`）优先于连接错误上报；进度映射 `0.02 + p*0.63 → 0.65` 留给解压。
 
 **安装 / 回滚（`Engine._update_release`）**
-`extract_archive()` → `locate_root()` 用 `anchor` 定位程序根目录（**解压后必须命中 anchor，否则中止且不动原目录**）→ `backup_dir()` 备份 → `clean_replace()`（clean）或 `copy_over()`（overwrite）→ `_stamp_update()` 写 records。两者都走 `should_preserve(name, is_dir, preserve)`：v1.6.10 起只匹配**第一层文件夹**且「名字含关键词即保留」（`preserve_keywords()` 小写去重），文件不参与、不递归深层；`__MACOSX` / `.DS_Store` / `_updater_undo.json` 仍单独跳过。
+`extract_archive()` → `locate_root()` 用 `anchor` 定位程序根目录（**解压后必须命中 anchor，否则中止且不动原目录**）→ `backup_dir()` 备份 → `clean_replace()`（clean）或 `copy_over()`（overwrite）→ **成功分支清掉 `manual_versions` 里的过期标记、复位 `local_manual`** → `records.versions` 写 `it.remote` → `_stamp_update()` 写 records。两者都走 `should_preserve(name, is_dir, preserve)`：v1.6.10 起只匹配**第一层文件夹**且「名字含关键词即保留」（`preserve_keywords()` 小写去重），文件不参与、不递归深层；`__MACOSX` / `.DS_Store` / `_updater_undo.json` 仍单独跳过。
 `retry_on_locked` 时用 `_wait_for_process_close()` / `_install_with_retry()` 每 3 秒重试，超时行按钮变「重试」，**不误标「已最新」**。任何异常回滚到备份，**绝不写 records、不标 latest**；撤销走 `undo_update()`，不要把 `_updater_undo.json` 拷回程序目录。
 
 ## 8. 关键不变量与已知坑（改动前必读）
@@ -133,6 +133,12 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 - `app.py::_on_update_progress` 必须遍历 `(self.page_home.list, self.progs_list)`：**只有 `HomePage` 才包一层 `.list`，`ItemListView` 直接有 `rows`**。写错时 Qt 槽异常被吞，但 `_excepthook` 每个 chunk 落盘（实测 80 秒 2867 条 / 0.5MB）。异常钩子已按「异常类型 + 位置」60 秒合并计数。
 - 镜像地址统一走 `normalize_mirror()` / `add_mirror()` / `remove_mirror()` / `reset_mirrors()`；手动代理**仅 `http://`**，不支持 socks5。
 - 解压后 anchor 校验、失败回滚不写 records、取消显示「已取消」、预发布 tag 不顶掉稳定版——都是硬约束。
+
+**版本标记（v1.6.11 修过，别回退）**
+- 手动标记在 `config.json`，更新结果在 `records.json`，**两个存储不同步**就是 bug 源头：`_update_release()` 成功后只写 records 不清标记，重启扫描时手动标记优先于 records，刚装好的新版又被判成「待更新」。成功分支必须 `set_manual_version(it.name, "")`。
+- 只改更新分支还不够：**升级前就已经是坏状态的用户不会被修复**。`_scan_release()` 里必须有「记录版本比标记新 → 清标记 + 用记录值」的自愈分支，也不用用户重新标记。
+- `set_manual_version()` 会被扫描 worker 线程调用（自愈）和主线程调用（右键标记），写配置必须走 `Engine._cfg_lock` 串行化。
+- 自愈的方向别写反：只有 `ver_gt(recorded, mv)` 才清；用户在程序外降级后手动标旧版本、或标记比记录新时，都要尊重标记。
 
 **Python / Qt 通用**
 - **别拿模块名当局部变量**：`except Exception as re` 会让整个函数的 `re.sub(...)` 抛 `UnboundLocalError`（v1.6.1 让所有 Release 更新全废，v1.6.3 改名 `lock_err`）。可用 AST 静态检查守卫。
@@ -173,5 +179,6 @@ python app.py --tray          # 后台静默启动（开机自启用这个）
 8. 解压后 anchor 校验、备份、占用重试是否都还在？
 9. Qt 槽里新增代码会不会抛异常？`crash.log` 是否干净？
 10. 新增配置键是否补进 `default_config()` 与 `_normalize()`，旧配置能否兼容？
-11. 保留名单改动是否仍只匹配第一层文件夹、不递归、不把同名文件当目录？
+11. 保留名单改动是否仍只匹配第一层文件夹、不递归、不把同名文件当目录？默认值变化是否同步升 `config.version` 并写一次性迁移（用户自定义词不能被吞）？
 12. 设置页控件构造顺序变了之后，槽函数里访问后面才创建的控件是否都有 `hasattr` 守卫？
+13. 版本比对相关改动是否同时覆盖「更新成功时清标记」和「扫描时自愈存量标记」两条路径？

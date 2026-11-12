@@ -37,23 +37,24 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.10"
+APP_VERSION = "1.6.11"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
 SILENT = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 # 常见用户数据目录关键词（默认保留名单，可在设置里改）。
-# v1.6.10 起按「文件夹名包含关键词」匹配，不区分大小写，所以写词根即可覆盖各种变体。
-DEFAULT_PRESERVE = ["User", "config", "configs", "saves", "save",
-                    "profiles", "settings"]
+# v1.6.10 起按「文件夹名包含关键词」匹配，不区分大小写，所以写词根即可覆盖各种变体：
+# config 已经能保住 configs / MyConfigs，save 已经能保住 saves，不必再列重复变体。
+DEFAULT_PRESERVE = ["User", "config", "save", "profiles", "settings"]
 
 # 设置页里做成「一键开关」的常见保留项（默认全部开启）
 # v1.6.10：移除 data / logs / 3rdparty（模糊匹配下太宽泛），加入 settings
+# v1.6.11：saves 改成词根 save
 COMMON_PRESERVE = [
     ("User", "User"),
     ("config", "config"),
-    ("saves", "saves"),
+    ("save", "save"),
     ("profiles", "profiles"),
     ("settings", "settings"),
 ]
@@ -61,6 +62,10 @@ COMMON_PRESERVE = [
 # v1.6.9 及更早的默认保留名单，用于一次性配置迁移（见 _normalize）
 LEGACY_DEFAULT_PRESERVE = {"user", "config", "configs", "data", "saves", "save",
                            "logs", "profiles", "3rdparty"}
+
+# v1.6.10 的默认保留名单，用于 v4 → v5 一次性迁移（删掉被词根覆盖的 configs / saves）
+V4_DEFAULT_PRESERVE = {"user", "config", "configs", "saves", "save",
+                       "profiles", "settings"}
 
 DEFAULT_MIRRORS = [
     "https://gh-proxy.com/",
@@ -142,7 +147,7 @@ def config_path() -> str:
 
 def default_config() -> dict:
     return {
-        "version": 4,
+        "version": 5,
         "roots": [{"path": "D:\\Automate", "exclude": ["My-maawork", "Cache", "_updater", "_backup", ".git"],
                    "depth": 4, "enabled": True}],
         "preserve": list(DEFAULT_PRESERVE),
@@ -258,7 +263,16 @@ def _normalize(cfg: dict) -> dict:
         taken = {x.lower() for x in custom}
         cfg["preserve"] = [x for x in DEFAULT_PRESERVE
                            if x.lower() not in taken] + custom
-    cfg["version"] = max(4, cver)
+    # v1.6.11：删掉 configs / saves 这两个被词根完全覆盖的旧默认项，只留 config / save。
+    # 同样只替换默认值，用户自己填的关键词原样保留；不迁移的话它们会掉进「其他关键词」
+    # 输入框里，看起来像还有两个默认项没删干净。
+    if cver < 5 and isinstance(cfg.get("preserve"), list):
+        cur = [str(x).strip() for x in cfg["preserve"] if str(x).strip()]
+        custom = [x for x in cur if x.lower() not in V4_DEFAULT_PRESERVE]
+        taken = {x.lower() for x in custom}
+        cfg["preserve"] = [x for x in DEFAULT_PRESERVE
+                           if x.lower() not in taken] + custom
+    cfg["version"] = max(5, cver)
     if not isinstance(cfg.get("preserve"), list):
         cfg["preserve"] = list(DEFAULT_PRESERVE)
     seen, cleaned = set(), []
@@ -1117,6 +1131,9 @@ class Engine:
         self.proxy = self.resolve_proxy()
         self.mirror = None
         self._mirror_lock = threading.Lock()
+        # 扫描是多线程的，自愈过期版本标记时会从 worker 线程写 config，
+        # 和主线程「手动标记版本 / 保存设置」串行化，避免并发写覆盖。
+        self._cfg_lock = threading.Lock()
         self.cancel = threading.Event()
         self._target_locks: dict[str, threading.Lock] = {}
         self._target_locks_guard = threading.Lock()
@@ -1162,18 +1179,19 @@ class Engine:
         return str(mv.get((name or "").lower(), "") or "")
 
     def set_manual_version(self, name: str, ver: str) -> None:
-        mv = self.cfg.setdefault("manual_versions", {})
         key = (name or "").lower()
         if not key:
             return
-        if str(ver or "").strip():
-            mv[key] = str(ver).strip()
-        else:
-            mv.pop(key, None)
-        try:
-            save_config(self.cfg)
-        except Exception:
-            pass
+        with self._cfg_lock:
+            mv = self.cfg.setdefault("manual_versions", {})
+            if str(ver or "").strip():
+                mv[key] = str(ver).strip()
+            else:
+                mv.pop(key, None)
+            try:
+                save_config(self.cfg)
+            except Exception:
+                pass
 
     # ---------- 记录 ----------
     @property
@@ -1677,15 +1695,23 @@ class Engine:
             it.asset_size = int(asset.get("size") or 0)
             it.asset_digest = str(asset.get("digest") or "").strip() or ""
             it.download_url = asset.get("browser_download_url", "")
+        # 手动标记是「用户声明的本地版本」。本程序更新成功后会把新版本写进
+        # records.versions，但旧标记仍留在 config 里；若继续优先用标记，重启后
+        # 刚装好的新版又会被判成「待更新」。所以记录版本比标记新时认定标记已过期：
+        # 以记录为准并清掉它，同时也自愈旧版本留下的存量状态（无需用户重新标记）。
+        recorded = str(self.records["versions"].get(self._record_key(it), "") or "").strip()
+        mv = self.manual_version(it.name)
+        if mv and recorded and ver_gt(recorded, mv):
+            self.set_manual_version(it.name, "")
+            mv = ""
         it.local = read_local_version(it.path, it.version_spec, it.name, self.records,
                                       record_key=self._record_key(it))
         it.local_manual = False
         if not it.local:
-            mv = self.manual_version(it.name)
             if mv:
                 it.local, it.local_manual = mv, True
         if not it.local:
-            it.local = self.records["versions"].get(self._record_key(it), "")
+            it.local = recorded
         mark = "　· 手动标记" if it.local_manual else ""
         if not tag:
             it.status = "error"
@@ -2058,6 +2084,12 @@ class Engine:
                 return it
             it.state, it.status = "done", "latest"
             it.local = it.remote or it.local
+            it.local_manual = False
+            if "　· 手动标记" in (it.detail or ""):
+                it.detail = it.detail.replace("　· 手动标记", "")
+            # 更新成功后手动标记已过期，交给 records.versions 接管；
+            # 不清的话下次启动扫描会用旧标记把新版本判成「待更新」。
+            self.set_manual_version(it.name, "")
             self.records["versions"][self._record_key(it)] = it.remote
             self._stamp_update(it)
             # 成功立即原子写盘：只改内存的话，record 类型程序下次启动会把已装新版
