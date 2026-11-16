@@ -2041,6 +2041,21 @@ class StrategyPage(QWidget):
         self._preserve_fx.setOpacity(1.0)
         chips_box.setGraphicsEffect(self._preserve_fx)
 
+        # ---- 检查调度（v1.6.14）----
+        self._group(g, "检查调度")
+        self.scan_workers_spin = NumberStepper(
+            int(self.cfg.get("update", {}).get("scan_workers", core.SCAN_WORKERS_DEFAULT)),
+            core.SCAN_WORKERS_MIN, core.SCAN_WORKERS_MAX, 1, " 个", 108)
+        self.scan_workers_spin.valueChanged.connect(self._save_scan_workers)
+        self._row(g, "refresh", "同时检查数量",
+                  f"默认 {core.SCAN_WORKERS_DEFAULT} 个，逐个错峰启动；"
+                  f"改成 1 就是严格排队，最多 {core.SCAN_WORKERS_MAX} 个",
+                  self.scan_workers_spin)
+        delays = " / ".join(f"{int(s)} 秒" for s in core.SCAN_RETRY_DELAYS)
+        self._row(g, "refresh", "检查失败自动重试",
+                  f"查询失败时自动重试 {len(core.SCAN_RETRY_DELAYS)} 次（间隔 {delays}），"
+                  "点「停止」立即中断")
+
         # 单个程序更新超时
         self.timeout_spin = NumberStepper(
             int(self.cfg.get("update", {}).get("timeout_min", 10)), 1, 180, 5, " 分钟", 108)
@@ -2176,7 +2191,11 @@ class StrategyPage(QWidget):
         self.extra_edit.setText("，".join(self._preserve_extras()))
         self.config_changed.emit()
 
-    # ---------- 超时 / 重试 / 备份 ----------
+    # ---------- 检查调度 / 超时 / 重试 / 备份 ----------
+    def _save_scan_workers(self, *_):
+        self.cfg.setdefault("update", {})["scan_workers"] = int(self.scan_workers_spin.value())
+        self.config_changed.emit()
+
     def _save_timeout(self, *_):
         self.cfg.setdefault("update", {})["timeout_min"] = int(self.timeout_spin.value())
         self.config_changed.emit()

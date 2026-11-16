@@ -126,6 +126,19 @@ class ScanWorker(QThread):
         self.items = items
 
     def run(self):
+        state = [0, len(self.items)]      # 已完成数 / 总数，供重试提示复用
+
+        def on_progress(done, total, it):
+            state[0], state[1] = done, total
+            self.progress.emit(done, total, it.name)
+
+        def on_retry(it, nth, total_retries):
+            delays = core.SCAN_RETRY_DELAYS
+            sec = delays[nth - 1] if 0 < nth <= len(delays) else 2.0
+            # 复用进度行显示重试，不重置已完成计数
+            self.progress.emit(state[0], state[1],
+                               f"{it.name} 检查失败，{sec:.0f} 秒后重试（{nth}/{total_retries}）")
+
         try:
             # 每天一次的准备工作：内置加速地址测速 → 拉社区节点 → 全量测速。
             # 当天已经做过就立刻返回，不会每次开程序都重跑一遍。
@@ -136,7 +149,8 @@ class ScanWorker(QThread):
             self.engine.scan_all(
                 self.items,
                 on_item=lambda it: self.item_ready.emit(it),
-                on_progress=lambda d, t, it: self.progress.emit(d, t, it.name),
+                on_progress=on_progress,
+                on_retry=on_retry,
             )
         finally:
             self.finished_all.emit(self.items)

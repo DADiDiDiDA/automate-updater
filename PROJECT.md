@@ -70,18 +70,18 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 
 状态到界面文案的映射在 `pages.py`（`choose` → 「待选择」/ warning）。失败时 `it.state = "failed"`，并按原因设 `status` 为 `error` 或 `skip`。
 
-## 6. 配置结构（`config.json`，`version: 3`）
+## 6. 配置结构（`config.json`，`version: 6`）
 
 `load_config()` = `default_config()` + 用户文件浅合并 + `_normalize()` 归一化升级（旧字段清理、类型修正、枚举校验）。
 
 | 段 | 关键键 |
 | --- | --- |
 | `roots[]` | `path` · `exclude[]`（只写文件夹名）· `depth` · `enabled` |
-| `preserve` / `preserve_map` | 全局保留关键词；程序名(小写) → `{"custom": true, "list": [...]}`。v1.6.10 起是「名字含关键词」模糊匹配；`config.version` 升到 4（删 data/logs/3rdparty、加 settings）、5（删 configs、saves 改 save）各做一次一次性替换，只换默认值、用户自定义原样保留 |
+| `preserve` / `preserve_map` | 全局保留关键词；程序名(小写) → `{"custom": true, "list": [...]}`。v1.6.10 起是「名字含关键词」模糊匹配；`config.version` 升到 4（删 data/logs/3rdparty、加 settings）、5（删 configs、saves 改 save）、6（settings 改成词根 setting）各做一次一次性替换，只换默认值、用户自定义原样保留；v6 之后自己填的 `settings` 不再被改写 |
 | `proxy_ports` / `proxy` | 探测端口表；`mode` = auto / manual / off，`url`（**仅 `http://`**） |
 | `manual_versions` | 程序名(小写) → 手动标记的本地版本。**更新成功后必须清除**，否则会压住 `records.versions` 里的新版本（见第 8 节） |
 | `mirrors` | `enabled` · `list`（用户可编辑）· `seeded` · `daily_check` · `chosen` · `ranking`([[毫秒, url]]，`-1` = 未响应) · `ranking_sig`（候选 md5）· `auto_nodes` · `nodes_url` · `nodes` · `nodes_fetched` · `nodes_attempt` · `nodes_error` · `probe_before` · `daily` |
-| `update` | `timeout_min`(10) · `install_mode`(clean/overwrite/wipe/incremental，默认 clean) · `retry_on_locked` · `retry_wait_min` |
+| `update` | `timeout_min`(10) · `install_mode`(clean/overwrite/wipe/incremental，默认 clean) · `retry_on_locked` · `retry_wait_min` · `scan_workers`（同时检查数，默认 3、夹到 1–6） |
 | `install_mode_map` | 程序名(小写) → `clean` / `overwrite` / `wipe` / `incremental`；缺省或非法值 = 跟随全局 `update.install_mode`。由 `_normalize()` 补默认并清非法值，无需版本迁移 |
 | `background` | `close_to_tray` · `run_at_startup` · `check_enabled`（**仅后台定时器**）· `interval_min`（后台查版本间隔，5–1440，默认 60）· `auto_mode`(off/silent/notify) · `notify_methods[]` |
 | `backup` / `dingtalk` / `ui` / `programs` / `last_scan` | 备份份数、通知凭证（默认全空）、`ui.sort` + `ui.prior`、程序定制 |
@@ -101,8 +101,9 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 - `sync_nodes()`：从 `NODES_URL`（`hubporg/ghproxy-next/components/nodes.ts`）取 `value:` 域名，`parse_nodes_ts()` 做中文→punycode、过滤 `github.com`、去重；抓取走「代理 → 直连 → `top_mirrors(8)` 转发 `raw.githubusercontent.com`」，24 秒总时限，**不依赖用户开本地加速**。成功/失败都写 `nodes_attempt`（当天不重试），失败保留旧 `nodes`。节点单独存 `mirrors.nodes`，**不混入可编辑的 `list`**。
 - `_probe_daily()`：`probe_mirrors()` 并发自适应测速，结果写 `mirrors.ranking` + `ranking_sig`（候选集合指纹，变了就重测）；`sort_by_ranking()` 顺序 = 快 → `-1` 未响应 → 未测速；`top_mirrors(6/8/12)` 分别供 API / 抓取 / 下载。
 
-**检查（`Engine.collect()` → `scan_all(workers=6)`）**
+**检查（`Engine.collect()` → `scan_all()`）**
 - `find_git_repos()` / `find_program_dirs()` 按 roots + exclude + depth 收集目录；`sniff_program()` 匹配 `BUILTIN_PROGRAMS`（7 款内置精确规则）或从文件里 `sniff_repo()` 猜仓库。
+- **检查调度（v1.6.14）**：`scan_all(workers=0)` 从 `cfg.update.scan_workers` 取并发上限（默认 3）；`ThreadPoolExecutor` 之外还按 `SCAN_SUBMIT_STAGGER=0.35s` 错峰提交，避免瞬时并发打挂线路。只有 `status="error"` 的项走 `_scan_with_retry()`，按 `SCAN_RETRY_DELAYS=(2,4)` 重试 2 次；每次等待用 `cancel.wait()`，点「停止」立刻中断。`on_retry` 回调由 `ScanWorker` 转成进度行提示，**不重置已完成计数**。测试可用 `stagger=0` / 显式 `workers` 关掉随机性。
 - `_scan_git()`：`fetch` 后比落后提交数，**不论 behind 是否为 0 都写 `it.published`**（否则「按发布时间」排序会把已是最新的一大半挤到末尾）；`_git_changelog()` 收集提交日志。
 - `_scan_release()`：`http_json()` 走镜像/直连回退拿 tag 与 assets，挑资产（下节），填 `download_url` / `asset_size` / `asset_digest` / `anchor`；`ver_gt()` 比较版本（数值分段）。本地版本取值顺序：**目录里读到的 `read_local_version()` > 手动标记 `manual_versions` > 更新记录 `records.versions`**；但 v1.6.11 起会先比对记录与标记，`ver_gt(recorded, mv)` 为真就判定标记已过期，清标记并改用记录值（存量状态自愈）。
 - 时间类排序用 `_date_ord()` 转 `YYYYMMDD` 数值、空日期垫底，特殊优先规则（`prior`）**降为同日次要键**，否则会整体打乱时间顺序。
@@ -148,6 +149,11 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 - `preserve`（保留文件夹）只在 `clean` / `incremental` 下有意义；`overwrite` / `wipe` 忽略它，UI 也应把 chips 置灰（`StrategyPage._sync_mode_desc`）。
 - 「更新策略」现在是**独立侧边栏页**（`_NAV_ORDER = home/programs/strategy/settings`），设置页已移除该组。导航索引、快捷键、`_dev_shot` 都按 `_NAV_ORDER` 定位，**别再硬编码 index**。
 - 策略在更新时读 `cfg` 实时值，改完设置无需重扫即生效；单程序入口有两处（策略页清单下拉 + 程序行右键 `StrategyDialog`），改完都要 `page_strategy.set_items(self.items)` 刷新。
+
+**检查调度 / 保留词根（v1.6.14）**
+- `scan_workers` 只控制**检查**并发，不影响 `UpdateWorker`（更新仍逐个串行）；改成 1 就是严格排队，但错峰间隔仍然生效。
+- 重试只在 `_scan_with_retry()` 里做一次包裹，**不要**在 `_scan_git` / `_scan_release` 内部再加重试，否则次数会翻倍；`choose` / `unknown` / `latest` 等状态都不重试。
+- `DEFAULT_PRESERVE` 用「词根」`setting` 后，`settings` 由模糊匹配自动覆盖（`should_preserve()` 不区分大小写、只匹配第一层文件夹）；迁移只认**小写等于 settings** 的旧默认值，别把用户自定义的 `my_settings` 也改掉。
 
 **检查结果快照（`snapshot`）也会过期，别只修「读取」那条路**
 - 启动先离线铺列表：`_load_cached_items()` 调 `apply_snapshot()` 把 `records.snapshot` 套回界面；只有当天没检查过才联网重扫（`scan_pending()` 看 `mirrors.daily.scan`）。所以**更新成功若不刷新快照，且当天扫描闸门已满足，重启后一定会把刚装好的新版又显示成「待更新」**——v1.6.12 之前就栽在这。
@@ -198,3 +204,5 @@ python app.py --tray          # 后台静默启动（开机自启用这个）
 13. 版本比对相关改动是否同时覆盖「更新成功时清标记」和「扫描时自愈存量标记」两条路径？
 14. 安装策略取值是否只走 `Engine.install_mode_for()`（单程序覆盖 > 全局）？四种模式的文案是否区分清楚、`incremental` 是否绝不删除文件？
 15. 页面/导航改动是否按 `_NAV_ORDER` 定位，而不是硬编码 stack index？切到策略页与右键改策略后是否 `set_items()` 刷新了清单？
+16. 检查调度改动是否仍遵守「并发上限 + 错峰提交 + 只重试 error + 停止立即中断」？重试回调有没有把进度计数冲掉？
+17. 保留名单默认值变化时是否同步升 `config.version` 并写一次性迁移，且没有改写用户自定义词（含大小写不同的变体）？

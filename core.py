@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.13"
+APP_VERSION = "1.6.14"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -46,17 +46,18 @@ SILENT = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
 # 常见用户数据目录关键词（默认保留名单，可在设置里改）。
 # v1.6.10 起按「文件夹名包含关键词」匹配，不区分大小写，所以写词根即可覆盖各种变体：
 # config 已经能保住 configs / MyConfigs，save 已经能保住 saves，不必再列重复变体。
-DEFAULT_PRESERVE = ["User", "config", "save", "profiles", "settings"]
+# v1.6.14：settings 改成词根 setting，既保住 setting 也保住 settings。
+DEFAULT_PRESERVE = ["User", "config", "save", "profiles", "setting"]
 
 # 设置页里做成「一键开关」的常见保留项（默认全部开启）
 # v1.6.10：移除 data / logs / 3rdparty（模糊匹配下太宽泛），加入 settings
-# v1.6.11：saves 改成词根 save
+# v1.6.11：saves 改成词根 save；v1.6.14：settings 改成词根 setting
 COMMON_PRESERVE = [
     ("User", "User"),
     ("config", "config"),
     ("save", "save"),
     ("profiles", "profiles"),
-    ("settings", "settings"),
+    ("setting", "setting"),
 ]
 
 # v1.6.9 及更早的默认保留名单，用于一次性配置迁移（见 _normalize）
@@ -66,6 +67,16 @@ LEGACY_DEFAULT_PRESERVE = {"user", "config", "configs", "data", "saves", "save",
 # v1.6.10 的默认保留名单，用于 v4 → v5 一次性迁移（删掉被词根覆盖的 configs / saves）
 V4_DEFAULT_PRESERVE = {"user", "config", "configs", "saves", "save",
                        "profiles", "settings"}
+
+# v1.6.11 ~ v1.6.13 的默认保留名单，用于 v5 → v6 一次性迁移（settings → setting）
+V5_DEFAULT_PRESERVE = {"user", "config", "save", "profiles", "settings"}
+
+# 检查调度（v1.6.14）：可配置并发 + 错峰启动 + 失败重试
+SCAN_WORKERS_DEFAULT = 3
+SCAN_WORKERS_MIN = 1
+SCAN_WORKERS_MAX = 6
+SCAN_SUBMIT_STAGGER = 0.35        # 相邻两个检查之间错开启动的秒数
+SCAN_RETRY_DELAYS = (2.0, 4.0)    # 失败后递增等待； tuple 长度=重试次数
 
 # 更新时的文件替换策略（全局默认 + 单程序可覆盖）。
 #   clean       删除后覆盖：删掉保留名单以外的旧文件，再解压新版（默认）
@@ -167,7 +178,7 @@ def config_path() -> str:
 
 def default_config() -> dict:
     return {
-        "version": 5,
+        "version": 6,
         "roots": [{"path": "D:\\Automate", "exclude": ["My-maawork", "Cache", "_updater", "_backup", ".git"],
                    "depth": 4, "enabled": True}],
         "preserve": list(DEFAULT_PRESERVE),
@@ -198,8 +209,10 @@ def default_config() -> dict:
         },
         # install_mode：全局默认策略，见 INSTALL_MODES（默认 clean=删除后覆盖）
         # retry_on_locked：目标文件被其它进程占用时自动暂停并重试，而不是直接判失败
+        # scan_workers：同时联网检查的程序数（默认 3，逐个错峰启动，1 = 严格排队）
         "update": {"timeout_min": 10, "install_mode": DEFAULT_INSTALL_MODE,
-                   "retry_on_locked": True, "retry_wait_min": 5},
+                   "retry_on_locked": True, "retry_wait_min": 5,
+                   "scan_workers": SCAN_WORKERS_DEFAULT},
         "background": {
             "close_to_tray": True,           # 关闭窗口时最小化到托盘
             "run_at_startup": False,         # 开机自启（后台静默）
@@ -282,6 +295,11 @@ def _normalize(cfg: dict) -> dict:
         u["retry_wait_min"] = max(1, min(60, int(u.get("retry_wait_min") or 5)))
     except Exception:
         u["retry_wait_min"] = 5
+    try:
+        u["scan_workers"] = max(SCAN_WORKERS_MIN, min(
+            SCAN_WORKERS_MAX, int(u.get("scan_workers") or SCAN_WORKERS_DEFAULT)))
+    except Exception:
+        u["scan_workers"] = SCAN_WORKERS_DEFAULT
     # v1.6.10：默认保留名单改了（删 data/logs/3rdparty、加 settings），并且改成
     # 关键词匹配。老配置里存着完整旧名单，不迁移的话这三个会跑到「其他关键词」
     # 输入框里、settings 反而不会出现。只替换旧默认值，用户自己填的关键词原样保留。
@@ -304,7 +322,19 @@ def _normalize(cfg: dict) -> dict:
         taken = {x.lower() for x in custom}
         cfg["preserve"] = [x for x in DEFAULT_PRESERVE
                            if x.lower() not in taken] + custom
-    cfg["version"] = max(5, cver)
+    # v1.6.14：settings 改成词根 setting。老配置里的「settings」不迁移的话，
+    # 卡片不会亮、程序目录里叫 setting 的文件夹也不会被保留。只换旧默认值本身，
+    # 用户自己填的其他关键词原样保留；同时出现的 setting 去重。
+    if cver < 6 and isinstance(cfg.get("preserve"), list):
+        cur = [str(x).strip() for x in cfg["preserve"] if str(x).strip()]
+        seen, fixed = set(), []
+        for x in cur:
+            v = "setting" if x.lower() == "settings" else x
+            if v.lower() not in seen:
+                seen.add(v.lower())
+                fixed.append(v)
+        cfg["preserve"] = fixed
+    cfg["version"] = max(6, cver)
     if not isinstance(cfg.get("preserve"), list):
         cfg["preserve"] = list(DEFAULT_PRESERVE)
     seen, cleaned = set(), []
@@ -1849,18 +1879,57 @@ class Engine:
                 last = f"{type(e).__name__}: {e}"
         return False, "全部失败", last or "未知错误"
 
-    # ---------- 并发扫描 ----------
-    def scan_all(self, items: list[Item], on_item=None, on_progress=None, workers: int = 6) -> list[Item]:
+    # ---------- 检查调度：排队 + 错峰 + 失败重试 ----------
+    def _scan_with_retry(self, it: Item, on_retry=None) -> Item:
+        """检查失败时按递增间隔重试（默认 2s / 4s）；点「停止」立即中断。"""
+        res = it
+        for attempt in range(len(SCAN_RETRY_DELAYS) + 1):
+            if self.cancel.is_set():
+                return res
+            res = self.scan_item(it)
+            # 只有判定为失败的项才重试；already update / latest / choose 等不反复查
+            if res.status != "error" or self.cancel.is_set():
+                return res
+            if attempt >= len(SCAN_RETRY_DELAYS):
+                return res
+            if on_retry:
+                on_retry(it, attempt + 1, len(SCAN_RETRY_DELAYS))
+            res.error = ""          # 重试期间界面不再展示上一次的错误
+            if self.cancel.wait(SCAN_RETRY_DELAYS[attempt]):
+                return res
+        return res
+
+    def scan_all(self, items: list[Item], on_item=None, on_progress=None,
+                 workers: int = 0, on_retry=None, stagger=None) -> list[Item]:
+        """并发上限内排队检查，启动错峰，失败自动重试。
+
+        workers=0 表示读设置里的 ``update.scan_workers``（默认 3）；
+        stagger 仅供测试关掉错峰，正式检查用 SCAN_SUBMIT_STAGGER。
+        """
         # cancel 由 GUI 在启动 worker 前清理；这里再 clear 会吞掉刚点下的「停止」
-        # 全部并发提交，所以扫描期间每个未完成的行都应显示「检查中」。
+        try:
+            limit = max(SCAN_WORKERS_MIN, min(SCAN_WORKERS_MAX,
+                        int(workers or (self.cfg.get("update") or {}).get("scan_workers")
+                            or SCAN_WORKERS_DEFAULT)))
+        except Exception:
+            limit = SCAN_WORKERS_DEFAULT
+        gap = SCAN_SUBMIT_STAGGER if stagger is None else max(0.0, float(stagger))
+        # 排队中的行也要先显示「检查中」，不能等轮到它才亮
         for it in items:
             it.scanning = True
         done = 0
         total = len(items)
         results: list[Item] = []
         try:
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(self.scan_item, it): it for it in items}
+            with ThreadPoolExecutor(max_workers=limit) as ex:
+                futs = {}
+                for idx, it in enumerate(items):
+                    if self.cancel.is_set():
+                        break
+                    futs[ex.submit(self._scan_with_retry, it, on_retry)] = it
+                    # 错峰提交：避免一瞬间把 N 个请求全打到同一条线路上
+                    if idx < len(items) - 1 and gap and self.cancel.wait(gap):
+                        break
                 for fut in as_completed(futs):
                     it = futs[fut]
                     try:
