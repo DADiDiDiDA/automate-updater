@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""页面：首页概览、程序列表、设置。"""
+"""页面：首页概览、程序列表、更新策略、设置与各类弹窗。"""
 
 from __future__ import annotations
 
@@ -133,6 +133,7 @@ class ItemListView(QWidget):
     row_undo = Signal(str)
     row_preserve = Signal(str)
     row_asset = Signal(str)
+    row_strategy = Signal(str)
     sort_changed = Signal(str)
     prior_changed = Signal(str)
 
@@ -234,6 +235,7 @@ class ItemListView(QWidget):
             row.undo_requested.connect(self.row_undo)
             row.preserve_requested.connect(self.row_preserve)
             row.asset_requested.connect(self.row_asset)
+            row.strategy_requested.connect(self.row_strategy)
             self.rows[it.key] = row
             self.list_lay.insertWidget(self.list_lay.count() - 1, row)
         self._update_counts()
@@ -409,6 +411,7 @@ class HomePage(QWidget):
     row_undo = Signal(str)
     row_preserve = Signal(str)
     row_asset = Signal(str)
+    row_strategy = Signal(str)
     sort_changed = Signal(str)
     prior_changed = Signal(str)
 
@@ -481,6 +484,7 @@ class HomePage(QWidget):
         self.list.row_undo.connect(self.row_undo)
         self.list.row_preserve.connect(self.row_preserve)
         self.list.row_asset.connect(self.row_asset)
+        self.list.row_strategy.connect(self.row_strategy)
         self.list.sort_changed.connect(self.sort_changed)
         self.list.prior_changed.connect(self.prior_changed)
         lay.addWidget(self.list, 1)
@@ -1306,7 +1310,6 @@ class SettingsPage(QWidget):
         g = self.page_general.lay
         self._build_appearance(g)
         self._build_background(g)
-        self._build_strategy(g)
         self._build_roots(g)
         self._build_network(g)
         g.addStretch(1)
@@ -1611,153 +1614,6 @@ class SettingsPage(QWidget):
         self.startup_toggle.blockSignals(True)
         self.startup_toggle.setChecked(autostart.is_enabled())
         self.startup_toggle.blockSignals(False)
-
-    # ---------- 更新策略 ----------
-    def _build_strategy(self, lay: QVBoxLayout) -> None:
-        self._group(lay, "更新策略")
-
-        self.install_seg = self._segmented(
-            [("clean", "只保留指定文件夹"), ("overwrite", "直接覆盖")],
-            self.cfg.get("update", {}).get("install_mode", "clean"),
-            self._on_install_mode)
-        self.install_row = self._row(lay, "restore", "安装方式", "", self.install_seg)
-
-        chips_box = QWidget()
-        flat(chips_box)
-        cl = QVBoxLayout(chips_box)
-        cl.setContentsMargins(0, 0, 0, 0)
-        cl.setSpacing(8)
-        chip_row = QHBoxLayout()
-        chip_row.setSpacing(7)
-        self.preserve_chips: dict[str, Chip] = {}
-        for name, text in core.COMMON_PRESERVE:
-            c = Chip(text)
-            c.setToolTip(f"更新时保留名字含「{name}」的文件夹，不删除也不覆盖其内容")
-            c.set_active(self._preserve_on(name))
-            c.clicked.connect(lambda _=False, n=name, cc=c: self._toggle_preserve(n, cc))
-            self.preserve_chips[name] = c
-            chip_row.addWidget(c)
-        chip_row.addStretch(1)
-        cl.addLayout(chip_row)
-
-        self.extra_edit = QLineEdit("，".join(self._preserve_extras()))
-        self.extra_edit.setPlaceholderText("其他关键词，用逗号分隔（如 mods，plugins）")
-        self.extra_edit.setMinimumHeight(32)
-        self.extra_edit.editingFinished.connect(self._save_extras)
-        cl.addWidget(self.extra_edit)
-        self.preserve_row = self._row(lay, "folder", "默认保留的文件夹",
-                                      "名字含这些关键词的文件夹原样保留（只匹配第一层文件夹，不区分大小写）",
-                                      None, chips_box)
-        self.preserve_box = chips_box
-        self._preserve_fx = QGraphicsOpacityEffect(chips_box)
-        self._preserve_fx.setOpacity(1.0)
-        chips_box.setGraphicsEffect(self._preserve_fx)
-        self._sync_install_desc()
-
-        self.timeout_spin = NumberStepper(
-            int(self.cfg.get("update", {}).get("timeout_min", 10)), 1, 180, 5, " 分钟", 108)
-        self.timeout_spin.valueChanged.connect(self._save_timeout)
-        self._row(lay, "timer", "单个程序更新超时",
-                  "下载 + 解压总时长超过该值即中止，避免卡死", self.timeout_spin)
-
-        retry = QWidget()
-        flat(retry)
-        rl = QHBoxLayout(retry)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(10)
-        self.retry_toggle = ToggleSwitch(
-            bool(self.cfg.get("update", {}).get("retry_on_locked", True)))
-        self.retry_toggle.toggled.connect(self._save_retry)
-        self.retry_spin = NumberStepper(
-            int(self.cfg.get("update", {}).get("retry_wait_min", 5)), 1, 30, 1, " 分钟", 108)
-        self.retry_spin.valueChanged.connect(self._save_retry)
-        rl.addWidget(self.retry_toggle)
-        rl.addWidget(self.retry_spin)
-        self._row(lay, "refresh", "文件被占用时自动等待",
-                  "检测到程序或文件正被使用时自动暂停，每 3 秒重试一次；"
-                  "最长等待时长可右侧调整，随时可点「停止」中断", retry)
-        self._sync_retry()
-
-        bk = QWidget()
-        flat(bk)
-        bkl = QHBoxLayout(bk)
-        bkl.setContentsMargins(0, 0, 0, 0)
-        bkl.setSpacing(10)
-        self.backup_toggle = ToggleSwitch(bool(self.cfg.get("backup", {}).get("enabled", True)))
-        self.backup_toggle.toggled.connect(self._save_backup)
-        self.keep_spin = NumberStepper(
-            int(self.cfg.get("backup", {}).get("keep", 2)), 1, 10, 1, " 份", 96)
-        self.keep_spin.valueChanged.connect(self._save_backup)
-        bkl.addWidget(self.backup_toggle)
-        bkl.addWidget(self.keep_spin)
-        self._row(lay, "save", "覆盖前自动备份", "备份存放在根目录 Cache\\_backup 下", bk)
-
-    def _on_install_mode(self, mode: str) -> None:
-        self.cfg.setdefault("update", {})["install_mode"] = mode
-        self._sync_install_desc()
-        self.config_changed.emit()
-
-    def _sync_install_desc(self) -> None:
-        """安装方式与「默认保留的文件夹」联动：直接覆盖时保留列表不生效。"""
-        clean = (self.cfg.get("update", {}).get("install_mode", "clean") != "overwrite")
-        self.install_row.set_desc(
-            "只保留指定文件夹：删除旧的无关文件后再解压新版" if clean
-            else "直接覆盖：保留全部已有文件，只用新版同名内容替换")
-        self.preserve_row.set_desc(
-            "名字含这些关键词的文件夹原样保留（只匹配第一层文件夹，不区分大小写）" if clean
-            else "直接覆盖模式下不生效；需要精细控制时可右键单个程序单独设置")
-        self.preserve_box.setEnabled(clean)
-        self._preserve_fx.setOpacity(1.0 if clean else 0.42)
-
-    def _preserve_on(self, name: str) -> bool:
-        low = name.lower()
-        return any(str(e).lower() == low for e in self.cfg.get("preserve", []))
-
-    def _preserve_extras(self) -> list[str]:
-        common = {n.lower() for n, _ in core.COMMON_PRESERVE}
-        return [str(e) for e in self.cfg.get("preserve", []) if str(e).lower() not in common]
-
-    def _toggle_preserve(self, name: str, chip) -> None:
-        on = not self._preserve_on(name)
-        chip.set_active(on)
-        cur = [e for e in self.cfg.get("preserve", []) if str(e).lower() != name.lower()]
-        if on:
-            cur.append(name)
-        self.cfg["preserve"] = cur
-        self.config_changed.emit()
-
-    def _save_extras(self) -> None:
-        common = {n.lower() for n, _ in core.COMMON_PRESERVE}
-        keep = [e for e in self.cfg.get("preserve", []) if str(e).lower() in common]
-        seen = {str(e).lower() for e in keep}
-        raw = self.extra_edit.text().replace("，", ",")
-        for x in raw.split(","):
-            x = x.strip()
-            if x and x.lower() not in seen:
-                keep.append(x)
-                seen.add(x.lower())
-        self.cfg["preserve"] = keep
-        self.extra_edit.setText("，".join(self._preserve_extras()))
-        self.config_changed.emit()
-
-    def _save_timeout(self, *_):
-        self.cfg.setdefault("update", {})["timeout_min"] = int(self.timeout_spin.value())
-        self.config_changed.emit()
-
-    def _sync_retry(self) -> None:
-        self.retry_spin.setEnabled(self.retry_toggle.isChecked())
-
-    def _save_retry(self, *_):
-        self.cfg.setdefault("update", {})["retry_on_locked"] = self.retry_toggle.isChecked()
-        self.cfg["update"]["retry_wait_min"] = int(self.retry_spin.value())
-        self._sync_retry()
-        self.config_changed.emit()
-
-    def _save_backup(self, *_):
-        self.cfg.setdefault("backup", {})
-        self.cfg["backup"]["enabled"] = self.backup_toggle.isChecked()
-        self.cfg["backup"]["keep"] = self.keep_spin.value()
-        self.config_changed.emit()
 
     # ---------- 检查文件夹 ----------
     def _build_roots(self, lay: QVBoxLayout) -> None:
@@ -2088,3 +1944,331 @@ class SettingsPage(QWidget):
             key = w.property("_fg_key")
             if key:
                 tint(w, getattr(p, key, p.text))
+
+
+class StrategyDialog(ThemedDialog):
+    """单个程序的更新策略：跟随全局 / 直接覆盖 / 删除后覆盖 / 先清空 / 仅增量。"""
+
+    def __init__(self, parent, name: str, current: str, global_mode: str):
+        super().__init__(parent, "更新策略", 520)
+        self.value_ = current if current in core.INSTALL_MODES else ""
+
+        self.body.addWidget(_label(f"「{name}」", 13, "text", bold=True))
+        self.body.addWidget(_label(
+            "设置这个程序在更新时如何替换文件；选「跟随全局」则使用「更新策略」页里的默认策略。",
+            11, "text_muted", wrap=True))
+
+        g_lbl = core.INSTALL_MODE_LABELS.get(global_mode, global_mode)
+        items = [("", f"跟随全局（{g_lbl}）")]
+        items += [(m, core.INSTALL_MODE_LABELS[m]) for m in core.INSTALL_MODES]
+        self.combo = ThemedCombo(items, self.value_, 260)
+        self.combo.changed.connect(self._on_pick)
+        self.body.addWidget(self.combo)
+
+        self.hint = _label(core.INSTALL_MODE_HINTS.get(self.value_ or global_mode, ""),
+                           11, "text_muted", wrap=True)
+        self.body.addWidget(self.hint)
+        self.add_footer()
+
+    def _on_pick(self, key: str) -> None:
+        self.value_ = key if key in core.INSTALL_MODES else ""
+        self.hint.setText(core.INSTALL_MODE_HINTS.get(self.value_ or "", ""))
+
+    def value(self) -> str:
+        return self.value_
+
+
+class StrategyPage(QWidget):
+    """更新策略页：全局默认策略 + 保留名单 + 超时/重试/备份 + 单程序覆盖清单。"""
+
+    config_changed = Signal()
+
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self._items: list = []
+        self._prog_rows: list = []
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.scroll = self._scroll_page()
+        outer.addWidget(self.scroll, 1)
+        g = self.scroll.lay
+
+        g.addWidget(_label(
+            "控制更新时如何替换程序文件。全局默认作用于所有程序，也可以给单个程序单独指定。",
+            12, "text_muted", wrap=True))
+
+        # ---- 默认策略 ----
+        self._group(g, "默认策略")
+        self.mode_combo = ThemedCombo(
+            [(m, core.INSTALL_MODE_LABELS[m]) for m in core.INSTALL_MODES],
+            self._global_mode(), 176)
+        self.mode_combo.changed.connect(self._on_global_mode)
+        self.mode_row = self._row(g, "restore", "默认更新策略", "", self.mode_combo)
+
+        # 默认保留的文件夹（clean / incremental 生效）
+        chips_box = QWidget()
+        flat(chips_box)
+        cl = QVBoxLayout(chips_box)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(8)
+        chip_row = QHBoxLayout()
+        chip_row.setSpacing(7)
+        self.preserve_chips: dict[str, Chip] = {}
+        for name, text in core.COMMON_PRESERVE:
+            c = Chip(text)
+            c.setToolTip(f"更新时保留名字含「{name}」的文件夹，不删除也不覆盖其内容")
+            c.set_active(self._preserve_on(name))
+            c.clicked.connect(lambda _=False, n=name, cc=c: self._toggle_preserve(n, cc))
+            self.preserve_chips[name] = c
+            chip_row.addWidget(c)
+        chip_row.addStretch(1)
+        cl.addLayout(chip_row)
+
+        self.extra_edit = QLineEdit("，".join(self._preserve_extras()))
+        self.extra_edit.setPlaceholderText("其他关键词，用逗号分隔（如 mods，plugins）")
+        self.extra_edit.setMinimumHeight(32)
+        self.extra_edit.editingFinished.connect(self._save_extras)
+        cl.addWidget(self.extra_edit)
+        self.preserve_row = self._row(
+            g, "folder", "默认保留的文件夹",
+            "名字含这些关键词的文件夹原样保留（只匹配第一层文件夹，不区分大小写）",
+            None, chips_box)
+        self.preserve_box = chips_box
+        self._preserve_fx = QGraphicsOpacityEffect(chips_box)
+        self._preserve_fx.setOpacity(1.0)
+        chips_box.setGraphicsEffect(self._preserve_fx)
+
+        # 单个程序更新超时
+        self.timeout_spin = NumberStepper(
+            int(self.cfg.get("update", {}).get("timeout_min", 10)), 1, 180, 5, " 分钟", 108)
+        self.timeout_spin.valueChanged.connect(self._save_timeout)
+        self._row(g, "timer", "单个程序更新超时",
+                  "下载 + 解压总时长超过该值即中止，避免卡死", self.timeout_spin)
+
+        # 文件被占用自动等待
+        retry = QWidget()
+        flat(retry)
+        rl = QHBoxLayout(retry)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(10)
+        self.retry_toggle = ToggleSwitch(
+            bool(self.cfg.get("update", {}).get("retry_on_locked", True)))
+        self.retry_toggle.toggled.connect(self._save_retry)
+        self.retry_spin = NumberStepper(
+            int(self.cfg.get("update", {}).get("retry_wait_min", 5)), 1, 30, 1, " 分钟", 108)
+        self.retry_spin.valueChanged.connect(self._save_retry)
+        rl.addWidget(self.retry_toggle)
+        rl.addWidget(self.retry_spin)
+        self._row(g, "refresh", "文件被占用时自动等待",
+                  "检测到程序或文件正被使用时自动暂停，每 3 秒重试一次；"
+                  "最长等待时长可右侧调整，随时可点「停止」中断", retry)
+
+        # 覆盖前自动备份
+        bk = QWidget()
+        flat(bk)
+        bkl = QHBoxLayout(bk)
+        bkl.setContentsMargins(0, 0, 0, 0)
+        bkl.setSpacing(10)
+        self.backup_toggle = ToggleSwitch(bool(self.cfg.get("backup", {}).get("enabled", True)))
+        self.backup_toggle.toggled.connect(self._save_backup)
+        self.keep_spin = NumberStepper(
+            int(self.cfg.get("backup", {}).get("keep", 2)), 1, 10, 1, " 份", 96)
+        self.keep_spin.valueChanged.connect(self._save_backup)
+        bkl.addWidget(self.backup_toggle)
+        bkl.addWidget(self.keep_spin)
+        self._row(g, "save", "覆盖前自动备份", "备份存放在根目录 Cache\\_backup 下", bk)
+
+        # ---- 按程序设置 ----
+        self._group(g, "按程序设置")
+        self.prog_hint = _label("", 11, "text_muted", wrap=True)
+        g.addWidget(self.prog_hint)
+        self.prog_holder = QWidget()
+        flat(self.prog_holder)
+        self.prog_lay = QVBoxLayout(self.prog_holder)
+        self.prog_lay.setContentsMargins(0, 0, 0, 0)
+        self.prog_lay.setSpacing(8)
+        g.addWidget(self.prog_holder)
+        g.addStretch(1)
+
+        self._sync_mode_desc()
+        self._sync_retry()
+        self._rebuild_programs()
+
+    # ---------- 结构 ----------
+    def _scroll_page(self) -> QScrollArea:
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.NoFrame)
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        holder = QWidget()
+        lay = QVBoxLayout(holder)
+        lay.setContentsMargins(0, 4, 10, 22)
+        lay.setSpacing(8)
+        sc.setWidget(holder)
+        sc.lay = lay
+        return sc
+
+    def _group(self, lay: QVBoxLayout, text: str) -> None:
+        lay.addWidget(SettingGroup(text))
+
+    def _row(self, lay: QVBoxLayout, icon: str, title: str, desc: str = "",
+             control=None, content=None) -> SettingRow:
+        row = SettingRow(icon, title, desc, control, content)
+        lay.addWidget(row)
+        return row
+
+    # ---------- 全局默认策略 ----------
+    def _global_mode(self) -> str:
+        m = (self.cfg.get("update") or {}).get("install_mode", core.DEFAULT_INSTALL_MODE)
+        return m if m in core.INSTALL_MODES else core.DEFAULT_INSTALL_MODE
+
+    def _on_global_mode(self, mode: str) -> None:
+        if mode not in core.INSTALL_MODES:
+            return
+        self.cfg.setdefault("update", {})["install_mode"] = mode
+        self._sync_mode_desc()
+        self._rebuild_programs()
+        self.config_changed.emit()
+
+    def _sync_mode_desc(self) -> None:
+        """策略与保留名单联动：覆盖/清空模式下保留名单不生效。"""
+        mode = self._global_mode()
+        self.mode_row.set_desc(core.INSTALL_MODE_HINTS.get(mode, ""))
+        active = mode in ("clean", "incremental")
+        self.preserve_row.set_desc(
+            "名字含这些关键词的文件夹原样保留（只匹配第一层文件夹，不区分大小写）" if active
+            else "当前策略不保留任何文件夹，此设置不生效（仅「删除后覆盖」「仅增量覆盖」生效）")
+        self.preserve_box.setEnabled(active)
+        self._preserve_fx.setOpacity(1.0 if active else 0.42)
+
+    # ---------- 保留名单 ----------
+    def _preserve_on(self, name: str) -> bool:
+        low = name.lower()
+        return any(str(e).lower() == low for e in self.cfg.get("preserve", []))
+
+    def _preserve_extras(self) -> list[str]:
+        common = {n.lower() for n, _ in core.COMMON_PRESERVE}
+        return [str(e) for e in self.cfg.get("preserve", []) if str(e).lower() not in common]
+
+    def _toggle_preserve(self, name: str, chip) -> None:
+        on = not self._preserve_on(name)
+        chip.set_active(on)
+        cur = [e for e in self.cfg.get("preserve", []) if str(e).lower() != name.lower()]
+        if on:
+            cur.append(name)
+        self.cfg["preserve"] = cur
+        self.config_changed.emit()
+
+    def _save_extras(self) -> None:
+        common = {n.lower() for n, _ in core.COMMON_PRESERVE}
+        keep = [e for e in self.cfg.get("preserve", []) if str(e).lower() in common]
+        seen = {str(e).lower() for e in keep}
+        raw = self.extra_edit.text().replace("，", ",")
+        for x in raw.split(","):
+            x = x.strip()
+            if x and x.lower() not in seen:
+                keep.append(x)
+                seen.add(x.lower())
+        self.cfg["preserve"] = keep
+        self.extra_edit.setText("，".join(self._preserve_extras()))
+        self.config_changed.emit()
+
+    # ---------- 超时 / 重试 / 备份 ----------
+    def _save_timeout(self, *_):
+        self.cfg.setdefault("update", {})["timeout_min"] = int(self.timeout_spin.value())
+        self.config_changed.emit()
+
+    def _sync_retry(self) -> None:
+        self.retry_spin.setEnabled(self.retry_toggle.isChecked())
+
+    def _save_retry(self, *_):
+        self.cfg.setdefault("update", {})["retry_on_locked"] = self.retry_toggle.isChecked()
+        self.cfg["update"]["retry_wait_min"] = int(self.retry_spin.value())
+        self._sync_retry()
+        self.config_changed.emit()
+
+    def _save_backup(self, *_):
+        self.cfg.setdefault("backup", {})
+        self.cfg["backup"]["enabled"] = self.backup_toggle.isChecked()
+        self.cfg["backup"]["keep"] = self.keep_spin.value()
+        self.config_changed.emit()
+
+    # ---------- 按程序设置 ----------
+    def set_items(self, items) -> None:
+        self._items = list(items or [])
+        self._rebuild_programs()
+
+    def _rebuild_programs(self) -> None:
+        # 先清空旧行：hide + removeWidget + deleteLater，避免弹成顶层小窗
+        for w in self._prog_rows:
+            try:
+                w.hide()
+                self.prog_lay.removeWidget(w)
+                w.deleteLater()
+            except RuntimeError:
+                pass
+        self._prog_rows = []
+
+        g_mode = self._global_mode()
+        rel = [it for it in self._items if getattr(it, "kind", "") == "release"]
+        if not rel:
+            self.prog_hint.setText("还没有可设置的程序。先在「设置」里添加检查文件夹并检查一次。")
+            return
+        self.prog_hint.setText(
+            f"共 {len(rel)} 个程序。未单独设置的程序使用默认策略（{core.INSTALL_MODE_LABELS[g_mode]}）；"
+            "Git 仓库按提交拉取更新，不涉及文件替换，不在此列。")
+
+        overrides = self.cfg.get("install_mode_map") or {}
+        for it in rel:
+            key = (it.name or "").lower()
+            cur = overrides.get(key, "")
+            if cur not in core.INSTALL_MODES:
+                cur = ""
+            combo = ThemedCombo(
+                [("", f"跟随全局（{core.INSTALL_MODE_LABELS[g_mode]}）")]
+                + [(m, core.INSTALL_MODE_LABELS[m]) for m in core.INSTALL_MODES],
+                cur, 188)
+            combo.changed.connect(lambda m, nm=it.name, cb=combo: self._on_prog_mode(nm, m, cb))
+            desc = (core.INSTALL_MODE_LABELS[cur] + "（已单独设置）" if cur
+                    else f"跟随全局：{core.INSTALL_MODE_LABELS[g_mode]}")
+            row = SettingRow("apps", it.name, desc, combo)
+            row.setToolTip(f"{it.name}\n{getattr(it, 'path', '')}")
+            self.prog_lay.addWidget(row)
+            self._prog_rows.append(row)
+
+    def _on_prog_mode(self, name: str, mode: str, combo) -> None:
+        """页面清单里改了某程序的策略。"""
+        key = (name or "").lower()
+        mm = self.cfg.setdefault("install_mode_map", {})
+        if mode in core.INSTALL_MODES:
+            mm[key] = mode
+        else:
+            mm.pop(key, None)
+        # 刷新这一行的说明
+        g_mode = self._global_mode()
+        for row in self._prog_rows:
+            if row.title_lbl.text() == name:
+                row.set_desc(core.INSTALL_MODE_LABELS[mode] + "（已单独设置）" if mode
+                             else f"跟随全局：{core.INSTALL_MODE_LABELS[g_mode]}")
+                break
+        self.config_changed.emit()
+
+    # ---------- 主题 ----------
+    def refresh_theme(self) -> None:
+        for combo in self.findChildren(ThemedCombo):
+            combo.refresh_theme()
+        for chip in self.findChildren(Chip):
+            chip.refresh_theme()
+        for row in self.findChildren(SettingRow):
+            row.refresh_theme()
+        for grp in self.findChildren(SettingGroup):
+            grp.refresh_theme()
+        for card in self.findChildren(Card):
+            card.update()
+        for w in self.findChildren(QWidget):
+            key = w.property("_fg_key")
+            if key:
+                tint(w, getattr(THEME.p, key, THEME.p.text))

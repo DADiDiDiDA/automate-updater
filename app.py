@@ -25,10 +25,15 @@ import core
 import autostart
 from backdrop import BACKDROP
 from pages import (HomePage, ItemListView, MirrorDialog, NodesDialog, PreserveDialog,
-                   SettingsPage, ThemedDialog, VersionDialog, _label)
+                   SettingsPage, StrategyDialog, StrategyPage, ThemedDialog, VersionDialog,
+                   _label)
 from theme import GLYPH, THEME, build_qss, glyph_font, qc, rgba, scoped, tint
 from tray import TrayIcon
 from widgets import NavButton, Toast
+
+# 侧边栏顺序 = 页面栈索引顺序；导航、快捷键、开发截图都按这个定位
+_NAV_ORDER = ["home", "programs", "strategy", "settings"]
+_NAV_TITLES = {"home": "首页", "programs": "程序", "strategy": "更新策略", "settings": "设置"}
 
 def mode_icon(to_dark: bool) -> QIcon:
     """自绘太阳 / 月亮图标：图标字体缺字时也不会变成怪字符。"""
@@ -502,7 +507,7 @@ class MainWindow(QWidget):
 
         self.toast = Toast(self)
         start_page = os.environ.get("AM_PAGE", "").strip()
-        if start_page in ("home", "programs", "settings"):
+        if start_page in _NAV_ORDER:
             self._on_nav(start_page)
         if os.environ.get("AM_EXPAND_NOTIFY") == "1":
             self.page_settings.notify_card.set_open(True)
@@ -559,8 +564,10 @@ class MainWindow(QWidget):
         self.nav_group = []
         self.nav_home = NavButton("home", "home", "首页")
         self.nav_progs = NavButton("programs", "apps", "程序")
+        self.nav_strategy = NavButton("strategy", "restore", "更新策略")
         self.nav_settings = NavButton("settings", "settings", "设置")
-        for btn in (self.nav_home, self.nav_progs, self.nav_settings):
+        # 侧边栏顺序 = 页面栈索引顺序，_on_nav 用 _NAV_ORDER 定位
+        for btn in (self.nav_home, self.nav_progs, self.nav_strategy, self.nav_settings):
             btn.clicked.connect(self._on_nav)
             self.nav_group.append(btn)
             sl.addWidget(btn)
@@ -637,6 +644,7 @@ class MainWindow(QWidget):
         self.page_home.row_undo.connect(self.undo_update)
         self.page_home.row_preserve.connect(self.edit_preserve)
         self.page_home.row_asset.connect(self.edit_asset)
+        self.page_home.row_strategy.connect(self.edit_strategy)
 
         self.page_progs = QWidget()
         pl = QVBoxLayout(self.page_progs)
@@ -655,6 +663,7 @@ class MainWindow(QWidget):
         self.progs_list.row_undo.connect(self.undo_update)
         self.progs_list.row_preserve.connect(self.edit_preserve)
         self.progs_list.row_asset.connect(self.edit_asset)
+        self.progs_list.row_strategy.connect(self.edit_strategy)
         pl.addWidget(self.progs_list, 1)
 
         ui = self.cfg.get("ui") or {}
@@ -664,10 +673,14 @@ class MainWindow(QWidget):
             lv.sort_changed.connect(self._on_sort_changed)
             lv.prior_changed.connect(self._on_prior_changed)
 
+        self.page_strategy = StrategyPage(self.cfg)
+        self.page_strategy.config_changed.connect(self._save_cfg)
+        self.page_strategy.set_items(getattr(self, "items", []) or [])
+
         self.page_settings = SettingsPage(self.cfg)
         self._wire_settings(self.page_settings)
 
-        for page in (self.page_home, self.page_progs, self.page_settings):
+        for page in (self.page_home, self.page_progs, self.page_strategy, self.page_settings):
             wrap = QWidget()
             wl = QVBoxLayout(wrap)
             wl.setContentsMargins(22, 4, 18, 18)
@@ -678,9 +691,10 @@ class MainWindow(QWidget):
         self.nav_home.set_active(True)
         self._update_brand()
 
-        # 键盘快捷键：Ctrl+1/2/3 切页，F5 重新检查
+        # 键盘快捷键：Ctrl+1/2/3/4 切页，F5 重新检查
         from PySide6.QtGui import QKeySequence, QShortcut
-        for key, seq in (("home", "Ctrl+1"), ("programs", "Ctrl+2"), ("settings", "Ctrl+3")):
+        for key, seq in (("home", "Ctrl+1"), ("programs", "Ctrl+2"),
+                         ("strategy", "Ctrl+3"), ("settings", "Ctrl+4")):
             sc = QShortcut(QKeySequence(seq), self)
             sc.activated.connect(lambda k=key: self._on_nav(k))
         QShortcut(QKeySequence("F5"), self).activated.connect(self.start_scan)
@@ -840,6 +854,8 @@ class MainWindow(QWidget):
         self._update_logo()
         self.page_home.refresh_theme()
         self.progs_list.refresh_theme()
+        if hasattr(self, "page_strategy"):
+            self.page_strategy.refresh_theme()
         # 只刷配色，不重建整页（重建会丢掉正在输入但未失焦的代理/Webhook）
         if hasattr(self, "page_settings"):
             self.page_settings.refresh_theme()
@@ -981,11 +997,15 @@ class MainWindow(QWidget):
 
     # ---------- 导航 ----------
     def _on_nav(self, key: str) -> None:
-        idx = {"home": 0, "programs": 1, "settings": 2}[key]
-        self.stack.setCurrentIndex(idx)
+        if key not in _NAV_ORDER:
+            return
+        self.stack.setCurrentIndex(_NAV_ORDER.index(key))
         for nav in self.nav_group:
             nav.set_active(nav.key == key)
-        self.page_title.setText({"home": "首页", "programs": "程序", "settings": "设置"}[key])
+        self.page_title.setText(_NAV_TITLES.get(key, ""))
+        # 切到「更新策略」时刷新程序清单（可能刚扫过 / 增删过程序）
+        if key == "strategy" and hasattr(self, "page_strategy"):
+            self.page_strategy.set_items(self.items)
 
     # ---------- 托盘 / 定时 ----------
     def _dev_shot(self, path: str) -> None:
@@ -993,11 +1013,11 @@ class MainWindow(QWidget):
         try:
             self.showNormal()
             off = os.environ.get("AM_SCROLL", "").strip()
-            if off and self.stack.currentIndex() == 2:
+            if off and self.stack.currentIndex() == _NAV_ORDER.index("settings"):
                 bar = self.page_settings.stack.currentWidget().verticalScrollBar()
                 bar.setValue(int(off))
             tab = os.environ.get("AM_TAB", "").strip()
-            if tab and self.stack.currentIndex() == 2:
+            if tab and self.stack.currentIndex() == _NAV_ORDER.index("settings"):
                 self.page_settings.switch_tab(int(tab))
             self.repaint()
             QApplication.processEvents()
@@ -1181,6 +1201,7 @@ class MainWindow(QWidget):
         self.items = items
         self.page_home.set_items(items)
         self.progs_list.set_items(items)
+        self.page_strategy.set_items(items)
         self.page_home.last_scan_time = self.engine.records.get("last_scan", "—") or "—"
         self.page_home.refresh_stats()
         if self.tray is not None:
@@ -1225,6 +1246,7 @@ class MainWindow(QWidget):
             it.scanning = True
         self.page_home.set_items(items)
         self.progs_list.set_items(items)
+        self.page_strategy.set_items(items)
         self.page_home.set_scan_state(True, 0, len(items), "正在连接 GitHub…")
         if self.tray is not None:
             self.tray.set_busy(True, "正在检查更新…")
@@ -1259,6 +1281,7 @@ class MainWindow(QWidget):
         last = self.engine.records.get("last_scan", "—") or "—"
         self.page_home.last_scan_time = last
         self.page_home.refresh_stats()
+        self.page_strategy.set_items(self.items)
         upd = [i for i in items
                if i.status == "update" or (i.status == "unknown" and i.scanned)]
         errs = [i for i in items if i.status == "error"]
@@ -1629,6 +1652,32 @@ class MainWindow(QWidget):
             self.toast.show_text(f"「{it.name}」已改为跟随全局保留列表")
         else:
             self.toast.show_text(f"「{it.name}」将保留 {len(dlg.chosen)} 个文件夹")
+
+    def edit_strategy(self, key: str) -> None:
+        """右键「更新策略…」：给单个程序指定更新时的文件替换策略。"""
+        it = next((i for i in self.items if i.key == key), None)
+        if not it:
+            return
+        if it.kind == "git":
+            self.toast.show_text("Git 仓库按提交拉取更新，不涉及文件替换", ok=False)
+            return
+        override = (self.cfg.get("install_mode_map") or {}).get(it.name.lower(), "")
+        if override not in core.INSTALL_MODES:
+            override = ""
+        g = (self.cfg.get("update") or {}).get("install_mode", core.DEFAULT_INSTALL_MODE)
+        if g not in core.INSTALL_MODES:
+            g = core.DEFAULT_INSTALL_MODE
+        dlg = StrategyDialog(self, it.name, override, g)
+        if not dlg.exec():
+            return
+        self.engine.set_install_mode(it.name, dlg.value())
+        self.page_strategy.set_items(self.items)
+        mode = self.engine.install_mode_for(it.name)
+        if dlg.value():
+            self.toast.show_text(
+                f"「{it.name}」更新策略：{core.INSTALL_MODE_LABELS.get(mode, mode)}")
+        else:
+            self.toast.show_text(f"「{it.name}」已改为跟随全局策略")
 
     def bind_repo(self, key: str) -> None:
         it = next((i for i in self.items if i.key == key), None)

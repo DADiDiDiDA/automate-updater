@@ -3,7 +3,7 @@
 > 本文面向「需要接着改这份代码」的人或 AI。读完应该能回答：代码在哪、一次检查/更新怎么走、哪些约定不能破、改完怎么验证。
 > 人类用户请看 [README.md](README.md)，版本变更请看 [update.md](update.md)。
 
-**30 秒版**：`core.py` 是不带 Qt 的纯逻辑引擎（扫描 / 下载 / 解压 / 覆盖 / 回滚 / 网络），`app.py` 是窗口 + 6 个后台 worker + 单实例入口，`pages.py` 是首页/列表/设置与弹窗。业务判定集中在 `core.py`；**下载与镜像策略经过多次返工，改之前务必读第 8 节的不变量**。
+**30 秒版**：`core.py` 是不带 Qt 的纯逻辑引擎（扫描 / 下载 / 解压 / 覆盖 / 回滚 / 网络），`app.py` 是窗口 + 6 个后台 worker + 单实例入口，`pages.py` 是首页/列表/设置/更新策略与弹窗。业务判定集中在 `core.py`；**下载与镜像策略经过多次返工，改之前务必读第 8 节的不变量**。
 
 ---
 
@@ -30,7 +30,7 @@
 | --- | --- | --- |
 | `core.py` | 逻辑 | 常量与 `BUILTIN_PROGRAMS`、`default_config()` / `_normalize()`、镜像与节点管理、`Item` dataclass、`Engine`（扫描/更新/回滚/通知）、`download()`、解压与覆盖工具 |
 | `app.py` | 应用 | `ScanWorker` / `UpdateWorker` / `UndoWorker` / `MirrorWorker` / `NodesSyncWorker`；`MainWindow`、`AssetDialog`、`BindDialog`、单实例、`main()`、`_excepthook` |
-| `pages.py` | 页面 | `HomePage`、`ItemListView`（列表行直接持有 `rows`）、`SettingsPage`、各 `ThemedDialog`（`MirrorDialog` / `NodesDialog` / `PreserveDialog` / `VersionDialog` / `ExcludeDialog`）、`_date_ord` / `_time_ord` 排序辅助 |
+| `pages.py` | 页面 | `HomePage`、`ItemListView`（列表行直接持有 `rows`）、`SettingsPage`、`StrategyPage`（更新策略页：全局策略 + 按程序清单）、各 `ThemedDialog`（`MirrorDialog` / `NodesDialog` / `PreserveDialog` / `StrategyDialog` / `VersionDialog` / `ExcludeDialog`）、`_date_ord` / `_time_ord` 排序辅助 |
 | `widgets.py` | 控件 | 与姊妹项目同源的通用控件（`NumberStepper`、`WrapLabel`、`ThemedCombo`、`Card`、`Badge`…） |
 | `theme.py` / `backdrop.py` | 主题 | 3 套皮肤 × 明暗；`tint()` / `flat()` / `scoped()`；玻璃背景实时取景 |
 | `tray.py` | 托盘 | 图标（蓝紫渐变 + 白箭头 + 红点角标）、右键菜单、悬停提示 |
@@ -81,7 +81,8 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 | `proxy_ports` / `proxy` | 探测端口表；`mode` = auto / manual / off，`url`（**仅 `http://`**） |
 | `manual_versions` | 程序名(小写) → 手动标记的本地版本。**更新成功后必须清除**，否则会压住 `records.versions` 里的新版本（见第 8 节） |
 | `mirrors` | `enabled` · `list`（用户可编辑）· `seeded` · `daily_check` · `chosen` · `ranking`([[毫秒, url]]，`-1` = 未响应) · `ranking_sig`（候选 md5）· `auto_nodes` · `nodes_url` · `nodes` · `nodes_fetched` · `nodes_attempt` · `nodes_error` · `probe_before` · `daily` |
-| `update` | `timeout_min`(10) · `install_mode`(clean/overwrite) · `retry_on_locked` · `retry_wait_min` |
+| `update` | `timeout_min`(10) · `install_mode`(clean/overwrite/wipe/incremental，默认 clean) · `retry_on_locked` · `retry_wait_min` |
+| `install_mode_map` | 程序名(小写) → `clean` / `overwrite` / `wipe` / `incremental`；缺省或非法值 = 跟随全局 `update.install_mode`。由 `_normalize()` 补默认并清非法值，无需版本迁移 |
 | `background` | `close_to_tray` · `run_at_startup` · `check_enabled`（**仅后台定时器**）· `interval_min`（后台查版本间隔，5–1440，默认 60）· `auto_mode`(off/silent/notify) · `notify_methods[]` |
 | `backup` / `dingtalk` / `ui` / `programs` / `last_scan` | 备份份数、通知凭证（默认全空）、`ui.sort` + `ui.prior`、程序定制 |
 
@@ -121,7 +122,7 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 5. 失败原因写 `download.last_error`，界面显示「下载失败：<原因>」；内容类错误（`content_err`）优先于连接错误上报；进度映射 `0.02 + p*0.63 → 0.65` 留给解压。
 
 **安装 / 回滚（`Engine._update_release`）**
-`extract_archive()` → `locate_root()` 用 `anchor` 定位程序根目录（**解压后必须命中 anchor，否则中止且不动原目录**）→ `backup_dir()` 备份 → `clean_replace()`（clean）或 `copy_over()`（overwrite）→ **成功分支清掉 `manual_versions` 里的过期标记、复位 `local_manual`** → `records.versions` 写 `it.remote` → `_stamp_update()` 写 records。两者都走 `should_preserve(name, is_dir, preserve)`：v1.6.10 起只匹配**第一层文件夹**且「名字含关键词即保留」（`preserve_keywords()` 小写去重），文件不参与、不递归深层；`__MACOSX` / `.DS_Store` / `_updater_undo.json` 仍单独跳过。
+`extract_archive()` → `locate_root()` 用 `anchor` 定位程序根目录（**解压后必须命中 anchor，否则中止且不动原目录**）→ `backup_dir()` 备份 → `_install_with_retry()` 按 `Engine.install_mode_for(it.name)`（单程序覆盖优先，否则全局）分派：`clean` → `clean_replace(preserve)`；`overwrite` → `copy_over([])`；`wipe` → `clean_replace([])`（连保留目录也清）；`incremental` → `incremental_over()`（只写更新/缺失文件，从不删除）→ **成功分支清掉 `manual_versions` 里的过期标记、复位 `local_manual`** → `records.versions` 写 `it.remote` → `_stamp_update()` 写 records。两者都走 `should_preserve(name, is_dir, preserve)`：v1.6.10 起只匹配**第一层文件夹**且「名字含关键词即保留」（`preserve_keywords()` 小写去重），文件不参与、不递归深层；`__MACOSX` / `.DS_Store` / `_updater_undo.json` 仍单独跳过。
 `retry_on_locked` 时用 `_wait_for_process_close()` / `_install_with_retry()` 每 3 秒重试，超时行按钮变「重试」，**不误标「已最新」**。任何异常回滚到备份，**绝不写 records、不标 latest**；撤销走 `undo_update()`，不要把 `_updater_undo.json` 拷回程序目录。
 
 ## 8. 关键不变量与已知坑（改动前必读）
@@ -139,6 +140,14 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 - 只改更新分支还不够：**升级前就已经是坏状态的用户不会被修复**。`_scan_release()` 里必须有「记录版本比标记新 → 清标记 + 用记录值」的自愈分支，也不用用户重新标记。
 - `set_manual_version()` 会被扫描 worker 线程调用（自愈）和主线程调用（右键标记），写配置必须走 `Engine._cfg_lock` 串行化。
 - 自愈的方向别写反：只有 `ver_gt(recorded, mv)` 才清；用户在程序外降级后手动标旧版本、或标记比记录新时，都要尊重标记。
+
+**更新策略（v1.6.13，四种模式别混淆）**
+- `INSTALL_MODES = (clean, overwrite, wipe, incremental)`，默认 `clean`（删除后覆盖）。`Engine.install_mode_for(name)` 是**唯一**的取值入口：先查 `cfg.install_mode_map[name.lower()]`，合法才用，否则回落到 `cfg.update.install_mode`。
+- `_install_with_retry()` 里 `mode` 只在进入时读一次，四种分支的消息文案各不相同，测试/日志按文案能区分。
+- `incremental_over()` 的语义是「**绝不删除任何文件**」：只写本地没有、或 `src mtime > dst mtime` 的文件，保留目录整棵跳过。别让它在任何分支里调用 `rmtree`/`os.remove`。
+- `preserve`（保留文件夹）只在 `clean` / `incremental` 下有意义；`overwrite` / `wipe` 忽略它，UI 也应把 chips 置灰（`StrategyPage._sync_mode_desc`）。
+- 「更新策略」现在是**独立侧边栏页**（`_NAV_ORDER = home/programs/strategy/settings`），设置页已移除该组。导航索引、快捷键、`_dev_shot` 都按 `_NAV_ORDER` 定位，**别再硬编码 index**。
+- 策略在更新时读 `cfg` 实时值，改完设置无需重扫即生效；单程序入口有两处（策略页清单下拉 + 程序行右键 `StrategyDialog`），改完都要 `page_strategy.set_items(self.items)` 刷新。
 
 **检查结果快照（`snapshot`）也会过期，别只修「读取」那条路**
 - 启动先离线铺列表：`_load_cached_items()` 调 `apply_snapshot()` 把 `records.snapshot` 套回界面；只有当天没检查过才联网重扫（`scan_pending()` 看 `mirrors.daily.scan`）。所以**更新成功若不刷新快照，且当天扫描闸门已满足，重启后一定会把刚装好的新版又显示成「待更新」**——v1.6.12 之前就栽在这。
@@ -187,3 +196,5 @@ python app.py --tray          # 后台静默启动（开机自启用这个）
 11. 保留名单改动是否仍只匹配第一层文件夹、不递归、不把同名文件当目录？默认值变化是否同步升 `config.version` 并写一次性迁移（用户自定义词不能被吞）？
 12. 设置页控件构造顺序变了之后，槽函数里访问后面才创建的控件是否都有 `hasattr` 守卫？
 13. 版本比对相关改动是否同时覆盖「更新成功时清标记」和「扫描时自愈存量标记」两条路径？
+14. 安装策略取值是否只走 `Engine.install_mode_for()`（单程序覆盖 > 全局）？四种模式的文案是否区分清楚、`incremental` 是否绝不删除文件？
+15. 页面/导航改动是否按 `_NAV_ORDER` 定位，而不是硬编码 stack index？切到策略页与右键改策略后是否 `set_items()` 刷新了清单？

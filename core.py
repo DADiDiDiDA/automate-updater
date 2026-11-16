@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.12"
+APP_VERSION = "1.6.13"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -66,6 +66,26 @@ LEGACY_DEFAULT_PRESERVE = {"user", "config", "configs", "data", "saves", "save",
 # v1.6.10 的默认保留名单，用于 v4 → v5 一次性迁移（删掉被词根覆盖的 configs / saves）
 V4_DEFAULT_PRESERVE = {"user", "config", "configs", "saves", "save",
                        "profiles", "settings"}
+
+# 更新时的文件替换策略（全局默认 + 单程序可覆盖）。
+#   clean       删除后覆盖：删掉保留名单以外的旧文件，再解压新版（默认）
+#   overwrite   直接覆盖：保留全部旧文件，只用新版同名文件替换
+#   wipe        先清空再解压：整个程序目录先清空（连配置/存档也不留），再解压新版
+#   incremental 仅增量覆盖：只写入本地没有或比本地新的文件，从不删除任何东西
+INSTALL_MODES = ("clean", "overwrite", "wipe", "incremental")
+DEFAULT_INSTALL_MODE = "clean"
+INSTALL_MODE_LABELS = {
+    "clean": "删除后覆盖",
+    "overwrite": "直接覆盖",
+    "wipe": "先清空再解压",
+    "incremental": "仅增量覆盖",
+}
+INSTALL_MODE_HINTS = {
+    "clean": "删掉保留名单以外的旧文件，再解压新版（默认，推荐）",
+    "overwrite": "保留全部旧文件，只用新版同名文件替换",
+    "wipe": "先清空整个程序目录（连配置/存档也不留）再解压，慎用",
+    "incremental": "只写入比本地新的文件，从不删除任何东西",
+}
 
 DEFAULT_MIRRORS = [
     "https://gh-proxy.com/",
@@ -152,6 +172,7 @@ def default_config() -> dict:
                    "depth": 4, "enabled": True}],
         "preserve": list(DEFAULT_PRESERVE),
         "preserve_map": {},                    # 程序名(小写) → {"custom": True, "list": [...]}
+        "install_mode_map": {},                # 程序名(小写) → clean/overwrite/wipe/incremental（缺省跟随全局）
         "proxy_ports": list(DEFAULT_PROXY_PORTS),
         "proxy": {"mode": "auto", "url": ""},   # auto 自动探测 | manual 手动指定 | off 不用
         "manual_versions": {},                  # 程序名(小写) → 手动标记的本地版本
@@ -175,9 +196,9 @@ def default_config() -> dict:
             # 只用日期做闸门，当天做过就不再重复，避免每次开程序都把网络跑一遍。
             "daily": {},
         },
-        # clean 保留指定文件夹 | overwrite 直接覆盖
+        # install_mode：全局默认策略，见 INSTALL_MODES（默认 clean=删除后覆盖）
         # retry_on_locked：目标文件被其它进程占用时自动暂停并重试，而不是直接判失败
-        "update": {"timeout_min": 10, "install_mode": "clean",
+        "update": {"timeout_min": 10, "install_mode": DEFAULT_INSTALL_MODE,
                    "retry_on_locked": True, "retry_wait_min": 5},
         "background": {
             "close_to_tray": True,           # 关闭窗口时最小化到托盘
@@ -236,11 +257,22 @@ def _normalize(cfg: dict) -> dict:
         cfg["update"] = {}
     u = cfg["update"]
     u.setdefault("timeout_min", 10)
-    u.setdefault("install_mode", "clean")
+    u.setdefault("install_mode", DEFAULT_INSTALL_MODE)
     u.setdefault("retry_on_locked", True)
     u.setdefault("retry_wait_min", 5)
-    if u.get("install_mode") not in ("clean", "overwrite"):
-        u["install_mode"] = "clean"
+    if u.get("install_mode") not in INSTALL_MODES:
+        u["install_mode"] = DEFAULT_INSTALL_MODE
+    # 单程序安装策略：只保留合法键值，键统一小写，非法值直接丢弃（跟随全局）
+    mm = cfg.get("install_mode_map")
+    if not isinstance(mm, dict):
+        cfg["install_mode_map"] = {}
+    else:
+        clean_mm = {}
+        for k, v in mm.items():
+            key = str(k).strip().lower()
+            if key and v in INSTALL_MODES:
+                clean_mm[key] = v
+        cfg["install_mode_map"] = clean_mm
     try:
         u["timeout_min"] = max(1, int(u.get("timeout_min") or 10))
     except Exception:
@@ -1550,6 +1582,29 @@ class Engine:
         except Exception:
             pass
 
+    def install_mode_for(self, name: str) -> str:
+        """某程序更新时实际使用的策略：单程序覆盖优先，否则用全局默认。"""
+        override = (self.cfg.get("install_mode_map") or {}).get((name or "").lower())
+        if override in INSTALL_MODES:
+            return override
+        g = (self.cfg.get("update") or {}).get("install_mode", DEFAULT_INSTALL_MODE)
+        return g if g in INSTALL_MODES else DEFAULT_INSTALL_MODE
+
+    def set_install_mode(self, name: str, mode: str) -> None:
+        """写入单程序的更新策略；mode 为空或非法表示改回跟随全局。"""
+        key = (name or "").lower()
+        if not key:
+            return
+        mm = self.cfg.setdefault("install_mode_map", {})
+        if mode in INSTALL_MODES:
+            mm[key] = mode
+        else:
+            mm.pop(key, None)
+        try:
+            save_config(self.cfg)
+        except Exception:
+            pass
+
     # ---------- 排除文件夹 ----------
     def owner_root(self, path: str) -> dict | None:
         """找出某个路径属于哪个检查根目录（最长前缀匹配）。"""
@@ -1896,7 +1951,8 @@ class Engine:
     def _install_with_retry(self, it: Item, src_root: str, pr,
                             deadline: float, wait_end: float) -> str:
         """执行替换；遇到文件占用则暂停、等待、重试，直到释放 / 取消 / 超时。"""
-        overwrite = (self.cfg.get("update", {}).get("install_mode", "clean") == "overwrite")
+        # 单程序策略优先，否则用全局默认；读的是 cfg 实时值，改完设置无需重扫即生效
+        mode = self.install_mode_for(it.name)
         attempt = 0
         while True:
             attempt += 1
@@ -1906,9 +1962,16 @@ class Engine:
                 raise RuntimeError(f"更新超时（超过 {self.timeout_sec() // 60} 分钟），已中止")
             pr(0.8, "替换文件" if attempt == 1 else f"重试替换文件（第 {attempt} 次）")
             try:
-                if overwrite:
+                if mode == "overwrite":
                     copied = copy_over(src_root, it.path, [])
                     return f"已覆盖安装 {it.remote}（写入 {copied} 项）"
+                if mode == "wipe":
+                    removed, copied = clean_replace(src_root, it.path, [])
+                    return (f"已清空并安装 {it.remote}"
+                            f"（清理旧文件 {removed} 项，写入 {copied} 项）")
+                if mode == "incremental":
+                    copied = incremental_over(src_root, it.path, it.preserve)
+                    return f"已增量更新到 {it.remote}（写入 {copied} 项）"
                 removed, copied = clean_replace(src_root, it.path, it.preserve)
                 return f"已更新到 {it.remote}（清理旧文件 {removed} 项，写入 {copied} 项）"
             except Exception as e:
@@ -2678,6 +2741,49 @@ def clean_replace(src_root: str, dst: str, preserve) -> tuple[int, int]:
         msg = "旧文件清理失败 " + "；".join(failed[:3])
         raise (FileLockedError(msg) if locked else RuntimeError(msg))
     return removed, copied
+
+
+def incremental_over(src_root: str, dst: str, preserve) -> int:
+    """仅增量覆盖：只写入本地没有、或比本地更新的文件，**从不删除任何文件**。
+
+    保留名单里的顶层文件夹整个跳过；`__MACOSX` / `.DS_Store` / `_updater_undo.json`
+    也跳过。返回写入的文件数。失败按「占用 / 普通错误」分别抛 FileLockedError 或
+    RuntimeError，交给上层等待重试，绝不静默吞掉。
+    """
+    keywords = preserve_keywords(preserve)
+    skip = ("__MACOSX", ".DS_Store", "_updater_undo.json")
+    written = 0
+    failures: list[str] = []
+    locked = False
+    for dirpath, dirnames, filenames in os.walk(src_root):
+        rel_dir = os.path.relpath(dirpath, src_root)
+        parts = [] if rel_dir == "." else rel_dir.split(os.sep)
+        if parts and should_preserve(parts[0], True, keywords):
+            dirnames[:] = []          # 保留目录整棵跳过
+            continue
+        for fn in filenames:
+            if fn in skip:
+                continue
+            s = os.path.join(dirpath, fn)
+            rel = os.path.relpath(s, src_root)
+            d = os.path.join(dst, rel)
+            try:
+                if os.path.exists(d):
+                    try:
+                        if os.path.getmtime(s) <= os.path.getmtime(d) + 1e-6:
+                            continue          # 新版不比本地新，跳过
+                    except Exception:
+                        pass                  # 拿不到时间就照常写入，宁可覆盖也不漏装
+                os.makedirs(os.path.dirname(d) or dst, exist_ok=True)
+                shutil.copy2(s, d)
+                written += 1
+            except Exception as e:
+                failures.append(f"{rel}: {e}")
+                locked = locked or is_locked_error(e)
+    if failures:
+        msg = "写入失败 " + "；".join(failures[:3])
+        raise (FileLockedError(msg) if locked else RuntimeError(msg))
+    return written
 
 
 def backup_dir(target: str, app_name: str, keep: int) -> str:

@@ -797,6 +797,7 @@ class ProgramRow(QFrame):
     undo_requested = Signal(str)
     preserve_requested = Signal(str)
     asset_requested = Signal(str)
+    strategy_requested = Signal(str)
 
     def __init__(self, item, parent=None):
         super().__init__(parent)
@@ -1083,6 +1084,8 @@ class ProgramRow(QFrame):
         act_asset.setEnabled(it.kind != "git")
         act_preserve = m.addAction("更新时保留的文件夹…")
         act_preserve.setEnabled(it.kind != "git")
+        act_strategy = m.addAction("更新策略…")
+        act_strategy.setEnabled(it.kind != "git")
         m.addSeparator()
         act_open = m.addAction("打开所在文件夹")
         act_copy = m.addAction("复制文件夹路径")
@@ -1108,6 +1111,8 @@ class ProgramRow(QFrame):
             self.asset_requested.emit(it.key)
         elif act is act_preserve:
             self.preserve_requested.emit(it.key)
+        elif act is act_strategy:
+            self.strategy_requested.emit(it.key)
         elif act is act_open:
             self.open_requested.emit(it.key)
         elif act is act_copy:
