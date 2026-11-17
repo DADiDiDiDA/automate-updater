@@ -987,21 +987,22 @@ class ProgramRow(QFrame):
             else:
                 self.ver_lbl.setText("")
 
-        has_notes = bool(it.notes)
-        self.log_btn.setVisible(has_notes)
-        if not has_notes and self._expanded:
-            self.toggle_expand()
-        if has_notes:
-            head = it.notes.splitlines()[0].strip() if it.kind == "git" else ""
+        # v1.6.17：日志按钮始终显示，不再随 notes 有无而消失。
+        # notes 现在也存进快照，离线启动不会丢；确实没有更新说明时给个明确提示。
+        if it.notes:
             self.notes_title.setText(
                 f"更新日志 · {it.published}" if it.published and it.kind != "git"
                 else ("提交记录" if it.kind == "git" else "更新日志"))
-            self.notes_text.setPlainText(it.notes or "")
+            self.notes_text.setPlainText(it.notes)
             # 按行数给高度：短日志不再挤成两三行，长日志最多 520px 后内部滚动
-            lines = len((it.notes or "").splitlines())
+            lines = len(it.notes.splitlines())
             h = min(520, max(150, lines * 18 + 30))
-            self.notes_text.setMinimumHeight(h)
-            self.notes_text.setMaximumHeight(h)
+        else:
+            self.notes_title.setText("更新日志")
+            self.notes_text.setPlainText("暂无更新说明（联网检查后如有新版本会显示在这里）")
+            h = 74
+        self.notes_text.setMinimumHeight(h)
+        self.notes_text.setMaximumHeight(h)
 
         # 按钮状态
         if it.status == "unbound":
@@ -1073,9 +1074,7 @@ class ProgramRow(QFrame):
         act_bind = None
         if it.status == "unbound" or not it.repo:
             act_bind = m.addAction("绑定 GitHub 仓库…")
-        act_log = None
-        if it.notes:
-            act_log = m.addAction("收起更新日志" if self._expanded else "查看更新日志")
+        act_log = m.addAction("收起更新日志" if self._expanded else "查看更新日志")
         act_repo = m.addAction("在浏览器里打开 GitHub 仓库" if it.repo
                                else "打开 GitHub 仓库（未绑定）")
         act_repo.setEnabled(bool(it.repo))
@@ -1101,7 +1100,7 @@ class ProgramRow(QFrame):
             self.undo_requested.emit(it.key)
         elif act_bind is not None and act is act_bind:
             self.bind_requested.emit(it.key)
-        elif act_log is not None and act is act_log:
+        elif act is act_log:
             self.toggle_expand()
         elif act is act_repo:
             self.repo_requested.emit(it.key)

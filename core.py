@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.16"
+APP_VERSION = "1.6.17"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -1404,7 +1404,7 @@ class Engine:
     # ---------- 上次检查快照 ----------
     SNAP_FIELDS = ("status", "local", "remote", "detail", "published", "local_manual",
                    "local_size", "asset", "asset_size", "asset_digest", "download_url",
-                   "anchor", "updated_at")
+                   "anchor", "updated_at", "notes")
 
     def save_snapshot(self, items) -> None:
         """把本次检查结果存下来：当天不再重复联网时，界面仍显示上次的结论。"""
