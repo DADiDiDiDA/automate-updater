@@ -1049,6 +1049,44 @@ class NodesDialog(ThemedDialog):
         self._rebuild()
 
 
+class ChangelogDialog(ThemedDialog):
+    """版本日志：把打包进去的 update.md 原样显示出来，可滚动、可全选复制。"""
+
+    def __init__(self, parent, text: str = "", path: str = ""):
+        super().__init__(parent, "版本日志", 760)
+        self.body.addWidget(_label(
+            "从新到旧记录每个版本的改动；这里显示的是随程序打包的快照，"
+            "仓库里的最新版请见 GitHub 上的 update.md。",
+            11, "text_muted", wrap=True))
+        if not text and path:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except Exception as e:
+                text = f"（读取版本日志失败：{e}）"
+        tp = THEME.p
+        self.view = QPlainTextEdit(text or "（暂无版本日志）")
+        self.view.setReadOnly(True)
+        self.view.setMinimumHeight(460)
+        f = QFont("Consolas")
+        f.setPixelSize(12)
+        self.view.setFont(f)
+        self.view.setStyleSheet(
+            f"QPlainTextEdit{{background:{rgba(tp.text, 0.05 if tp.dark else 0.04)};"
+            f"border:1px solid {rgba(tp.border, 0.18)};border-radius:10px;"
+            f"color:{tp.text};padding:10px;}}")
+        self.body.addWidget(self.view, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        close = QPushButton("关闭")
+        close.setObjectName("ghost")
+        close.setCursor(Qt.PointingHandCursor)
+        close.setFixedHeight(32)
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        self.body.addLayout(row)
+
+
 class VersionDialog(ThemedDialog):
     """手动标记本地版本：程序目录里读不到版本号时用它兜底比对。"""
 
@@ -1278,6 +1316,7 @@ class SettingsPage(QWidget):
     nodes_view_requested = Signal()
     autostart_requested = Signal(bool)
     proxy_changed = Signal()
+    changelog_requested = Signal()
 
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
@@ -1888,6 +1927,8 @@ class SettingsPage(QWidget):
     def _build_about(self, lay: QVBoxLayout) -> None:
         self._group(lay, "关于")
         self._row(lay, "info", f"{core.APP_NAME}", f"版本 v{core.APP_VERSION}")
+        self._row(lay, "apps", "版本日志", "查看本程序从首个版本到现在的完整更新记录",
+                  self._small_btn("查看", self.changelog_requested.emit))
         self._row(lay, "folder", "配置目录", core.config_dir(),
                   self._small_btn("打开", lambda: core.open_in_explorer(core.config_dir())))
         self._row(lay, "save", "备份目录", "覆盖前的旧版本都留在这里",

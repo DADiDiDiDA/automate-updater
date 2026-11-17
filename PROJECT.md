@@ -190,6 +190,7 @@ python app.py --tray          # 后台静默启动（开机自启用这个）
 ```
 
 - `.gitignore` 排除 `build/` `dist/` `dist_new/` `_test/` `config.json` `records.json` `crash.log` 与开发截图。
+- 版本日志：`update.md` 随 exe 打包（`spec` 的 `datas` 里 `('update.md', '.')`），「设置 → 关于 → 版本日志」走 `MainWindow._view_changelog()` → `ChangelogDialog`，用 `resource_path("update.md")` 读打包快照；源码直接跑时退回同目录的 `update.md`。新增日志条目只需改 `update.md`，不用改 UI。
 - 验证脚本放 `_test/`（不入库），命名惯例 `verify_au_v<版本>.py`；核心逻辑改动优先补纯 Python 断言，UI 改动再补离屏冒烟。
 - 真机验证过的关键路径：`daily_bootstrap` 全流程（88 条候选中 44 条可用，约 20s）、138MB 资产下载 + 校验 + 进度不回退（约 18s）。
 - 提交前确认：`config.json` / `records.json` 没被带上、没有真实凭证、版本号与 `core.APP_VERSION` 一致、`crash.log` 无新增异常。
@@ -214,3 +215,4 @@ python app.py --tray          # 后台静默启动（开机自启用这个）
 16. 检查调度改动是否仍遵守「并发上限 + 错峰提交 + 只重试 error + 停止立即中断」？重试回调有没有把进度计数冲掉？
 17. 保留名单默认值变化时是否同步升 `config.version` 并写一次性迁移，且没有改写用户自定义词（含大小写不同的变体）？
 18. CLI 改动是否仍保持「忙时排队不并发、转发去掉 quit_after、无指令不改变原流程」？带任务指令是否绕开了「当天已检查」闸门？
+19. 新增随程序打包的资源（如 `update.md`）是否同步加进 `.spec` 的 `datas`？关于页入口在源码运行和打包运行两种情况下是否都能读到内容？

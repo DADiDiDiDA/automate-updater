@@ -24,9 +24,9 @@ from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineE
 import core
 import autostart
 from backdrop import BACKDROP
-from pages import (HomePage, ItemListView, MirrorDialog, NodesDialog, PreserveDialog,
-                   SettingsPage, StrategyDialog, StrategyPage, ThemedDialog, VersionDialog,
-                   _label)
+from pages import (ChangelogDialog, HomePage, ItemListView, MirrorDialog, NodesDialog,
+                   PreserveDialog, SettingsPage, StrategyDialog, StrategyPage, ThemedDialog,
+                   VersionDialog, _label)
 from theme import GLYPH, THEME, build_qss, glyph_font, qc, rgba, scoped, tint
 from tray import TrayIcon
 from widgets import NavButton, Toast
@@ -735,6 +735,20 @@ class MainWindow(QWidget):
         page.nodes_view_requested.connect(self._view_nodes)
         page.proxy_changed.connect(self._on_proxy_changed)
         page.mirrors_changed.connect(self._on_mirrors_changed)
+        page.changelog_requested.connect(self._view_changelog)
+
+    def _view_changelog(self) -> None:
+        """设置 → 关于 → 版本日志：显示随程序打包的 update.md。"""
+        text = ""
+        for p in (resource_path("update.md"),
+                  os.path.join(os.path.dirname(resource_path("app.py")), "update.md")):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    text = f.read()
+                break
+            except Exception:
+                continue
+        ChangelogDialog(self, text).exec()
 
     def _on_mirrors_changed(self) -> None:
         # 镜像总开关/每日测速开关变了：清掉缓存镜像，下次检查按新设置重新走
