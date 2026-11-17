@@ -464,9 +464,16 @@ class AssetDialog(ThemedDialog):
 # ---------------------------------------------------------------- 主窗口
 
 class MainWindow(QWidget):
-    def __init__(self, start_hidden: bool = False):
+    def __init__(self, start_hidden: bool = False, cli: dict | None = None):
         super().__init__()
         self.cfg = core.load_config()
+        # 命令行指令：--check / --update / --notify / --quit-after / --show。
+        # 单实例转发来的指令会覆盖这里的 _cli，见 _dispatch_cli()。
+        self._cli: dict = dict(cli or {})
+        self._cli_active = False
+        self._cli_pending: dict | None = None
+        self._cli_wait_update = False
+        self._cli_summary: dict = {}
         THEME.set_preset(self.cfg.get("ui", {}).get("preset", "acrylic"))
         THEME.set_mode(self.cfg.get("ui", {}).get("theme", "auto"))
         THEME.set_blur(bool(self.cfg.get("ui", {}).get("blur", True)))
@@ -530,7 +537,11 @@ class MainWindow(QWidget):
         shot = os.environ.get("AM_SHOT", "").strip()
         if shot:
             QTimer.singleShot(2600, lambda: self._dev_shot(shot))
-        if not start_hidden:
+        if self._cli.get("check") or self._cli.get("update") or self._cli.get("notify"):
+            # 带任务指令时不能再走「今天已检查就跳过」的启动流程：计划任务要的是
+            # 每次都真的查一遍（--notify 单独使用则直接播报当前缓存的结论）。
+            QTimer.singleShot(300, self._run_cli_action)
+        elif not start_hidden:
             QTimer.singleShot(600, lambda: self._startup_check(silent=False))
         else:
             # 后台启动：稍等片刻再静默检查，避免和开机时的磁盘/网络高峰抢资源
@@ -1111,6 +1122,91 @@ class MainWindow(QWidget):
         if not done:
             self.tray and self.tray.notify(title, body)
 
+    # ---------- 命令行指令（--check / --update / --notify / --quit-after） ----------
+    def _run_cli_action(self) -> None:
+        """执行一次命令行任务；已有任务在跑就先排队，不并发抢同一批 items。"""
+        cli = dict(self._cli or {})
+        if not (cli.get("check") or cli.get("update") or cli.get("notify")):
+            return
+        if ((self.scan_worker and self.scan_worker.isRunning()) or
+                (self.update_worker and self.update_worker.isRunning()) or
+                (self._undo_worker and self._undo_worker.isRunning())):
+            self._cli_pending = cli
+            return
+        self._cli = cli
+        self._cli_active = True
+        self._cli_summary = {}
+        self._cli_wait_update = bool(cli.get("update"))
+        if cli.get("check") or cli.get("update"):
+            self.start_scan(silent=True)
+            if not (self.scan_worker and self.scan_worker.isRunning()):
+                self._cli_summary = {"title": "检查未启动",
+                                     "body": "没有找到可检查的程序，或当前有任务占用"}
+                self._cli_finish()
+        else:
+            self._cli_notify_only()
+
+    def _cli_notify_only(self) -> None:
+        """--notify 单独使用：播报当前缓存的结论，不联网。"""
+        if not self.items:
+            self._load_cached_items()
+        upd = [i for i in self.items
+               if i.status == "update" or (i.status == "unknown" and i.scanned)]
+        errs = [i for i in self.items if i.status == "error"]
+        names = "、".join(i.name for i in upd[:6]) + ("…" if len(upd) > 6 else "")
+        body = f"待更新 {len(upd)} 个" + (f"：{names}" if names else "")
+        if errs:
+            body += f"\n检查失败 {len(errs)} 个"
+        self._cli_summary = {"title": "Automate 状态", "body": body}
+        self._cli_finish()
+
+    def _cli_on_scan_done(self, items) -> bool:
+        """检查完成后的 CLI 分支；返回 True 表示已接管，不再走普通后台逻辑。"""
+        if not self._cli_active:
+            return False
+        upd = [i for i in items
+               if i.status == "update" or (i.status == "unknown" and i.scanned)]
+        errs = [i for i in items if i.status == "error"]
+        if self._cli_wait_update and upd:
+            self._cli_wait_update = False
+            self._cli_summary = {"title": "检查完成",
+                                 "body": f"发现 {len(upd)} 个待更新，正在更新"}
+            self._start_update(upd, background=True)
+            return True
+        self._cli_summary = {
+            "title": "检查完成",
+            "body": f"待更新 {len(upd)} 个" + (f"，检查失败 {len(errs)} 个" if errs else ""),
+        }
+        self._cli_finish()
+        return True
+
+    def _cli_finish(self) -> None:
+        """收尾：按 --notify 通知一次，按 --quit-after 退出，再执行排队的指令。"""
+        if not getattr(self, "_cli_active", False):
+            return
+        summary = self._cli_summary or {"title": "指令执行完成", "body": ""}
+        want_notify = bool(self._cli.get("notify"))
+        quit_after = bool(self._cli.get("quit_after"))
+        self._cli_active = False
+        self._cli_wait_update = False
+        if want_notify:
+            try:
+                self._notify(summary.get("title", "Automate 指令执行完成"),
+                             summary.get("body", ""))
+            except Exception:
+                pass
+        # 二次实例转发的指令不带 quit_after，常驻实例不会被计划任务退掉
+        if quit_after:
+            QTimer.singleShot(400, self.quit_app)
+        self._drain_cli_pending()
+
+    def _drain_cli_pending(self) -> None:
+        pending = self._cli_pending
+        self._cli_pending = None
+        if pending:
+            self._cli = pending
+            QTimer.singleShot(0, self._run_cli_action)
+
     def _set_autostart(self, on: bool) -> None:
         ok = autostart.set_enabled(bool(on), silent=True)
         self.cfg.setdefault("background", {})["run_at_startup"] = bool(on and ok)
@@ -1311,6 +1407,9 @@ class MainWindow(QWidget):
             self.tray.set_busy(False)
             self.tray.set_tooltip(self.engine.records.get("last_scan", ""), len(upd))
         self._update_brand()
+        # 命令行任务自行决定通知/更新/退出，不走下面的普通后台自动更新分支
+        if self._cli_on_scan_done(items):
+            return
         if not getattr(self, "_scan_silent", False):
             # 同一 release 里有多个安装包：先问清楚要哪一个，避免按体积猜错
             choose = [i for i in self.items if i.status == "choose"]
@@ -1563,6 +1662,11 @@ class MainWindow(QWidget):
         bad = sum(1 for i in all_items if i.state == "failed")
         detail = "\n".join(f"- {i.name}：{i.detail}" for i in all_items[:20])
         body = f"成功 {ok} 个" + (f"，失败 {bad} 个" if bad else "") + "\n" + detail
+        # 命令行任务由 _cli_finish 按 --notify 统一播报一次，不走下面的自动通知
+        if self._cli_active:
+            self._cli_summary = {"title": "Automate 更新完成", "body": body}
+            self._cli_finish()
+            return
         # 手动更新和后台更新统一走 _notify，遵守设置里的通知方式
         mode = self.cfg.get("background", {}).get("auto_mode", "off")
         if background:
@@ -1789,7 +1893,26 @@ def resource_path(name: str) -> str:
 
 def main() -> int:
     args = [a.lower() for a in sys.argv[1:]]
-    start_hidden = any(a in ("--tray", "--silent", "--background", "-t") for a in args)
+    if "--help" in args or "-h" in args:
+        print("用法: AutomateUpdater.exe [选项]\n"
+              "  --check       启动后立即检查一次版本（不受「当天已检查」限制）\n"
+              "  --update      检查完自动更新全部待更新程序（已包含 --check）\n"
+              "  --notify      完成后按设置的方式播报结果；单独使用则播报当前状态\n"
+              "  --quit-after  任务完成后自动退出（配合计划任务；转发给常驻实例时忽略）\n"
+              "  --hidden      后台静默启动，不显示窗口（别名 --tray / --silent / -t）\n"
+              "  --show        把已运行实例的主窗口叫到前台（优先于 --hidden）\n"
+              "  --help        显示本帮助\n"
+              "示例: AutomateUpdater.exe --update --notify --quit-after --hidden\n"
+              "      AutomateUpdater.exe --show")
+        return 0
+    show = "--show" in args
+    start_hidden = (any(a in ("--tray", "--silent", "--background", "--hidden", "-t")
+                        for a in args) and not show)
+    cli = {"check": "--check" in args,
+           "update": "--update" in args,
+           "notify": "--notify" in args,
+           "quit_after": "--quit-after" in args,
+           "show": show}
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
@@ -1831,7 +1954,8 @@ def main() -> int:
         # 否则 --tray 二次启动反而把主窗口弹到前台
         try:
             probe.write(json.dumps({"show": not start_hidden,
-                                    "hidden": start_hidden}).encode("utf-8"))
+                                    "hidden": start_hidden,
+                                    "cli": cli}).encode("utf-8"))
             probe.flush()
             probe.waitForBytesWritten(400)
         except Exception:
@@ -1846,7 +1970,7 @@ def main() -> int:
         print(f"无法建立单实例服务：{server.errorString()}", file=sys.stderr)
         return 0
 
-    win = MainWindow(start_hidden=start_hidden)
+    win = MainWindow(start_hidden=start_hidden, cli=cli)
 
     def _on_second_instance() -> None:
         while server.hasPendingConnections():
@@ -1862,7 +1986,16 @@ def main() -> int:
                 except Exception:
                     return                  # 分包没收齐
                 st["done"] = True
-                if isinstance(payload, dict) and (payload.get("show") or not payload.get("hidden")):
+                if not isinstance(payload, dict):
+                    return
+                c = dict(payload.get("cli") or {})
+                # 二次启动只是把任务交给常驻实例，不能让计划任务的 --quit-after
+                # 把常驻托盘一起退掉（与日常检查器的转发语义一致）
+                c.pop("quit_after", None)
+                if c.get("check") or c.get("update") or c.get("notify"):
+                    win._cli = c
+                    QTimer.singleShot(0, win._run_cli_action)
+                if payload.get("show") or not payload.get("hidden"):
                     win.show_main()
 
             def _try_parse(st):
@@ -1875,7 +2008,16 @@ def main() -> int:
                 except Exception:
                     return
                 st["done"] = True
-                if isinstance(payload, dict) and (payload.get("show") or not payload.get("hidden")):
+                if not isinstance(payload, dict):
+                    return
+                c = dict(payload.get("cli") or {})
+                # 二次启动只是把任务交给常驻实例，不能让计划任务的 --quit-after
+                # 把常驻托盘一起退掉（与日常检查器的转发语义一致）
+                c.pop("quit_after", None)
+                if c.get("check") or c.get("update") or c.get("notify"):
+                    win._cli = c
+                    QTimer.singleShot(0, win._run_cli_action)
+                if payload.get("show") or not payload.get("hidden"):
                     win.show_main()
 
             def _on_disconnect(c=conn, st=state):

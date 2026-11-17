@@ -155,6 +155,13 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 - 重试只在 `_scan_with_retry()` 里做一次包裹，**不要**在 `_scan_git` / `_scan_release` 内部再加重试，否则次数会翻倍；`choose` / `unknown` / `latest` 等状态都不重试。
 - `DEFAULT_PRESERVE` 用「词根」`setting` 后，`settings` 由模糊匹配自动覆盖（`should_preserve()` 不区分大小写、只匹配第一层文件夹）；迁移只认**小写等于 settings** 的旧默认值，别把用户自定义的 `my_settings` 也改掉。
 
+**命令行指令（v1.6.15）**
+- `main()` 解析 `sys.argv`：`--check` / `--update` / `--notify` / `--quit-after` / `--hidden`（别名 `--tray`/`--silent`/`--background`/`-t`）/ `--show` / `--help`。`--show` 优先于 hidden；`--update` 已包含 `--check` 语义。
+- 带任务指令时 `MainWindow.__init__` 走 `_run_cli_action()`，**不要**再走 `_startup_check()` 的「今天已检查就跳过」闸门，否则计划任务会静默失效。
+- 执行链：`_run_cli_action()` → `start_scan(silent=True)` → `_cli_on_scan_done()` →（`--update` 时 `_start_update(background=True)`）→ `_on_update_all_done()` → `_cli_finish()`。`_cli_finish()` 按 `--notify` 通知一次、按 `--quit-after` 退出，并 `_drain_cli_pending()` 跑下一条排队指令。
+- 忙时（扫描/更新/撤销在跑）新指令存 `_cli_pending`，**不能并发启动第二个 worker**；二次实例转发的 IPC 负载是 `{show, hidden, cli}`，转发前必须 `c.pop("quit_after", None)`，否则常驻托盘会被计划任务退掉。
+- CLI 分支在 `_on_scan_finished()` / `_on_update_all_done()` 里提前 return，普通后台自动更新与 `_notify` 去重逻辑不受影响；无指令时所有 `_cli_*` 标志保持 False。
+
 **检查结果快照（`snapshot`）也会过期，别只修「读取」那条路**
 - 启动先离线铺列表：`_load_cached_items()` 调 `apply_snapshot()` 把 `records.snapshot` 套回界面；只有当天没检查过才联网重扫（`scan_pending()` 看 `mirrors.daily.scan`）。所以**更新成功若不刷新快照，且当天扫描闸门已满足，重启后一定会把刚装好的新版又显示成「待更新」**——v1.6.12 之前就栽在这。
 - 两处都要刷新快照：① `apply_snapshot()` 用 `records.versions`（更新后的权威版本）纠正过期快照项（记录版本比快照本地版本新即以「已更新」处理，并立刻 `save_snapshot()` 回写）；② 更新收尾 `_on_update_all_done()` 调 `save_snapshot(self.items)` 持久化最新结果。
@@ -206,3 +213,4 @@ python app.py --tray          # 后台静默启动（开机自启用这个）
 15. 页面/导航改动是否按 `_NAV_ORDER` 定位，而不是硬编码 stack index？切到策略页与右键改策略后是否 `set_items()` 刷新了清单？
 16. 检查调度改动是否仍遵守「并发上限 + 错峰提交 + 只重试 error + 停止立即中断」？重试回调有没有把进度计数冲掉？
 17. 保留名单默认值变化时是否同步升 `config.version` 并写一次性迁移，且没有改写用户自定义词（含大小写不同的变体）？
+18. CLI 改动是否仍保持「忙时排队不并发、转发去掉 quit_after、无指令不改变原流程」？带任务指令是否绕开了「当天已检查」闸门？

@@ -8,7 +8,7 @@
 | --- | --- |
 | 平台 | Windows 10 / 11 |
 | 技术栈 | Python 3 · PySide6 · pillow · PyInstaller（单文件 exe，便携） |
-| 当前版本 | **v1.6.14** |
+| 当前版本 | **v1.6.15** |
 | 仓库 | [DADiDiDiDA/automate-updater](https://github.com/DADiDiDiDA/automate-updater) |
 | 外部依赖 | `git`（仓库类程序）、`7-Zip` 或 `py7zr`（`.7z` 包） |
 
@@ -122,11 +122,33 @@
 
 | 快捷键 | 作用 |
 | --- | --- |
-| `Ctrl+1 / 2 / 3` | 首页 / 程序 / 设置 |
+| `Ctrl+1 / 2 / 3 / 4` | 首页 / 程序 / 更新策略 / 设置 |
 | `F5` | 重新检查 |
 | 右键列表行 | 更新 / 撤销 / 绑定仓库 / 打开 GitHub 仓库 / 手动标记版本 / 下载文件筛选 / 保留文件夹 / 排除文件夹 |
 
 双击列表某一行 = 打开该程序所在文件夹。
+
+## 命令行参数
+
+和日常检查器共用一套常用指令，方便计划任务 / 快捷方式调用：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--check` | 立即联网检查一次版本（不受「当天已检查」限制） |
+| `--update` | 检查完自动更新全部待更新程序（已包含 `--check`） |
+| `--notify` | 完成后按设置里的方式（系统通知 / 钉钉 / 弹窗）播报一次；单独使用则播报当前缓存的状态，不联网 |
+| `--quit-after` | 任务完成后自动退出（配合计划任务） |
+| `--hidden` / `--tray` / `--silent` / `--background` / `-t` | 后台静默启动，不显示主窗口 |
+| `--show` | 把已运行实例的主窗口叫到前台（优先于 `--hidden`） |
+| `--help` / `-h` | 打印参数说明 |
+
+```powershell
+AutomateUpdater.exe --check --notify --quit-after --hidden
+AutomateUpdater.exe --update --notify --quit-after --hidden
+AutomateUpdater.exe --show
+```
+
+常驻托盘时再次带参数启动，任务会转交给已运行的实例执行；`--quit-after` 只影响本次指令，不会把常驻实例退掉。忙时转发的指令会排队，不会并发抢同一批程序。
 
 ## 配置与数据文件（便携）
 
