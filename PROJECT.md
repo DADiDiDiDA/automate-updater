@@ -217,3 +217,13 @@ python app.py --tray          # 后台静默启动（开机自启用这个）
 18. CLI 改动是否仍保持「忙时排队不并发、转发去掉 quit_after、无指令不改变原流程」？带任务指令是否绕开了「当天已检查」闸门？
 19. 新增随程序打包的资源（如 `update.md`）是否同步加进 `.spec` 的 `datas`？关于页入口在源码运行和打包运行两种情况下是否都能读到内容？
 20. 改动 `Item` 字段或 `SNAP_FIELDS` 后，离线启动（`apply_snapshot`）能否还原新字段？需要常显的按钮是否被 `setVisible(bool(...))` 藏掉？
+
+## 11. v1.6.18 全量核查补记
+
+- **`save_config` 必须串行化**：UI 线程与后台线程（每日流程 / `set_manual_version`）都会写，固定 `.tmp` 名会互相截断，半截 JSON 被 `os.replace` 成正式文件后，下次启动静默回落默认配置。加模块级 `RLock` + 按 pid 命名临时文件；解析失败另存 `.corrupt`。
+- **`dlcache` 有生命周期**：整包只在成功路径删除，失败/取消分支会长留。`cleanup_dlcache(keep_days=7, max_bytes=2GB)` 在启动时后台跑。
+- **增量覆盖依赖 mtime**：`_extract_zip` 必须还原 `info.date_time`，否则解出的文件永远比本地「新」，`incremental` 退化成全量覆盖。
+- **版本解析要容错**：tag 可能带前缀（`M9A-v1.2.3`）与 `+build`；预发布段按 `.` 拆分后数字段按值、字母段按字典序比较（`beta.10 > beta.2`），不能直接比字符串。
+- **资产选择先看架构**：`-win-arm64` 往往体积最大，只按体积会选错；先排除 arm64、优先明确 x64 的包。
+- **快照要跟着状态走**：撤销更新后必须 `save_snapshot()`，否则当天不再联网，重启按旧快照显示「已最新」。
+- **备份元数据不进程序目录**：`_updater_manifest.json` 要加进 `copy_over` / `incremental_over` 的跳过列表。
