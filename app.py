@@ -1760,6 +1760,13 @@ class MainWindow(QWidget):
         self.page_home.update_item(it)
         self.progs_list.update_item(it)
         self.page_home.refresh_stats()
+        if ok:
+            # 撤销把本地版本退回去了，但快照里还是「已最新」——当天不会再联网，
+            # 重启后 apply_snapshot 按旧快照显示，用户就再也收不到这一版的更新提示。
+            try:
+                self.engine.save_snapshot(self.items)
+            except Exception:
+                pass
 
     def edit_preserve(self, key: str) -> None:
         """右键「更新时保留的文件夹」：按程序单独指定覆盖安装时保留的目录。"""
@@ -1976,6 +1983,14 @@ def main() -> int:
             pass
         probe.disconnectFromServer()
         return 0
+
+    # 后台清理下载缓存：解压失败/取消/占用超时这些分支不会删整包，
+    # dlcache 里几百 MB 的 zip 和 .part 会一直堆着
+    try:
+        import threading
+        threading.Thread(target=core.cleanup_dlcache, daemon=True).start()
+    except Exception:
+        pass
 
     QLocalServer.removeServer(ipc_key)            # 清理上次异常退出留下的名字
     server = QLocalServer()

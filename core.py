@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -37,7 +38,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.17"
+APP_VERSION = "1.6.18"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -174,6 +175,44 @@ def config_dir() -> str:
 
 def config_path() -> str:
     return os.path.join(config_dir(), "config.json")
+
+
+def cleanup_dlcache(keep_days: int = 7, max_bytes: int = 2 * 1024 ** 3) -> int:
+    """清理下载缓存（dlcache）：返回释放的字节数。
+
+    `.part` 断点和整包只在成功更新后才会被删；解压失败、锚点不符、备份失败、
+    用户取消这些分支都直接 return，压缩包（几百 MB 到 GB）就一直留着。
+    启动时按「超过保留期」+「总量超上限」两条规则清理；正在下载时不会调用。
+    """
+    cache = os.path.join(config_dir(), "dlcache")
+    if not os.path.isdir(cache):
+        return 0
+    now = time.time()
+    files = []
+    try:
+        for n in os.listdir(cache):
+            p = os.path.join(cache, n)
+            try:
+                if os.path.isfile(p):
+                    st = os.stat(p)
+                    files.append((p, st.st_size, st.st_mtime))
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    freed = 0
+    total = sum(f[1] for f in files)
+    for p, size, mtime in sorted(files, key=lambda f: f[2]):
+        expired = keep_days > 0 and (now - mtime) > keep_days * 86400
+        if not expired and total <= max_bytes:
+            continue
+        try:
+            os.remove(p)
+            freed += size
+            total -= size
+        except OSError:
+            continue
+    return freed
 
 
 def default_config() -> dict:
@@ -640,7 +679,11 @@ def load_config() -> dict:
                 else:
                     cfg[k] = v
         except Exception:
-            pass
+            # 留个现场再回落默认值：否则用户只会看到"设置全没了"
+            try:
+                shutil.copy2(p, p + ".corrupt")
+            except Exception:
+                pass
     # 首次运行迁移旧版 CLI 配置
     if not os.path.exists(p):
         legacy = r"D:\Automate\_updater\config.json"
@@ -660,12 +703,19 @@ def load_config() -> dict:
     return _normalize(cfg)
 
 
+# 配置写盘会被 UI 线程（开关/换肤）和后台线程（每日流程、扫描记录）同时调用。
+# 共用一个临时文件名时，两边会互相截断，甚至把半截 JSON 换成正式文件——
+# 下次启动解析失败就静默回落到默认配置，用户的检查目录/镜像/钉钉配置全丢。
+_CFG_LOCK = threading.RLock()
+
+
 def save_config(cfg: dict) -> None:
-    os.makedirs(config_dir(), exist_ok=True)
-    tmp = config_path() + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, config_path())
+    with _CFG_LOCK:
+        os.makedirs(config_dir(), exist_ok=True)
+        tmp = "%s.%d.tmp" % (config_path(), os.getpid())
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, config_path())
 
 
 # ==================================================================== 网络
@@ -1073,9 +1123,17 @@ def _verify_digest(path: str, sha256: str) -> bool:
 # ==================================================================== 版本工具
 
 def _ver_parts(s: str):
-    """解析版本为 (数字元组, 预发布标识或 None)。解析失败返回 (None, None)。"""
+    """解析版本为 (数字元组, 预发布标识或 None)。解析失败返回 (None, None)。
+
+    兼容三种常见写法：
+      * `M9A-v1.2.3` / `release-1.2.3` —— 自定义仓库的 tag 常带前缀，以前整条解析失败
+        → ver_gt 恒 False → 该程序永远显示「已最新」，再也不提示更新；
+      * `1.2.3+build.7` —— 语义化版本的构建元数据，不参与比较，直接截掉；
+      * `1.2.3-beta.10` —— 预发布段按数字/字母分别比较（见 _pre_key）。
+    """
     s = (s or "").strip().lstrip("vV")
-    m = re.match(r"^(\d+(?:\.\d+)*)(?:[-_.]?([A-Za-z0-9][A-Za-z0-9_.-]*))?$", s)
+    s = s.split("+", 1)[0]
+    m = re.search(r"(\d+(?:\.\d+)*)(?:[-_.]?([A-Za-z0-9][A-Za-z0-9_.-]*))?$", s)
     if not m:
         return None, None
     try:
@@ -1109,7 +1167,21 @@ def ver_gt(a: str, b: str) -> bool:
         return True          # a 是正式版，b 是预发布 → a 更新
     if pa is not None and pb is None:
         return False
-    return pa > pb
+    return _pre_key(pa) > _pre_key(pb)
+
+
+def _pre_key(pre: str):
+    """预发布标识排序键：数字段按数值、字母段按字典序，数字段排在字母段之前。
+
+    直接比字符串会把 beta.10 判成比 beta.2 旧（"1" < "2"），于是 rc.10 永远不提示。
+    """
+    out = []
+    for part in re.split(r"[._-]", pre or ""):
+        if part.isdigit():
+            out.append((0, int(part), ""))
+        else:
+            out.append((1, 0, part.lower()))
+    return out
 
 
 
@@ -2518,6 +2590,15 @@ def read_local_version(target: str, spec: dict, name: str, records: dict, record
 _ARC_RE = re.compile(r"\.(zip|7z)$", re.I)
 _SKIP_ASSET_RE = re.compile(r"(source|sha256|checksum|symbol)", re.I)
 _WIN_ASSET_RE = re.compile(r"(win|x64|x86_64|windows)", re.I)
+_ARM_RE = re.compile(r"(arm64|aarch64)", re.I)
+_X64_RE = re.compile(r"(x64|x86_64|amd64|win64)", re.I)
+
+
+def _host_is_x64() -> bool:
+    try:
+        return platform.machine().lower() in ("amd64", "x86_64")
+    except Exception:
+        return True
 
 
 def asset_candidates(assets) -> list:
@@ -2534,6 +2615,15 @@ def asset_candidates(assets) -> list:
         return []
     win = [a for a in arcs if _WIN_ASSET_RE.search(a.get("name", ""))]
     pool = win or arcs
+    # 先按架构收窄：同一 release 同时发 -win-arm64 / -win-x64 / -win-x86 时，
+    # 只按体积会挑到 arm64 包（往往最大），装完 exe 直接起不来。
+    if _host_is_x64():
+        no_arm = [a for a in pool if not _ARM_RE.search(a.get("name", ""))]
+        if no_arm:
+            pool = no_arm
+        named64 = [a for a in pool if _X64_RE.search(a.get("name", ""))]
+        if named64:
+            pool = named64
     return sorted(pool, key=lambda a: -int(a.get("size") or 0))
 
 
@@ -2669,6 +2759,13 @@ def _extract_zip(archive: str, dest: str) -> bool:
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 with z.open(info) as src, open(target, "wb") as out:
                     shutil.copyfileobj(src, out, 256 * 1024)
+                # 还原压缩包里记录的时间：解压出来的 mtime 恒为"现在"，
+                # 会让「仅增量覆盖」判定每个文件都比本地新 → 退化成全量覆盖。
+                try:
+                    ts = time.mktime(tuple(info.date_time) + (0, 0, -1))
+                    os.utime(target, (ts, ts))
+                except Exception:
+                    pass
             return True
     except Exception:
         return False
@@ -2743,7 +2840,8 @@ def copy_over(src_root: str, dst: str, preserve) -> int:
     n = 0
     for name in os.listdir(src_root):
         # _updater_undo.json 是备份目录里的内部元数据，不能随撤销拷回程序目录
-        if name in ("__MACOSX", ".DS_Store", "_updater_undo.json"):
+        if name in ("__MACOSX", ".DS_Store", "_updater_undo.json",
+                    "_updater_manifest.json"):
             continue
         s, d = os.path.join(src_root, name), os.path.join(dst, name)
         if should_preserve(name, os.path.isdir(s), keywords):
@@ -2820,7 +2918,7 @@ def incremental_over(src_root: str, dst: str, preserve) -> int:
     RuntimeError，交给上层等待重试，绝不静默吞掉。
     """
     keywords = preserve_keywords(preserve)
-    skip = ("__MACOSX", ".DS_Store", "_updater_undo.json")
+    skip = ("__MACOSX", ".DS_Store", "_updater_undo.json", "_updater_manifest.json")
     written = 0
     failures: list[str] = []
     locked = False

@@ -8,7 +8,7 @@
 | --- | --- |
 | 平台 | Windows 10 / 11 |
 | 技术栈 | Python 3 · PySide6 · pillow · PyInstaller（单文件 exe，便携） |
-| 当前版本 | **v1.6.17** |
+| 当前版本 | **v1.6.18** |
 | 仓库 | [DADiDiDiDA/automate-updater](https://github.com/DADiDiDiDA/automate-updater) |
 | 外部依赖 | `git`（仓库类程序）、`7-Zip` 或 `py7zr`（`.7z` 包） |
 

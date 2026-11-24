@@ -1022,6 +1022,12 @@ class ProgramRow(QFrame):
                 self.action_btn.setText("跳过")
                 self.action_btn.setObjectName("ghost")
                 self.action_btn.setEnabled(False)
+            elif it.status == "choose":
+                # 多个安装包没选定：徽章是「待选择」，按钮却灰着「更新」，
+                # 用户点不动也不知道该右键。给一个可点的入口。
+                self.action_btn.setText("选择文件")
+                self.action_btn.setObjectName("soft")
+                self.action_btn.setEnabled(it.scanned)
             elif it.status == "latest" or it.state == "done":
                 self.action_btn.setText("已最新")
                 self.action_btn.setObjectName("ghost")

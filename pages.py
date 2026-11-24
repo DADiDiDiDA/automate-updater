@@ -370,7 +370,9 @@ class ItemListView(QWidget):
                 continue
             ok = True
             if self.filter == "update":
-                ok = it.status in ("update", "unknown")
+                # 与 chip 计数同一判定：unknown 只有扫描过的才算「有更新」，
+                # 否则数字显示 0、点进去却列出一堆待确认的程序
+                ok = self.is_update(it)
             elif self.filter == "git":
                 ok = it.kind == "git"
             elif self.filter == "release":
@@ -1621,10 +1623,13 @@ class SettingsPage(QWidget):
         if not (cfg.get("webhook") or "").strip():
             self.ding_test_lbl.setText("先填写 Webhook 端点再测试")
             return
-        self.ding_test_lbl.setText("正在发送测试消息…")
         w = getattr(self, "_ding_test_worker", None)
         if w is not None and w.isRunning():
+            # 先判断再改文字：以前先把标签改成"正在发送"再 return，
+            # 这一轮的 done 信号不会再来，标签就永久卡在"正在发送"
+            self.ding_test_lbl.setText("上一条测试消息还在发送中…")
             return
+        self.ding_test_lbl.setText("正在发送测试消息…")
         w = _DingTestWorker(cfg, "### 测试消息\n\n如果你看到这条，说明通知配置是通的。")
         w.done.connect(self._on_ding_test_done)
         self._ding_test_worker = w
