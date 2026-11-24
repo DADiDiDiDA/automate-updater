@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsOpacityEffect, QHB
                                QWidget)
 
 from backdrop import BACKDROP, paint_glass
+from core import INSTALL_MODE_LABELS, INSTALL_MODE_SHORT
 from theme import (GLYPH, THEME, badge_fg, card_color, flat, glyph_font, qc, rgba, scoped,
                    tint)
 
@@ -589,6 +590,56 @@ class Badge(QWidget):
         painter.end()
 
 
+class ModeChip(Badge):
+    """可点的策略徽章：点一下直接开「更新策略」弹窗。
+
+    单独设置过的程序用强调色，跟随全局的用灰色——不点开也能看出哪些程序被单独改过。
+    """
+
+    clicked = Signal()
+
+    def __init__(self, text: str = "", color: str = "dim", parent=None):
+        super().__init__(text, color, parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self._hover = False
+
+    def set_color(self, color: str) -> None:
+        super().set_color(color)
+        self.update()
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+        super().leaveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        from PySide6.QtCore import QRectF as _R
+        if e.button() == Qt.LeftButton and _R(self.rect()).contains(e.position()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
+
+    def paintEvent(self, e):
+        if not self._text:
+            return
+        col = QColor(self._resolved())
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 6, 6)
+        bg = QColor(col)
+        bg.setAlphaF(0.34 if self._hover else 0.20)
+        painter.fillPath(path, bg)
+        painter.setFont(self.font())
+        painter.setPen(qc(badge_fg(col.name(), THEME.p.dark), 1.0))
+        painter.drawText(self.rect(), Qt.AlignCenter, self._text)
+        painter.end()
+
+
 class Chip(QPushButton):
     """筛选胶囊，带计数。"""
 
@@ -841,6 +892,10 @@ class ProgramRow(QFrame):
         title_row.addWidget(self.kind_badge)
         self.status_badge = Badge("")
         title_row.addWidget(self.status_badge)
+        # 更新策略徽章：Git 仓库按提交拉取，不涉及文件替换，只有 Release 需要
+        self.mode_chip = ModeChip("", "dim")
+        self.mode_chip.clicked.connect(lambda: self.strategy_requested.emit(self.item.key))
+        title_row.addWidget(self.mode_chip)
         title_row.addStretch(1)
         mid.addLayout(title_row)
 
@@ -964,6 +1019,24 @@ class ProgramRow(QFrame):
             text, color = "失败", "danger"
         self.status_badge.setText(text)
         self.status_badge.set_color(color)
+
+        # 更新策略徽章（点击可改）：单独设置过的高亮显示
+        if it.kind == "release":
+            mode = getattr(it, "mode", "") or ""
+            over = bool(getattr(it, "mode_over", False)) and bool(mode)
+            if over:
+                self.mode_chip.setText(f"策略·{INSTALL_MODE_SHORT.get(mode, mode)}")
+                self.mode_chip.set_color("accent")
+                self.mode_chip.setToolTip(
+                    f"更新策略：{INSTALL_MODE_LABELS.get(mode, mode)}（单独设置）\n点击修改")
+            else:
+                self.mode_chip.setText("策略·跟随全局")
+                self.mode_chip.set_color("dim")
+                tail = f"（{INSTALL_MODE_LABELS.get(mode, mode)}）" if mode else ""
+                self.mode_chip.setToolTip(
+                    f"更新策略：跟随全局默认{tail}\n点击给这个程序单独设置")
+        else:
+            self.mode_chip.setText("")
 
         # 版本变化
         if it.kind == "git":

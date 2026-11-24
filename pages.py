@@ -675,24 +675,79 @@ class ThemedDialog(QDialog):
 
 
 class ExcludeDialog(ThemedDialog):
-    """编辑某个检查文件夹的排除项。"""
+    """编辑某个检查文件夹的排除项与扫描深度。"""
 
-    def __init__(self, parent, path: str, excludes: list[str]):
-        super().__init__(parent, "排除子文件夹", 470)
+    def __init__(self, parent, path: str, excludes: list[str], depth: int = 4):
+        super().__init__(parent, "排除文件夹", 500)
         self.path = path
-        self.body.addWidget(_label(f"扫描 {path} 时跳过这些文件夹（每行一个，不区分大小写）",
-                                   11, "text_muted", wrap=True))
+        self.depth = max(1, min(8, int(depth or 4)))
+        self.body.addWidget(_label(
+            "扫描下面这个目录时跳过这些文件夹（每行一个，不区分大小写）。"
+            "填名称（任意层级同名目录都跳过）或相对路径（如 BetterGI\\Repos）；"
+            "排除一个文件夹，等于连同它的全部子文件夹一起排除。",
+            11, "text_muted", wrap=True))
+        self.body.addWidget(_label(path, 11, "text_dim", wrap=True))
+        self.body.addWidget(_label(
+            "排除只影响「检查」：更新时哪些文件夹要保留，请到「更新策略」页的保留名单，"
+            "或在程序行右键 →「更新时保留的文件夹」。",
+            11, "text_muted", wrap=True))
         tp = THEME.p
         self.edit = QPlainTextEdit("\n".join(excludes))
-        self.edit.setPlaceholderText("My-maawork\nCache\nnode_modules")
-        self.edit.setFixedHeight(158)
+        self.edit.setPlaceholderText("Cache\nBetterGI\\Repos\nMy-maawork")
+        self.edit.setFixedHeight(146)
         self.edit.setStyleSheet(
             f"QPlainTextEdit{{background:{rgba(tp.text, 0.05 if tp.dark else 0.04)};"
             f"border:1px solid {rgba(tp.border, 0.14)};border-radius:10px;color:{tp.text};"
             f"font-family:'Consolas','Microsoft YaHei UI';font-size:12px;padding:8px 10px;}}"
             f"QPlainTextEdit:focus{{border:1px solid {rgba(tp.accent, 0.55)};}}")
         self.body.addWidget(self.edit)
+
+        self.check_lbl = _label("", 11, "text_muted", wrap=True)
+        self.body.addWidget(self.check_lbl)
+
+        row = QWidget()
+        flat(row)
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 2, 0, 0)
+        rl.setSpacing(10)
+        self.depth_spin = NumberStepper(self.depth, 1, 8, 1, " 层", 96)
+        self.depth_spin.valueChanged.connect(self._on_depth)
+        rl.addStretch(1)
+        rl.addWidget(_label("Git 仓库最多往下找几层", 11, "text_muted"))
+        rl.addWidget(self.depth_spin)
+        self.body.addWidget(row)
         self.add_footer()
+
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(500)
+        self._timer.timeout.connect(self._validate)
+        self.edit.textChanged.connect(lambda: self._timer.start())
+        self._validate()
+
+    def _on_depth(self, v) -> None:
+        try:
+            self.depth = max(1, min(8, int(v)))
+        except Exception:
+            self.depth = 4
+
+    def _validate(self) -> None:
+        """实时校验：哪些排除项在这台机器上根本没匹配到文件夹。"""
+        entries = self.values()
+        if not entries:
+            self.check_lbl.setText("没有排除项：这个目录下的文件夹都会参与检查")
+            return
+        try:
+            hit, miss = core.excluded_hits(self.path, entries)
+        except Exception:
+            self.check_lbl.setText("")
+            return
+        if not miss:
+            self.check_lbl.setText(f"{len(hit)} 项全部匹配到文件夹，本次扫描即生效")
+        else:
+            self.check_lbl.setText(
+                f"{len(hit)} 项已匹配 · {len(miss)} 项在这台机器上没找到："
+                + "、".join(miss[:5]) + ("…" if len(miss) > 5 else ""))
 
     def values(self) -> list[str]:
         return [l.strip() for l in self.edit.toPlainText().splitlines() if l.strip()]
@@ -1274,16 +1329,24 @@ class RootRow(QWidget):
     def _refresh_sub(self) -> None:
         ex = self.root.get("exclude", [])
         depth = self.root.get("depth", 4)
-        self.sub_lbl.setText(f"排除 {len(ex)} 项 · 扫描深度 {depth}" if ex else f"未设置排除 · 扫描深度 {depth}")
+        self.sub_lbl.setText(f"排除 {len(ex)} 项（含子文件夹） · 扫描深度 {depth}" if ex
+                             else f"未设置排除 · 扫描深度 {depth}")
+        if ex:
+            self.sub_lbl.setToolTip("排除项：\n" + "\n".join(f"· {e}" for e in ex)
+                                    + "\n\n被排除的文件夹连同其全部子文件夹都不参与检查")
+        else:
+            self.sub_lbl.setToolTip("还没有排除任何文件夹")
 
     def _on_toggle(self, on: bool) -> None:
         self.root["enabled"] = on
         self.changed.emit()
 
     def _edit_excludes(self) -> None:
-        dlg = ExcludeDialog(self.window(), self.root.get("path", ""), self.root.get("exclude", []))
+        dlg = ExcludeDialog(self.window(), self.root.get("path", ""),
+                            self.root.get("exclude", []), self.root.get("depth", 4))
         if dlg.exec():
             self.root["exclude"] = dlg.values()
+            self.root["depth"] = dlg.depth
             self._refresh_sub()
             self.changed.emit()
 
@@ -2025,15 +2088,20 @@ class StrategyDialog(ThemedDialog):
 
 
 class StrategyPage(QWidget):
-    """更新策略页：全局默认策略 + 保留名单 + 超时/重试/备份 + 单程序覆盖清单。"""
+    """更新策略页：全局默认策略 + 保留名单 + 检查调度 + 超时/重试/备份。
+
+    单个程序的策略不在这里设置：它在「程序」页每行的策略徽章上
+    （右键 →「更新策略…」同效），这样和程序清单天然一致。
+    """
 
     config_changed = Signal()
+    goto_programs = Signal()
 
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
         self.cfg = cfg
         self._items: list = []
-        self._prog_rows: list = []
+        self._prog_rows: list = []      # 兼容旧调用，不再用于渲染
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -2043,8 +2111,26 @@ class StrategyPage(QWidget):
         g = self.scroll.lay
 
         g.addWidget(_label(
-            "控制更新时如何替换程序文件。全局默认作用于所有程序，也可以给单个程序单独指定。",
+            "控制更新时如何替换程序文件。下面这些是全局默认，作用于所有程序；"
+            "单个程序的策略在「程序」页单独设置。",
             12, "text_muted", wrap=True))
+
+        # ---- 按程序设置：入口 + 统计（界面在「程序」页） ----
+        prog_box = QWidget()
+        flat(prog_box)
+        pl2 = QHBoxLayout(prog_box)
+        pl2.setContentsMargins(0, 2, 0, 6)
+        pl2.setSpacing(10)
+        self.prog_hint = _label("", 11, "text_muted", wrap=True)
+        pl2.addWidget(self.prog_hint, 1)
+        self.go_progs_btn = QPushButton("去程序页")
+        self.go_progs_btn.setObjectName("ghost")
+        self.go_progs_btn.setCursor(Qt.PointingHandCursor)
+        self.go_progs_btn.setFixedHeight(28)
+        self.go_progs_btn.setToolTip("在「程序」页点程序行标题旁的策略徽章，或右键 →「更新策略…」")
+        self.go_progs_btn.clicked.connect(self.goto_programs.emit)
+        pl2.addWidget(self.go_progs_btn, 0)
+        g.addWidget(prog_box)
 
         # ---- 默认策略 ----
         self._group(g, "默认策略")
@@ -2142,16 +2228,6 @@ class StrategyPage(QWidget):
         bkl.addWidget(self.keep_spin)
         self._row(g, "save", "覆盖前自动备份", "备份存放在根目录 Cache\\_backup 下", bk)
 
-        # ---- 按程序设置 ----
-        self._group(g, "按程序设置")
-        self.prog_hint = _label("", 11, "text_muted", wrap=True)
-        g.addWidget(self.prog_hint)
-        self.prog_holder = QWidget()
-        flat(self.prog_holder)
-        self.prog_lay = QVBoxLayout(self.prog_holder)
-        self.prog_lay.setContentsMargins(0, 0, 0, 0)
-        self.prog_lay.setSpacing(8)
-        g.addWidget(self.prog_holder)
         g.addStretch(1)
 
         self._sync_mode_desc()
@@ -2261,64 +2337,34 @@ class StrategyPage(QWidget):
         self.cfg["backup"]["keep"] = self.keep_spin.value()
         self.config_changed.emit()
 
-    # ---------- 按程序设置 ----------
+    # ---------- 按程序设置（入口与统计） ----------
     def set_items(self, items) -> None:
         self._items = list(items or [])
         self._rebuild_programs()
 
     def _rebuild_programs(self) -> None:
-        # 先清空旧行：hide + removeWidget + deleteLater，避免弹成顶层小窗
-        for w in self._prog_rows:
-            try:
-                w.hide()
-                self.prog_lay.removeWidget(w)
-                w.deleteLater()
-            except RuntimeError:
-                pass
-        self._prog_rows = []
-
         g_mode = self._global_mode()
+        g_lbl = core.INSTALL_MODE_LABELS[g_mode]
         rel = [it for it in self._items if getattr(it, "kind", "") == "release"]
         if not rel:
-            self.prog_hint.setText("还没有可设置的程序。先在「设置」里添加检查文件夹并检查一次。")
+            self.prog_hint.setText(
+                "还没有可设置的程序：先在「设置 → 检查文件夹」里添加目录并检查一次")
             return
-        self.prog_hint.setText(
-            f"共 {len(rel)} 个程序。未单独设置的程序使用默认策略（{core.INSTALL_MODE_LABELS[g_mode]}）；"
-            "Git 仓库按提交拉取更新，不涉及文件替换，不在此列。")
-
         overrides = self.cfg.get("install_mode_map") or {}
-        for it in rel:
-            key = (it.name or "").lower()
-            cur = overrides.get(key, "")
-            if cur not in core.INSTALL_MODES:
-                cur = ""
-            combo = ThemedCombo(
-                [("", f"跟随全局（{core.INSTALL_MODE_LABELS[g_mode]}）")]
-                + [(m, core.INSTALL_MODE_LABELS[m]) for m in core.INSTALL_MODES],
-                cur, 188)
-            combo.changed.connect(lambda m, nm=it.name, cb=combo: self._on_prog_mode(nm, m, cb))
-            desc = (core.INSTALL_MODE_LABELS[cur] + "（已单独设置）" if cur
-                    else f"跟随全局：{core.INSTALL_MODE_LABELS[g_mode]}")
-            row = SettingRow("apps", it.name, desc, combo)
-            row.setToolTip(f"{it.name}\n{getattr(it, 'path', '')}")
-            self.prog_lay.addWidget(row)
-            self._prog_rows.append(row)
+        n_over = sum(1 for it in rel if (overrides.get((it.name or "").lower()) in core.INSTALL_MODES))
+        self.prog_hint.setText(
+            f"共 {len(rel)} 个程序，其中 {n_over} 个单独设过策略，其余跟随默认（{g_lbl}）；"
+            "在「程序」页点策略徽章或右键「更新策略…」修改。")
 
-    def _on_prog_mode(self, name: str, mode: str, combo) -> None:
-        """页面清单里改了某程序的策略。"""
+    def _on_prog_mode(self, name: str, mode: str, combo=None) -> None:
+        """保留接口：把某程序的策略写入配置并刷新统计（列表已搬到「程序」页）。"""
         key = (name or "").lower()
         mm = self.cfg.setdefault("install_mode_map", {})
         if mode in core.INSTALL_MODES:
             mm[key] = mode
         else:
             mm.pop(key, None)
-        # 刷新这一行的说明
-        g_mode = self._global_mode()
-        for row in self._prog_rows:
-            if row.title_lbl.text() == name:
-                row.set_desc(core.INSTALL_MODE_LABELS[mode] + "（已单独设置）" if mode
-                             else f"跟随全局：{core.INSTALL_MODE_LABELS[g_mode]}")
-                break
+        self._rebuild_programs()
         self.config_changed.emit()
 
     # ---------- 主题 ----------

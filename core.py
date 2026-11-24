@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.18"
+APP_VERSION = "1.6.19"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -97,6 +97,13 @@ INSTALL_MODE_HINTS = {
     "overwrite": "保留全部旧文件，只用新版同名文件替换",
     "wipe": "先清空整个程序目录（连配置/存档也不留）再解压，慎用",
     "incremental": "只写入比本地新的文件，从不删除任何东西",
+}
+# 程序行上的策略徽章用短标签：完整名字（「删除后覆盖」）会把标题行挤窄
+INSTALL_MODE_SHORT = {
+    "clean": "覆盖",
+    "overwrite": "只替换",
+    "wipe": "清空",
+    "incremental": "增量",
 }
 
 DEFAULT_MIRRORS = [
@@ -446,12 +453,39 @@ def _normalize(cfg: dict) -> dict:
     if cfg["ui"].get("prior") not in ("update", "none", "git", "release"):
         cfg["ui"]["prior"] = "update"
     # 规范化检查目录路径（避免 D://Automate 这类写法导致显示与去重异常）
+    # 排除项一并归一化：正斜杠、尾斜杠、绝对路径、重复项都在这里收敛，
+    # 否则「写了 A/B 却匹配不上」会让用户以为排除功能没生效。
+    clean_roots = []
     for r in cfg.get("roots") or []:
-        if isinstance(r, dict) and r.get("path"):
-            try:
-                r["path"] = os.path.normpath(str(r["path"]))
-            except Exception:
-                pass
+        if not isinstance(r, dict):
+            continue
+        base = str(r.get("path") or "").strip()
+        if not base:
+            continue
+        try:
+            base = os.path.normpath(base)
+        except Exception:
+            pass
+        raw = r.get("exclude")
+        entries, seen = [], set()
+        for e in (raw if isinstance(raw, list) else []):
+            v = normalize_exclude(e, base)
+            if v and v not in seen:
+                seen.add(v)
+                entries.append(str(e).strip())
+        try:
+            depth = int(r.get("depth") or 4)
+        except Exception:
+            depth = 4
+        clean = {"path": base, "exclude": entries,
+                 "depth": max(1, min(8, depth)),
+                 "enabled": bool(r.get("enabled", True))}
+        # 保留未来可能新增的字段，别让一次归一化把它们抹掉
+        for k, v in r.items():
+            if k not in clean:
+                clean[k] = v
+        clean_roots.append(clean)
+    cfg["roots"] = clean_roots
     return cfg
 
 
@@ -1194,13 +1228,15 @@ def short(s: str, n: int = 160) -> str:
 
 # ==================================================================== 数据模型
 
-def dir_size(path: str, max_files: int = 30000) -> int:
-    """统计程序目录体积（跳过 .git，避免把仓库历史算进去）。"""
+def dir_size(path: str, max_files: int = 30000, excl=None) -> int:
+    """统计程序目录体积（跳过 .git；排除了的文件夹也不统计）。"""
     total = 0
     n = 0
     try:
         for dirpath, dirnames, filenames in os.walk(path):
             dirnames[:] = [d for d in dirnames if d not in (".git", "__pycache__")]
+            if excl is not None:
+                dirnames[:] = excl.prune(dirpath, dirnames)
             for fn in filenames:
                 try:
                     total += os.path.getsize(os.path.join(dirpath, fn))
@@ -1246,6 +1282,8 @@ class Item:
     scanned: bool = False          # 是否已完成本次检查
     scanning: bool = False         # 本次检查正在进行（列表显示「检查中」而不是「待检查」）
     updated_at: str = ""           # 上次通过本程序更新成功的时间（排序用）
+    mode: str = ""                 # 实际生效的安装策略（单程序覆盖 > 全局默认）
+    mode_over: bool = False        # 该策略是不是单独为这个程序设的
     progress: float = 0.0
     message: str = ""
     error: str = ""
@@ -1626,7 +1664,7 @@ class Engine:
             base = root.get("path", "")
             if not base or not os.path.isdir(base):
                 continue
-            excl = {e.lower() for e in root.get("exclude", [])}
+            excl = Excludes(base, root.get("exclude", []))
             depth = int(root.get("depth", 4))
             # 1) git 仓库
             for repo in find_git_repos(base, excl, depth):
@@ -1654,8 +1692,30 @@ class Engine:
                 if not it.repo:
                     it.status = "unbound"
                     it.detail = "未识别到 GitHub 仓库，可在「程序」里手动绑定"
+                it.mode = self.install_mode_for(name)
+                it.mode_over = bool(((self.cfg.get("install_mode_map") or {}).get(name.lower())))
                 items.append(it)
         return items
+
+    def _excl_for(self, path: str):
+        """某路径所属检查目录的排除规则（扫描时每项都要用，按目录缓存）。"""
+        root = self.owner_root(path) or {}
+        base = root.get("path") or ""
+        if not base:
+            return None
+        sig = (os.path.normcase(os.path.abspath(base)),
+               tuple(str(e) for e in (root.get("exclude") or [])))
+        cache = getattr(self, "_excl_cache", None)
+        if cache is None:
+            cache = self._excl_cache = {}
+        hit = cache.get(sig[0])
+        if hit and hit[0] == sig[1]:
+            return hit[1]
+        ex = Excludes(base, root.get("exclude") or [])
+        if len(cache) > 32:
+            cache.clear()
+        cache[sig[0]] = (sig[1], ex)
+        return ex
 
     def preserve_for(self, name: str, spec: dict) -> list:
         """某程序更新时要保留的文件夹名：单程序自定义优先，否则用全局列表。"""
@@ -1736,11 +1796,16 @@ class Engine:
         root = self.owner_root(path)
         if not root:
             return False, "该文件夹不在任何检查目录内"
+        base = root.get("path", "")
         entry = self.exclude_entry(path)
+        low = normalize_exclude(entry, base)
         excl = root.setdefault("exclude", [])
-        low = {e.lower() for e in excl}
-        if entry.lower() in low or os.path.basename(entry).lower() in low:
+        olds = [normalize_exclude(e, base) for e in excl]
+        if low in olds or os.path.basename(low) in olds:
             return False, f"「{entry}」已经在排除列表里了"
+        # 已经被上级（或同名规则）覆盖：再单独排一次子文件夹没有意义
+        if Excludes(base, excl).hit(path):
+            return False, f"「{entry}」已被上级排除项覆盖（排除本来就含全部子文件夹）"
         excl.append(entry)
         try:
             save_config(self.cfg)
@@ -1753,11 +1818,12 @@ class Engine:
         root = self.owner_root(path)
         if not root:
             return False
-        entry = self.exclude_entry(path).lower()
-        name = os.path.basename(entry)
+        base = root.get("path", "")
+        low = normalize_exclude(self.exclude_entry(path), base)
+        name = low.rsplit("\\", 1)[-1]
         before = len(root.get("exclude", []))
         root["exclude"] = [e for e in root.get("exclude", [])
-                           if e.lower() not in (entry, name)]
+                           if normalize_exclude(e, base) not in (low, name)]
         if len(root["exclude"]) != before:
             try:
                 save_config(self.cfg)
@@ -1778,7 +1844,7 @@ class Engine:
         rk = self._record_key(it)
         it.updated_at = (self.records.get("update_times") or {}).get(rk, "")
         if not it.local_size:
-            it.local_size = dir_size(it.path)
+            it.local_size = dir_size(it.path, excl=self._excl_for(it.path))
         try:
             res = self._scan_git(it) if it.kind == "git" else self._scan_release(it)
         except Exception as e:
@@ -2456,26 +2522,109 @@ def send_dingtalk_raw(ding_cfg: dict, text: str, title: str = APP_NAME) -> bool:
 
 # ==================================================================== 目录/文件工具
 
-def _excluded(root: str, path: str, name: str, excl: set) -> bool:
-    """排除项既可以是文件夹名，也可以是相对根目录的路径（右键排除时写入）。"""
-    if not excl:
-        return False
-    if name.lower() in excl:
-        return True
-    try:
-        rel = os.path.relpath(path, root).replace("/", "\\").lower()
-    except Exception:
-        return False
-    return rel in excl
+# 排除规则：一个检查根目录一份。排除项既可以是「文件夹名」，也可以是
+# 「相对根目录的路径」，三种写法都接受：
+#   1. 文件夹名        Cache                  → 任意层级同名目录都排除
+#   2. 相对路径        BetterGI\Repos         → 该目录**及其全部子目录**
+#   3. 绝对路径        D:\Automate\Cache      → 落在根目录内就折算成相对路径
+# 正斜杠/反斜杠、首尾多余分隔符与空格都做归一化。以前写成 A/B、带尾斜杠、
+# 或者贴了完整路径时会静默匹配不上（排除了却还在扫），也只在偶数层级生效。
+_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
-def find_git_repos(root: str, exclude: set, max_depth: int) -> list[str]:
+def normalize_exclude(entry: str, root: str = "") -> str:
+    """把排除项整理成小写名称或相对路径；不在 root 之下的绝对路径返回空串。"""
+    s = str(entry or "").strip().strip('"').strip("'").replace("/", "\\")
+    s = re.sub(r"\\{2,}", r"\\", s).strip("\\")
+    if not s or s in (".", ".."):
+        return ""
+    low = s.lower()
+    if _DRIVE_RE.match(low) or low.startswith("\\\\"):
+        if not root:
+            return ""
+        try:
+            rel = os.path.relpath(os.path.normpath(s), os.path.normpath(root))
+        except Exception:
+            return ""
+        low = rel.replace("/", "\\").lower()
+        if low.startswith(".."):
+            return ""                 # 不在这个根目录下，跟它没关系
+    while low.startswith(".\\"):
+        low = low[2:]
+    return low.strip("\\")
+
+
+class Excludes:
+    """一个根目录的排除规则；判定「自身或任一祖先被排除」。
+
+    祖先匹配很关键：os.walk 会剪枝，但 dir_size / 版本探测 / 以后新增的枚举
+    入口不一定从根目录开始走，只要路径里有任何一层在排除名单里，就整支跳过。
+    """
+
+    __slots__ = ("root", "names", "paths")
+
+    def __init__(self, root: str = "", entries=None):
+        self.root = os.path.abspath(root) if root else ""
+        self.names: set[str] = set()
+        self.paths: set[str] = set()
+        for e in entries or ():
+            v = normalize_exclude(e, self.root)
+            if not v:
+                continue
+            if "\\" in v:
+                self.paths.add(v)
+            else:
+                self.names.add(v)
+
+    def __bool__(self) -> bool:
+        return bool(self.names or self.paths)
+
+    def __len__(self) -> int:
+        return len(self.names) + len(self.paths)
+
+    def hit(self, path: str, name: str = "") -> bool:
+        if not (self.names or self.paths):
+            return False
+        if not self.root:
+            base = name or os.path.basename(str(path).rstrip("\\/"))
+            return bool(base) and base.lower() in self.names
+        try:
+            rel = os.path.relpath(os.path.abspath(path), self.root)
+        except Exception:
+            return False
+        rel = rel.replace("/", "\\").lower()
+        if rel.startswith(".."):
+            return False                       # 不在这个根目录下，跟它无关
+        parts = [p for p in rel.split("\\") if p and p != "."]
+        for i, part in enumerate(parts, 1):
+            if part in self.names:             # 祖先目录同名 → 整支排除
+                return True
+            if self.paths and "\\".join(parts[:i]) in self.paths:
+                return True
+        return False
+
+    def prune(self, dirpath: str, dirnames: list) -> list:
+        """os.walk 用的剪枝：隐藏目录与排除目录都不下钻。"""
+        return [d for d in dirnames
+                if not d.startswith(".") and not self.hit(os.path.join(dirpath, d), d)]
+
+
+def _as_excludes(root: str, exclude) -> Excludes:
+    return exclude if isinstance(exclude, Excludes) else Excludes(root, exclude)
+
+
+def _excluded(root: str, path: str, name: str, excl) -> bool:
+    """兼容旧调用：判断某个目录是否在排除名单内（含祖先被排除的情况）。"""
+    return _as_excludes(root, excl).hit(path, name)
+
+
+def find_git_repos(root: str, exclude, max_depth: int) -> list[str]:
+    ex = _as_excludes(root, exclude)
     out = []
     base = os.path.abspath(root).rstrip(os.sep).count(os.sep)
     for dirpath, dirnames, _ in os.walk(root):
         depth = dirpath.rstrip(os.sep).count(os.sep) - base
-        dirnames[:] = [d for d in dirnames if not d.startswith(".")
-                       and not _excluded(root, os.path.join(dirpath, d), d, exclude)]
+        dirnames[:] = ex.prune(dirpath, dirnames)
         if os.path.isdir(os.path.join(dirpath, ".git")):
             out.append(dirpath)
             dirnames[:] = []          # 仓库内部不再下钻
@@ -2485,12 +2634,13 @@ def find_git_repos(root: str, exclude: set, max_depth: int) -> list[str]:
     return out
 
 
-def find_program_dirs(root: str, exclude: set) -> list[str]:
+def find_program_dirs(root: str, exclude) -> list[str]:
     """只认根目录下一层的「独立程序」文件夹。
 
     判定：顶层有 .exe / interface.json / 启动脚本，且本身不是 git 仓库。
     这样不会钻进 MAA\\python、March7th\\3rdparty 这类内部目录。
     """
+    ex = _as_excludes(root, exclude)
     out = []
     try:
         entries = sorted(os.listdir(root))
@@ -2500,13 +2650,62 @@ def find_program_dirs(root: str, exclude: set) -> list[str]:
         path = os.path.join(root, name)
         if not os.path.isdir(path):
             continue
-        if name.startswith(".") or _excluded(root, path, name, exclude):
+        if name.startswith(".") or ex.hit(path, name):
             continue
         if os.path.isdir(os.path.join(path, ".git")):
             continue
         if looks_like_app(path):
             out.append(path)
     return out
+
+
+def excluded_hits(root: str, entries, max_depth: int = 5,
+                  max_dirs: int = 8000) -> tuple[list[str], list[str]]:
+    """校验排除项：返回 (确实匹配到文件夹的项, 一个都没匹配上的项)。
+
+    设置页用它提示「排除了但没生效」——写错名字、贴了别的盘符的路径、
+    或者填了根本不存在的目录时，用户以前完全看不出来，只会在扫描结果里
+    发现「怎么还在检查」。这里直接按文件系统验证，不依赖扫描剪枝。
+    """
+    want = [(str(raw), normalize_exclude(raw, root)) for raw in (entries or [])]
+    want = [(raw, v) for raw, v in want if v]
+    if not root or not want:
+        return [], []
+    names_need = {v for _, v in want if "\\" not in v}
+    paths_need = {v for _, v in want if "\\" in v}
+    found_names, found_paths = set(), set()
+    for v in list(paths_need):
+        if os.path.isdir(os.path.join(root, *v.split("\\"))):
+            found_paths.add(v)
+    if names_need or (paths_need - found_paths):
+        base = os.path.abspath(root).rstrip(os.sep).count(os.sep)
+        seen = 0
+        try:
+            for dirpath, dirnames, _ in os.walk(root):
+                depth = dirpath.rstrip(os.sep).count(os.sep) - base
+                for d in dirnames:
+                    seen += 1
+                    low = d.lower()
+                    if low in names_need:
+                        found_names.add(low)
+                    if paths_need:
+                        try:
+                            rel = os.path.relpath(os.path.join(dirpath, d), root)
+                        except Exception:
+                            continue
+                        found_paths.add(rel.replace("/", "\\").lower())
+                if depth >= max_depth or seen > max_dirs:
+                    dirnames[:] = []
+                else:
+                    dirnames[:] = [x for x in dirnames
+                                   if x not in (".git", "__pycache__")]
+        except Exception:
+            pass
+    hit, miss = [], []
+    for raw, v in want:
+        ok = (v in found_paths) if "\\" in v else (v in found_names)
+        (hit if ok else miss).append(raw)
+    return hit, miss
 
 
 def looks_like_app(path: str) -> bool:

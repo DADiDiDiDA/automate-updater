@@ -700,6 +700,8 @@ class MainWindow(QWidget):
 
         self.page_strategy = StrategyPage(self.cfg)
         self.page_strategy.config_changed.connect(self._save_cfg)
+        self.page_strategy.config_changed.connect(self._sync_item_modes)
+        self.page_strategy.goto_programs.connect(lambda: self._on_nav("programs"))
         self.page_strategy.set_items(getattr(self, "items", []) or [])
 
         self.page_settings = SettingsPage(self.cfg)
@@ -1793,7 +1795,7 @@ class MainWindow(QWidget):
             self.toast.show_text(f"「{it.name}」将保留 {len(dlg.chosen)} 个文件夹")
 
     def edit_strategy(self, key: str) -> None:
-        """右键「更新策略…」：给单个程序指定更新时的文件替换策略。"""
+        """策略徽章 / 右键「更新策略…」：给单个程序指定更新时的文件替换策略。"""
         it = next((i for i in self.items if i.key == key), None)
         if not it:
             return
@@ -1810,6 +1812,7 @@ class MainWindow(QWidget):
         if not dlg.exec():
             return
         self.engine.set_install_mode(it.name, dlg.value())
+        self._sync_item_modes()
         self.page_strategy.set_items(self.items)
         mode = self.engine.install_mode_for(it.name)
         if dlg.value():
@@ -1817,6 +1820,27 @@ class MainWindow(QWidget):
                 f"「{it.name}」更新策略：{core.INSTALL_MODE_LABELS.get(mode, mode)}")
         else:
             self.toast.show_text(f"「{it.name}」已改为跟随全局策略")
+
+    def _sync_item_modes(self) -> None:
+        """把「实际生效的安装策略」同步到每个程序行（改全局 / 改单程序后调用）。"""
+        overrides = self.cfg.get("install_mode_map") or {}
+        changed = []
+        for it in getattr(self, "items", []) or []:
+            if getattr(it, "kind", "") != "release":
+                continue
+            mode = self.engine.install_mode_for(it.name)
+            over = bool(overrides.get((it.name or "").lower()) in core.INSTALL_MODES)
+            if mode != getattr(it, "mode", "") or over != getattr(it, "mode_over", False):
+                it.mode = mode
+                it.mode_over = over
+                changed.append(it.key)
+        if not changed:
+            return
+        for lv in (self.page_home.list, self.progs_list):
+            for key in changed:
+                row = lv.rows.get(key)
+                if row is not None:
+                    row.refresh()
 
     def bind_repo(self, key: str) -> None:
         it = next((i for i in self.items if i.key == key), None)

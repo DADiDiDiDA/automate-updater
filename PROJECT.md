@@ -30,7 +30,7 @@
 | --- | --- | --- |
 | `core.py` | 逻辑 | 常量与 `BUILTIN_PROGRAMS`、`default_config()` / `_normalize()`、镜像与节点管理、`Item` dataclass、`Engine`（扫描/更新/回滚/通知）、`download()`、解压与覆盖工具 |
 | `app.py` | 应用 | `ScanWorker` / `UpdateWorker` / `UndoWorker` / `MirrorWorker` / `NodesSyncWorker`；`MainWindow`、`AssetDialog`、`BindDialog`、单实例、`main()`、`_excepthook` |
-| `pages.py` | 页面 | `HomePage`、`ItemListView`（列表行直接持有 `rows`）、`SettingsPage`、`StrategyPage`（更新策略页：全局策略 + 按程序清单）、各 `ThemedDialog`（`MirrorDialog` / `NodesDialog` / `PreserveDialog` / `StrategyDialog` / `VersionDialog` / `ExcludeDialog`）、`_date_ord` / `_time_ord` 排序辅助 |
+| `pages.py` | 页面 | `HomePage`、`ItemListView`（列表行直接持有 `rows`）、`SettingsPage`、`StrategyPage`（更新策略页：全局策略 + 检查调度 + 按程序统计/入口）、各 `ThemedDialog`（`MirrorDialog` / `NodesDialog` / `PreserveDialog` / `StrategyDialog` / `VersionDialog` / `ExcludeDialog`）、`_date_ord` / `_time_ord` 排序辅助 |
 | `widgets.py` | 控件 | 与姊妹项目同源的通用控件（`NumberStepper`、`WrapLabel`、`ThemedCombo`、`Card`、`Badge`…） |
 | `theme.py` / `backdrop.py` | 主题 | 3 套皮肤 × 明暗；`tint()` / `flat()` / `scoped()`；玻璃背景实时取景 |
 | `tray.py` | 托盘 | 图标（蓝紫渐变 + 白箭头 + 红点角标）、右键菜单、悬停提示 |
@@ -148,7 +148,8 @@ app.py  ──>  pages.py  ──>  widgets.py ──> theme.py / backdrop.py
 - `incremental_over()` 的语义是「**绝不删除任何文件**」：只写本地没有、或 `src mtime > dst mtime` 的文件，保留目录整棵跳过。别让它在任何分支里调用 `rmtree`/`os.remove`。
 - `preserve`（保留文件夹）只在 `clean` / `incremental` 下有意义；`overwrite` / `wipe` 忽略它，UI 也应把 chips 置灰（`StrategyPage._sync_mode_desc`）。
 - 「更新策略」现在是**独立侧边栏页**（`_NAV_ORDER = home/programs/strategy/settings`），设置页已移除该组。导航索引、快捷键、`_dev_shot` 都按 `_NAV_ORDER` 定位，**别再硬编码 index**。
-- 策略在更新时读 `cfg` 实时值，改完设置无需重扫即生效；单程序入口有两处（策略页清单下拉 + 程序行右键 `StrategyDialog`），改完都要 `page_strategy.set_items(self.items)` 刷新。
+- 策略在更新时读 `cfg` 实时值，改完设置无需重扫即生效。单程序入口只有一处：程序行标题旁的**策略徽章**（`ModeChip`）与右键「更新策略…」都走 `MainWindow.edit_strategy()` → `StrategyDialog`；
+  改完由 `MainWindow._sync_item_modes()` 把 `install_mode_for()` 的结果写回 `Item.mode` / `Item.mode_over` 并 `row.refresh()`，不要再让 `StrategyPage` 自己维护一份程序清单（那正是以前两页对不上的原因）。
 
 **检查调度 / 保留词根（v1.6.14）**
 - `scan_workers` 只控制**检查**并发，不影响 `UpdateWorker`（更新仍逐个串行）；改成 1 就是严格排队，但错峰间隔仍然生效。
@@ -227,3 +228,17 @@ python app.py --tray          # 后台静默启动（开机自启用这个）
 - **资产选择先看架构**：`-win-arm64` 往往体积最大，只按体积会选错；先排除 arm64、优先明确 x64 的包。
 - **快照要跟着状态走**：撤销更新后必须 `save_snapshot()`，否则当天不再联网，重启按旧快照显示「已最新」。
 - **备份元数据不进程序目录**：`_updater_manifest.json` 要加进 `copy_over` / `incremental_over` 的跳过列表。
+
+## 12. v1.6.19 补记
+
+**排除文件夹（语义：排除即含全部子文件夹）**
+- `core.normalize_exclude(entry, root)` 是唯一入口：统一正/反斜杠、压缩重复分隔符、去首尾分隔符与引号空格、绝对路径（且在本根目录内）折算成相对路径、`..` 之外一律丢弃。配置加载时 `_normalize()` 用它批量归一化并去重，`depth` 夹到 1–8。
+- `core.Excludes(root, entries)` 是唯一的匹配器：条目按「有没有分隔符」分成 `names` / `paths`，`hit()` 做**祖先链判定**（路径上任意一层命中即整支排除）。`find_git_repos` / `find_program_dirs` 走 `prune()`，`dir_size()` 也接 `excl=` 参数——凡是从根目录之外起步的枚举（体积、以后新增的入口）都必须显式传入，否则会出现「排除了但在统计里还在」。
+- 别再用「`rel in excl` 精确比对」：写成 `A/B`、带尾斜杠、贴绝对路径都会静默失效，这正是 v1.6.19 修的主诉。
+- `core.excluded_hits(root, entries)` 给界面做校验（命中 / 未匹配），直接按文件系统验证、不依赖扫描剪枝；设置页与「排除…」窗口的实时提示用它。
+- `Engine.exclude_path()` 会拒绝三类写入：已存在、与已有条目等价、被上级（含同名规则）覆盖——`Excludes.hit()` 判定，不要再手写字符串前缀比较。
+
+**程序行策略徽章**
+- `Item.mode` / `Item.mode_over` 由 `Engine.collect()` 写入（`install_mode_for()` + `install_mode_map` 命中判断），`SNAP_FIELDS` 不含它们，因为策略是配置而不是检查结果，每次 `collect()` 都重算。
+- `widgets.ModeChip` 继承 `Badge`，自绘 hover 底色；`ProgramRow.refresh()` 里 Git 行 `setText("")` 直接隐藏。
+- 改全局默认策略时 `StrategyPage.config_changed` 连着 `_sync_item_modes()`，否则所有「跟随全局」的徽章会停在旧文案。
