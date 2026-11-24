@@ -1895,13 +1895,20 @@ class MainWindow(QWidget):
         if not ok:
             self.toast.show_text(info, ok=False)
             return
-        self.items = [i for i in self.items if i.key != it.key]
+        # 排除一个文件夹 = 连同它的全部子文件夹一起排除。只删被点的那一行是不够的：
+        # 兄弟仓库（Git-Maawork\\FGO / \\E7 …）还留在列表里，用户会以为排除没生效。
+        # 用 Excludes.hit() 按路径前缀一次性过滤，再触发重扫让状态与配置一致。
+        root = self.engine.owner_root(it.path) or {}
+        ex = core.Excludes(root.get("path", ""), root.get("exclude", []))
+        self.items = [i for i in self.items if not ex.hit(i.path)]
         self.page_home.set_items(self.items)
         self.progs_list.set_items(self.items)
+        self.page_strategy.set_items(self.items)
         self._save_cfg()
         if hasattr(self, "page_settings"):
             self.page_settings.reload_roots()
-        self.toast.show_text(f"已排除「{info}」，不再检查它")
+        self.toast.show_text(f"已排除「{info}」及其子文件夹，重新扫描中…")
+        QTimer.singleShot(200, self.start_scan)
         if self.tray is not None:
             self.tray.set_tooltip(self.engine.records.get("last_scan", ""),
                                   sum(1 for i in self.items

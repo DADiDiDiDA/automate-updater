@@ -259,3 +259,17 @@ python app.py --tray          # 后台静默启动（开机自启用这个）
 - 合并只针对「磁盘有、内存没有」的键，所以正常删除操作不会被误恢复；同一进程连续写盘也不会重复追加。
 - 每次写盘前把上一版复制到 `config_backups/`（按分钟去重，滚动 20 份），`config.save.log` 只记时间 / pid / 关键项计数，**绝不写 webhook 与密钥**。
 - 回归见 `_test/verify_au_v1621.py`（13 项）：外部写入合并、正常写盘不误合并、备份与审计、真实重载。
+
+## 15. v1.6.22 补记：排除刷新 + 配置分层
+
+**右键排除必须整支移除并重扫**
+- `MainWindow.exclude_item()` 以前只按 `it.key` 删被点的那一行，兄弟子仓库（如 `Git-Maawork\FGO`、`\E7`）还留在程序列表里，用户会以为「排除没生效」。
+- 现在写入排除后用 `core.Excludes(root.path, root.exclude).hit(i.path)` 过滤整个列表（一次去掉该文件夹及全部子孙），再 `QTimer.singleShot(200, self.start_scan)` 用新配置重扫；首页 / 程序页 / 策略页三个列表同步刷新。
+
+**配置改成「默认 + 用户层」持久化（core.py §配置持久化）**
+- 两个文件：`config.json` 是展开后的完整配置（给人看 / 给老版本读），`config.user.json` 是**唯一权威**的稀疏用户层，只存「与当前默认值不同」的键。
+- `config_delta(defaults, cfg)` 生成差异：字典递归、列表整体替换、删除用 `{__au_remove__: True}` 墓碑；`USER_OWNED_MAPS`（`install_mode_map` / `preserve_map` / `manual_versions`）整个存，因为键名完全由用户决定。
+- `apply_config_delta(base, delta)` 把用户层叠加到默认上。**加载时如果 `config.user.json` 存在就完全不读 `config.json`**：展开层里存着「写盘那一刻的旧默认值」，一旦参与加载就会把升级后的新默认值盖回去（这正是「更新后配置像被重置」的元凶之一）。只有用户层不存在时才把 `config.json` 当老安装迁移、转成差异。
+- 写盘顺序：先写用户层（权威）再写展开层（兼容），崩在中间也不会丢用户设置。v1.6.21 的 mtime 保护、`config_backups/`、审计日志都保留，保护性合并现在从两层文件都读。
+-  Consequences：`roots` 这类「整体归用户管」的列表，升级时默认里新增的项不会注入（用户可能故意删过），但用户没碰过的标量/字典默认值（如新增的网络参数、默认策略）会自动升级生效。
+- 回归：`_test/verify_au_v1622.py`（25 项）覆盖分层、升级、老配置迁移、删除不复活、外部合并、排除过滤；v1.6.21 及此前全部回归无回退。

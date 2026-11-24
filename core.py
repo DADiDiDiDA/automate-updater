@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import glob
 import hashlib
@@ -38,7 +39,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.21"
+APP_VERSION = "1.6.22"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -712,51 +713,163 @@ def daily_state(cfg: dict) -> dict:
     return st
 
 
-def load_config() -> dict:
-    global _CFG_LOADED_MTIME_NS
-    cfg = default_config()
-    p = config_path()
+# ==================================================================== 配置持久化
+# v1.6.22 起分两层：
+#   config.json      展开后的完整配置（给人看 / 给老版本读）
+#   config.user.json 用户改动层，只存「和默认配置不一样」的地方
+# 读取：默认 → config.json → config.user.json（用户层优先级最高）
+# 写入：先写用户层再写展开层；中途崩了用户层还在，重启不会丢设置。
+# 这样程序升级改了默认配置，也不会把用户改过的项目覆盖掉。
+USER_OWNED_MAPS = ("install_mode_map", "preserve_map", "manual_versions")
+_REMOVE_KEY = "__au_remove__"
+
+
+def user_config_path() -> str:
+    return os.path.join(config_dir(), "config.user.json")
+
+
+def _is_remove(v) -> bool:
+    return isinstance(v, dict) and len(v) == 1 and v.get(_REMOVE_KEY) is True
+
+
+def _mark_remove() -> dict:
+    return {_REMOVE_KEY: True}
+
+
+def _dict_delta(base: dict, cur: dict) -> dict:
+    """递归算出 cur 相对 base 的差异；被删除的键用墓碑标记。"""
+    out: dict = {}
+    for k, v in cur.items():
+        if k in base and isinstance(v, dict) and isinstance(base[k], dict):
+            sub = _dict_delta(base[k], v)
+            if sub:
+                out[k] = sub
+        elif k not in base or v != base[k]:
+            out[k] = copy.deepcopy(v)
+    for k in base:
+        if k not in cur:
+            out[k] = _mark_remove()
+    return out
+
+
+def config_delta(defaults: dict, cfg: dict) -> dict:
+    """算出只含用户改动的稀疏层（列表整体替换，字典递归）。"""
+    out: dict = {}
+    for k, v in cfg.items():
+        if k in USER_OWNED_MAPS:            # 这些 map 完全归用户管，整体存
+            if v != defaults.get(k):
+                out[k] = copy.deepcopy(v)
+            continue
+        b = defaults.get(k, None)
+        if isinstance(v, dict) and isinstance(b, dict):
+            sub = _dict_delta(b, v)
+            if sub:
+                out[k] = sub
+        elif k not in defaults or v != b:
+            out[k] = copy.deepcopy(v)
+    for k in defaults:
+        if k not in cfg:
+            out[k] = _mark_remove()
+    return out
+
+
+def _apply_dict(base: dict, delta: dict) -> dict:
+    out = copy.deepcopy(base)
+    for k, v in delta.items():
+        if _is_remove(v):
+            out.pop(k, None)
+        elif isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _apply_dict(out[k], v)
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
+def apply_config_delta(base: dict, delta) -> dict:
+    """把稀疏用户层叠加到 base 上（墓碑 = 删除键）。"""
+    out = copy.deepcopy(base)
+    for k, v in (delta or {}).items():
+        if _is_remove(v):
+            out.pop(k, None)
+        elif k in USER_OWNED_MAPS:
+            out[k] = copy.deepcopy(v)
+        elif isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _apply_dict(out[k], v)
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
+def _read_json(path: str):
     try:
-        _CFG_LOADED_MTIME_NS = os.stat(p).st_mtime_ns if os.path.exists(p) else 0
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        _CFG_LOADED_MTIME_NS = 0
-    if os.path.exists(p):
+        return None
+
+
+def _config_mtimes() -> dict:
+    out = {}
+    for p in (config_path(), user_config_path()):
         try:
-            with open(p, encoding="utf-8") as f:
-                disk = json.load(f)
+            out[p] = os.stat(p).st_mtime_ns if os.path.exists(p) else 0
+        except Exception:
+            out[p] = 0
+    return out
+
+
+def load_config() -> dict:
+    global _CFG_LOADED_MTIME_NS, _CFG_LOADED_MTIMES
+    base = default_config()
+    cfg = copy.deepcopy(base)
+    p = config_path()
+    up = user_config_path()
+    _CFG_LOADED_MTIMES = _config_mtimes()
+    _CFG_LOADED_MTIME_NS = _CFG_LOADED_MTIMES.get(p, 0)
+
+    if os.path.exists(up):
+        # 用户层存在 → 它是唯一权威。展开层 config.json 只是给人看/给老版本读的快照，
+        # 绝不能参与加载：它里面存着「当时的默认值」，会把升级后的新默认值盖回去。
+        disk = _read_json(up)
+        if isinstance(disk, dict):
+            cfg = apply_config_delta(cfg, disk)
+        else:
+            try:
+                shutil.copy2(up, up + ".corrupt")
+            except Exception:
+                pass
+    elif os.path.exists(p):
+        # 迁移老安装：只有展开层时，把它和当前默认值做差，等价于用户层
+        disk = _read_json(p)
+        if isinstance(disk, dict):
+            merged = copy.deepcopy(base)
             for k, v in disk.items():
                 if k in ("backup", "dingtalk", "ui", "mirrors", "update") and isinstance(v, dict):
-                    cfg.setdefault(k, {})
-                    if isinstance(cfg[k], dict):
-                        cfg[k].update(v)
+                    if isinstance(merged.get(k), dict):
+                        merged[k].update(v)
                     else:
-                        cfg[k] = v
-                elif k in ("roots", "preserve", "proxy_ports", "programs") and isinstance(v, list):
-                    cfg[k] = v
+                        merged[k] = v
                 else:
-                    cfg[k] = v
-        except Exception:
-            # 留个现场再回落默认值：否则用户只会看到"设置全没了"
+                    merged[k] = v
+            cfg = apply_config_delta(cfg, config_delta(base, merged))
+        else:
             try:
                 shutil.copy2(p, p + ".corrupt")
             except Exception:
                 pass
+
     # 首次运行迁移旧版 CLI 配置
-    if not os.path.exists(p):
-        legacy = r"D:\Automate\_updater\config.json"
-        if os.path.exists(legacy):
-            try:
-                with open(legacy, encoding="utf-8") as f:
-                    old = json.load(f)
-                if old.get("dingtalk"):
-                    cfg["dingtalk"].update({"webhook": old["dingtalk"].get("webhook", ""),
-                                            "secret": old["dingtalk"].get("secret", "")})
-                if old.get("root"):
-                    cfg["roots"] = [{"path": old["root"].replace("/", "\\"),
-                                     "exclude": ["My-maawork", "Cache", "_updater", "_backup"],
-                                     "depth": int(old.get("git_scan_max_depth", 4)), "enabled": True}]
-            except Exception:
-                pass
+    if not os.path.exists(p) and not os.path.exists(up):
+        legacy = r"D:/Automate/_updater/config.json"
+        old = _read_json(legacy)
+        if isinstance(old, dict):
+            if isinstance(old.get("dingtalk"), dict):
+                cfg["dingtalk"].update({"webhook": old["dingtalk"].get("webhook", ""),
+                                        "secret": old["dingtalk"].get("secret", "")})
+            if old.get("root"):
+                cfg["roots"] = [{"path": old["root"].replace("/", "\\"),
+                                 "exclude": ["My-maawork", "Cache", "_updater", "_backup"],
+                                 "depth": int(old.get("git_scan_max_depth", 4)), "enabled": True}]
     return _normalize(cfg)
 
 
@@ -764,105 +877,114 @@ def load_config() -> dict:
 # 共用一个临时文件名时，两边会互相截断，甚至把半截 JSON 换成正式文件——
 # 下次启动解析失败就静默回落到默认配置，用户的检查目录/镜像/钉钉配置全丢。
 _CFG_LOCK = threading.RLock()
-_CFG_LOADED_MTIME_NS = 0        # 本进程读配置时文件的 mtime
-_CFG_LAST_WRITE_NS = 0          # 本进程最后一次写盘后的 mtime
+_CFG_LOADED_MTIME_NS = 0        # 兼容旧引用
+_CFG_LOADED_MTIMES: dict = {}   # 两份文件读入时的 mtime
+_CFG_LAST_WRITE_NS = 0
+_CFG_LAST_WRITE_MTIMES: dict = {}
 
 
-def _merge_protected_from_disk(cfg: dict, dst: str) -> list[str]:
-    """别的进程改过配置时，把磁盘上「多出来」的用户设置并回来。
+def _disk_as_full(path: str) -> dict:
+    """把任意一层配置读成展开后的完整配置，便于保护性合并。"""
+    d = _read_json(path)
+    if not isinstance(d, dict):
+        return {}
+    if os.path.basename(path) == "config.user.json":
+        return apply_config_delta(default_config(), d)
+    return d
 
-    只做加法，不删本机内存里已有的条目：旧实例退出时用过期配置覆盖新实例，
-    正是「刚加的排除项/单程序策略重启就没了」的典型成因。这里在写盘前
-    把磁盘上更全的那几项补回来，避免静默丢数据。返回被补回的字段说明。
-    """
+
+def _merge_protected_from_disk(cfg: dict) -> list[str]:
+    """别的进程改过配置时，把磁盘上「多出来」的用户设置并回来（只加不删）。"""
     merged = []
-    try:
-        with open(dst, encoding="utf-8") as f:
-            disk = json.load(f)
-    except Exception:
-        return merged
-    if not isinstance(disk, dict):
-        return merged
-    # 检查目录：按路径对应，排除项取并集
-    for dr in disk.get("roots") or []:
-        if not isinstance(dr, dict):
-            continue
-        dp = os.path.normcase(os.path.normpath(str(dr.get("path") or "")))
-        for r in cfg.get("roots") or []:
-            if not isinstance(r, dict) or not dp:
+    for path in (config_path(), user_config_path()):
+        disk = _disk_as_full(path)
+        for dr in disk.get("roots") or []:
+            if not isinstance(dr, dict):
                 continue
-            if os.path.normcase(os.path.normpath(str(r.get("path") or ""))) != dp:
+            dp = os.path.normcase(os.path.normpath(str(dr.get("path") or "")))
+            for r in cfg.get("roots") or []:
+                if not isinstance(r, dict) or not dp:
+                    continue
+                if os.path.normcase(os.path.normpath(str(r.get("path") or ""))) != dp:
+                    continue
+                have = {normalize_exclude(e, r.get("path", "")) for e in (r.get("exclude") or [])}
+                add = [e for e in (dr.get("exclude") or [])
+                       if normalize_exclude(e, r.get("path", "")) not in have]
+                if add:
+                    r.setdefault("exclude", []).extend(add)
+                    merged.append(f"排除项 +{len(add)}")
+                break
+        for key in USER_OWNED_MAPS:
+            dv = disk.get(key)
+            if not isinstance(dv, dict):
                 continue
-            have = {normalize_exclude(e, r.get("path", "")) for e in (r.get("exclude") or [])}
-            add = [e for e in (dr.get("exclude") or [])
-                   if normalize_exclude(e, r.get("path", "")) not in have]
+            cv = cfg.setdefault(key, {})
+            add = [k for k in dv if k not in cv]
+            for k in add:
+                cv[k] = dv[k]
             if add:
-                r.setdefault("exclude", []).extend(add)
-                merged.append(f"排除项 +{len(add)}")
-            break
-    # 单程序设置：磁盘上有、内存里没有的键一律补回
-    for key in ("install_mode_map", "preserve_map", "manual_versions"):
-        dv = disk.get(key)
-        if not isinstance(dv, dict):
-            continue
-        cv = cfg.setdefault(key, {})
-        add = [k for k in dv if k not in cv]
-        for k in add:
-            cv[k] = dv[k]
-        if add:
-            merged.append(f"{key} +{len(add)}")
+                merged.append(f"{key} +{len(add)}")
     return merged
 
 
-def save_config(cfg: dict) -> None:
-    """写配置；每次写盘前留一份上一版，并记一条审计日志。
+def _backup_config_file(path: str, prefix: str, stamp: str, bdir: str) -> None:
+    try:
+        if not os.path.exists(path):
+            return
+        os.makedirs(bdir, exist_ok=True)
+        name = f"{prefix}-{stamp}-{os.getpid()}.json"
+        if not any(f.startswith(prefix + "-" + stamp[:12]) for f in os.listdir(bdir)):
+            shutil.copy2(path, os.path.join(bdir, name))
+        files = sorted(f for f in os.listdir(bdir) if f.startswith(prefix + "-"))
+        for old in files[:-20]:
+            try:
+                os.remove(os.path.join(bdir, old))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    以前配置被覆盖后完全无法追查：不知道是谁写的、上一版是什么。现在
-    `config_backups/` 按分钟滚动保留 20 份，`config.save.log` 记下每次写盘的
-    进程号与关键项计数，设置「消失」时能直接定位并恢复。
-    """
-    global _CFG_LAST_WRITE_NS
+
+def save_config(cfg: dict) -> None:
+    """写两层配置；每次写盘前留备份 + 审计日志（不记 webhook/密钥）。"""
+    global _CFG_LAST_WRITE_NS, _CFG_LAST_WRITE_MTIMES
     with _CFG_LOCK:
         base = config_dir()
         os.makedirs(base, exist_ok=True)
-        dst = config_path()
-        # 别的进程（例如还没退干净的旧实例）在我们读盘之后改过文件：
-        # 写回去之前先把磁盘上多出来的用户设置并回来，否则配置会「重启就丢」。
+        dst, user_dst = config_path(), user_config_path()
+        # 别的进程在我们读盘之后改过文件：写回前把它的用户设置并回来
         try:
-            now_ns = os.stat(dst).st_mtime_ns if os.path.exists(dst) else 0
-            if now_ns and now_ns != _CFG_LAST_WRITE_NS and now_ns != _CFG_LOADED_MTIME_NS:
-                got = _merge_protected_from_disk(cfg, dst)
+            cur = _config_mtimes()
+            external = any(m and m != _CFG_LAST_WRITE_MTIMES.get(p, 0)
+                           and m != _CFG_LOADED_MTIMES.get(p, 0)
+                           for p, m in cur.items())
+            if external:
+                got = _merge_protected_from_disk(cfg)
                 if got:
                     with open(os.path.join(base, "config.save.log"), "a", encoding="utf-8") as f:
                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
                                 f"pid={os.getpid()} MERGED {', '.join(got)}\n")
         except Exception:
             pass
+
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        # 写前备份：同一分钟只留一份，避免一次设置操作产生十几份重复备份
-        try:
-            if os.path.exists(dst):
-                bdir = os.path.join(base, "config_backups")
-                os.makedirs(bdir, exist_ok=True)
-                name = f"config-{stamp}-{os.getpid()}.json"
-                if not any(f.startswith("config-" + stamp[:12]) for f in os.listdir(bdir)):
-                    shutil.copy2(dst, os.path.join(bdir, name))
-                files = sorted(f for f in os.listdir(bdir) if f.startswith("config-"))
-                for old in files[:-20]:
-                    try:
-                        os.remove(os.path.join(bdir, old))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        tmp = "%s.%d.tmp" % (dst, os.getpid())
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, dst)
+        bdir = os.path.join(base, "config_backups")
+        _backup_config_file(dst, "config", stamp, bdir)
+        _backup_config_file(user_dst, "userlayer", stamp, bdir)
+
+        # 先写用户层（权威），再写展开层（兼容）；崩在中间也不会丢用户设置
+        delta = config_delta(default_config(), cfg)
+        for path, payload in ((user_dst, delta), (dst, cfg)):
+            tmp = "%s.%d.tmp" % (path, os.getpid())
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        _CFG_LAST_WRITE_MTIMES = _config_mtimes()
         try:
             _CFG_LAST_WRITE_NS = os.stat(dst).st_mtime_ns
         except Exception:
             _CFG_LAST_WRITE_NS = 0
+
         # 审计日志：只记关键项数量，不记 webhook / 密钥等任何内容
         try:
             roots = cfg.get("roots") or []

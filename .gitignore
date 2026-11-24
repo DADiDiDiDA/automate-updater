@@ -30,3 +30,8 @@ dist_new/
 config_backups_restore_*.json
 config_backups/
 config.save.log
+
+# 配置用户层（含用户数据，绝不入库）
+config.user.json
+config.user.json.corrupt
+config.json.corrupt
