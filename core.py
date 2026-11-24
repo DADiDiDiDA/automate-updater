@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.20"
+APP_VERSION = "1.6.21"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -713,8 +713,13 @@ def daily_state(cfg: dict) -> dict:
 
 
 def load_config() -> dict:
+    global _CFG_LOADED_MTIME_NS
     cfg = default_config()
     p = config_path()
+    try:
+        _CFG_LOADED_MTIME_NS = os.stat(p).st_mtime_ns if os.path.exists(p) else 0
+    except Exception:
+        _CFG_LOADED_MTIME_NS = 0
     if os.path.exists(p):
         try:
             with open(p, encoding="utf-8") as f:
@@ -759,15 +764,122 @@ def load_config() -> dict:
 # 共用一个临时文件名时，两边会互相截断，甚至把半截 JSON 换成正式文件——
 # 下次启动解析失败就静默回落到默认配置，用户的检查目录/镜像/钉钉配置全丢。
 _CFG_LOCK = threading.RLock()
+_CFG_LOADED_MTIME_NS = 0        # 本进程读配置时文件的 mtime
+_CFG_LAST_WRITE_NS = 0          # 本进程最后一次写盘后的 mtime
+
+
+def _merge_protected_from_disk(cfg: dict, dst: str) -> list[str]:
+    """别的进程改过配置时，把磁盘上「多出来」的用户设置并回来。
+
+    只做加法，不删本机内存里已有的条目：旧实例退出时用过期配置覆盖新实例，
+    正是「刚加的排除项/单程序策略重启就没了」的典型成因。这里在写盘前
+    把磁盘上更全的那几项补回来，避免静默丢数据。返回被补回的字段说明。
+    """
+    merged = []
+    try:
+        with open(dst, encoding="utf-8") as f:
+            disk = json.load(f)
+    except Exception:
+        return merged
+    if not isinstance(disk, dict):
+        return merged
+    # 检查目录：按路径对应，排除项取并集
+    for dr in disk.get("roots") or []:
+        if not isinstance(dr, dict):
+            continue
+        dp = os.path.normcase(os.path.normpath(str(dr.get("path") or "")))
+        for r in cfg.get("roots") or []:
+            if not isinstance(r, dict) or not dp:
+                continue
+            if os.path.normcase(os.path.normpath(str(r.get("path") or ""))) != dp:
+                continue
+            have = {normalize_exclude(e, r.get("path", "")) for e in (r.get("exclude") or [])}
+            add = [e for e in (dr.get("exclude") or [])
+                   if normalize_exclude(e, r.get("path", "")) not in have]
+            if add:
+                r.setdefault("exclude", []).extend(add)
+                merged.append(f"排除项 +{len(add)}")
+            break
+    # 单程序设置：磁盘上有、内存里没有的键一律补回
+    for key in ("install_mode_map", "preserve_map", "manual_versions"):
+        dv = disk.get(key)
+        if not isinstance(dv, dict):
+            continue
+        cv = cfg.setdefault(key, {})
+        add = [k for k in dv if k not in cv]
+        for k in add:
+            cv[k] = dv[k]
+        if add:
+            merged.append(f"{key} +{len(add)}")
+    return merged
 
 
 def save_config(cfg: dict) -> None:
+    """写配置；每次写盘前留一份上一版，并记一条审计日志。
+
+    以前配置被覆盖后完全无法追查：不知道是谁写的、上一版是什么。现在
+    `config_backups/` 按分钟滚动保留 20 份，`config.save.log` 记下每次写盘的
+    进程号与关键项计数，设置「消失」时能直接定位并恢复。
+    """
+    global _CFG_LAST_WRITE_NS
     with _CFG_LOCK:
-        os.makedirs(config_dir(), exist_ok=True)
-        tmp = "%s.%d.tmp" % (config_path(), os.getpid())
+        base = config_dir()
+        os.makedirs(base, exist_ok=True)
+        dst = config_path()
+        # 别的进程（例如还没退干净的旧实例）在我们读盘之后改过文件：
+        # 写回去之前先把磁盘上多出来的用户设置并回来，否则配置会「重启就丢」。
+        try:
+            now_ns = os.stat(dst).st_mtime_ns if os.path.exists(dst) else 0
+            if now_ns and now_ns != _CFG_LAST_WRITE_NS and now_ns != _CFG_LOADED_MTIME_NS:
+                got = _merge_protected_from_disk(cfg, dst)
+                if got:
+                    with open(os.path.join(base, "config.save.log"), "a", encoding="utf-8") as f:
+                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+                                f"pid={os.getpid()} MERGED {', '.join(got)}\n")
+        except Exception:
+            pass
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        # 写前备份：同一分钟只留一份，避免一次设置操作产生十几份重复备份
+        try:
+            if os.path.exists(dst):
+                bdir = os.path.join(base, "config_backups")
+                os.makedirs(bdir, exist_ok=True)
+                name = f"config-{stamp}-{os.getpid()}.json"
+                if not any(f.startswith("config-" + stamp[:12]) for f in os.listdir(bdir)):
+                    shutil.copy2(dst, os.path.join(bdir, name))
+                files = sorted(f for f in os.listdir(bdir) if f.startswith("config-"))
+                for old in files[:-20]:
+                    try:
+                        os.remove(os.path.join(bdir, old))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        tmp = "%s.%d.tmp" % (dst, os.getpid())
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, config_path())
+        os.replace(tmp, dst)
+        try:
+            _CFG_LAST_WRITE_NS = os.stat(dst).st_mtime_ns
+        except Exception:
+            _CFG_LAST_WRITE_NS = 0
+        # 审计日志：只记关键项数量，不记 webhook / 密钥等任何内容
+        try:
+            roots = cfg.get("roots") or []
+            excl = sum(len(r.get("exclude") or []) for r in roots if isinstance(r, dict))
+            mm = cfg.get("install_mode_map") or {}
+            line = (f"{time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} "
+                    f"roots={len(roots)} exclude={excl} modes={len(mm)}\n")
+            log = os.path.join(base, "config.save.log")
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(line)
+            with open(log, encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > 300:
+                with open(log, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-300:])
+        except Exception:
+            pass
 
 
 # ==================================================================== 网络

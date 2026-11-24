@@ -25,3 +25,8 @@ dist/
 # 开发用测试脚本 / 临时构建产物
 _test/
 dist_new/
+
+# 配置备份与审计日志（含用户数据，绝不入库）
+config_backups_restore_*.json
+config_backups/
+config.save.log

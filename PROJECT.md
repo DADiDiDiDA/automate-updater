@@ -251,3 +251,11 @@ python app.py --tray          # 后台静默启动（开机自启用这个）
 - `proxy_ports` 的权威位置是**配置顶层**（`resolve_proxy()` 读 `cfg["proxy_ports"]`），不是 `cfg["proxy"]["proxy_ports"]`。设置页输入框在「本地代理 = auto」时才显示；`_save_proxy()` 负责解析去重、夹 1–65535，并把规范化文本回填输入框。
 - `mirrors.probe_before` 现在由设置页「下载前补测速」开关写入；它只影响下载前是否 `ensure_mirror()`，不动 `mirrors.daily` 的每日流程标记，切它不需要清当天闸门。
 - 回归：新语义与两个新选项都收在 `_test/verify_au_v1620.py`（38 项）；v1.6.19 的两条旧断言已改写。
+
+## 14. v1.6.21 补记：配置防丢
+
+- `save_config()` 以前只做「加锁 + pid 临时文件 + os.replace」，能防写坏，但防不住**旧实例退出时用过期内存覆盖新配置**（现象：刚加的排除项 / 单程序策略重启就没了）。
+- 现在 `load_config()` 记下文件 mtime（`_CFG_LOADED_MTIME_NS`），`save_config()` 每次写前比对：若 mtime 既不是我们读入时的、也不是自己上次写入的（`_CFG_LAST_WRITE_NS`），说明有别的进程改过 → 先 `_merge_protected_from_disk()` 把磁盘上多出来的 `roots[].exclude` / `install_mode_map` / `preserve_map` / `manual_versions` 并回来（只加不删），再写。写完更新 `_CFG_LAST_WRITE_NS`。
+- 合并只针对「磁盘有、内存没有」的键，所以正常删除操作不会被误恢复；同一进程连续写盘也不会重复追加。
+- 每次写盘前把上一版复制到 `config_backups/`（按分钟去重，滚动 20 份），`config.save.log` 只记时间 / pid / 关键项计数，**绝不写 webhook 与密钥**。
+- 回归见 `_test/verify_au_v1621.py`（13 项）：外部写入合并、正常写盘不误合并、备份与审计、真实重载。
