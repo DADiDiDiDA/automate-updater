@@ -682,9 +682,9 @@ class ExcludeDialog(ThemedDialog):
         self.path = path
         self.depth = max(1, min(8, int(depth or 4)))
         self.body.addWidget(_label(
-            "扫描下面这个目录时跳过这些文件夹（每行一个，不区分大小写）。"
-            "填名称（任意层级同名目录都跳过）或相对路径（如 BetterGI\\Repos）；"
-            "排除一个文件夹，等于连同它的全部子文件夹一起排除。",
+            "每行填一个相对这个目录的文件夹路径（每行一个，不区分大小写）："
+            "写 Cache 只跳过根目录下的 Cache，写 MAA\\Cache 才跳过更深处的同名目录；"
+            "只匹配指定位置，但排除一个文件夹会连同它的全部子文件夹一起排除。",
             11, "text_muted", wrap=True))
         self.body.addWidget(_label(path, 11, "text_dim", wrap=True))
         self.body.addWidget(_label(
@@ -1332,7 +1332,7 @@ class RootRow(QWidget):
         self.sub_lbl.setText(f"排除 {len(ex)} 项（含子文件夹） · 扫描深度 {depth}" if ex
                              else f"未设置排除 · 扫描深度 {depth}")
         if ex:
-            self.sub_lbl.setToolTip("排除项：\n" + "\n".join(f"· {e}" for e in ex)
+            self.sub_lbl.setToolTip("排除项（只匹配填写的位置）：\n" + "\n".join(f"· {e}" for e in ex)
                                     + "\n\n被排除的文件夹连同其全部子文件夹都不参与检查")
         else:
             self.sub_lbl.setToolTip("还没有排除任何文件夹")
@@ -1369,7 +1369,7 @@ class RootRow(QWidget):
 class SettingsPage(QWidget):
     """设置页：顶部分页 + 「分组标题 / 设置行」列表。"""
 
-    PROXY_DESC = "自动探测（7890 / 1080 / 10809…）或手动指定，也可以完全不用"
+    PROXY_DESC = "自动探测（端口见下方）或手动指定，也可以完全不用"
 
     theme_changed = Signal()
     roots_changed = Signal()
@@ -1848,6 +1848,13 @@ class SettingsPage(QWidget):
                   "每天测速内置加速地址与全部线路，下载前按速度择优；"
                   "关掉后启动检查会跳过测速步骤", box, self.mirror_lbl)
 
+        self.probe_toggle = ToggleSwitch(bool(mcfg.get("probe_before", True)))
+        self.probe_toggle.setToolTip("下载前若当天还没测速就补测一次，之后按速度顺序尝试线路")
+        self.probe_toggle.toggled.connect(self._save_mirrors)
+        self._row(lay, "download", "下载前补测速",
+                  "下载前若当天还没测过速就补测一次；关掉后直接用上次缓存的测速结果，"
+                  "断流仍会自动续传 / 换线路", self.probe_toggle)
+
         # ---- 代理：自动探测 / 手动指定 / 不使用 ----
         pcfg = self.cfg.setdefault("proxy", {})
         mode = pcfg.get("mode", "auto")
@@ -1860,6 +1867,19 @@ class SettingsPage(QWidget):
         self.proxy_row = self._row(
             lay, "link", "本地代理", self.PROXY_DESC,
             self.proxy_mode)
+
+        # 自动探测的端口表：以前只在 config.json 里，界面完全看不到
+        self.ports_edit = QLineEdit(
+            ", ".join(str(p) for p in (pcfg.get("proxy_ports") or core.DEFAULT_PROXY_PORTS)))
+        self.ports_edit.setPlaceholderText("7890, 1080, 10809")
+        self.ports_edit.setMinimumHeight(32)
+        self.ports_edit.setMinimumWidth(300)
+        self.ports_edit.editingFinished.connect(self._save_proxy)
+        self.ports_row = self._row(
+            lay, "settings", "自动探测端口",
+            "「本地代理 = 自动探测」时逐个尝试这些本机端口；写好几个用逗号分隔，"
+            "SOCKS 端口（1080/1081）会自动跳过，留空等于不探测", self.ports_edit)
+        self.ports_row.setVisible(mode == "auto")
 
         self.proxy_edit = QLineEdit((pcfg.get("url") or ""))
         self.proxy_edit.setPlaceholderText("http://127.0.0.1:7890")
@@ -1934,6 +1954,8 @@ class SettingsPage(QWidget):
             m["daily_check"] = self.daily_toggle.isChecked()
         if hasattr(self, "node_toggle"):
             m["auto_nodes"] = self.node_toggle.isChecked()
+        if hasattr(self, "probe_toggle"):
+            m["probe_before"] = self.probe_toggle.isChecked()
         # 准备流程按天记完成；开关变了要清掉对应标记，让下次检查立刻按新设置补跑，
         # 否则「关掉时跳过」留下的完成标记会让重新打开后整天都不生效。
         daily = m.get("daily")
@@ -1953,8 +1975,26 @@ class SettingsPage(QWidget):
         pc = self.cfg.setdefault("proxy", {})
         mode = self.proxy_mode.value() or "auto"
         pc["mode"] = mode
+        # 控件是逐个创建的，构造期若信号提前触发，后面的控件还不存在
+        if not hasattr(self, "proxy_edit") or not hasattr(self, "ports_edit"):
+            return
         url = self.proxy_edit.text().strip()
         pc["url"] = url
+        raw_ports = self.ports_edit.text().replace("，", ",")
+        ports, seen = [], set()
+        for chunk in raw_ports.split(","):
+            try:
+                p = int(chunk.strip())
+            except (TypeError, ValueError):
+                continue
+            if 1 <= p <= 65535 and p not in seen:
+                seen.add(p)
+                ports.append(p)
+        # 顶层 proxy_ports 才是 resolve_proxy()/detect_proxy() 读的那份；
+        # 写进 proxy 子字典看着像存了，实际完全不生效。
+        self.cfg["proxy_ports"] = ports
+        self.ports_edit.setText(", ".join(str(p) for p in ports))
+        self.ports_row.setVisible(mode == "auto")
         self.proxy_addr_row.setVisible(mode == "manual")
         if url.lower().startswith("socks"):
             # urllib 的 ProxyHandler 不支持 SOCKS，填了也会静默失效，必须说清楚

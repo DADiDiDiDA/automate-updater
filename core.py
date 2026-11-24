@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 
 APP_NAME = "自动化更新器"          # 显示名称（窗口标题 / 托盘 / 关于）
 APP_ID = "AutomateUpdater"        # 内部标识：配置回退目录、单实例名、AppUserModelID
-APP_VERSION = "1.6.19"
+APP_VERSION = "1.6.20"
 
 # 子进程（git / tar / tasklist / powershell）都是控制台程序，必须禁止弹窗
 CREATE_NO_WINDOW = 0x08000000
@@ -225,7 +225,7 @@ def cleanup_dlcache(keep_days: int = 7, max_bytes: int = 2 * 1024 ** 3) -> int:
 def default_config() -> dict:
     return {
         "version": 6,
-        "roots": [{"path": "D:\\Automate", "exclude": ["My-maawork", "Cache", "_updater", "_backup", ".git"],
+        "roots": [{"path": "D:\\Automate", "exclude": ["My-maawork", "Cache", "_updater", "_backup"],
                    "depth": 4, "enabled": True}],
         "preserve": list(DEFAULT_PRESERVE),
         "preserve_map": {},                    # 程序名(小写) → {"custom": True, "list": [...]}
@@ -412,6 +412,21 @@ def _normalize(cfg: dict) -> dict:
     if base_pc.get("mode") not in ("auto", "manual", "off"):
         base_pc["mode"] = "auto"
     base_pc["url"] = str(base_pc.get("url") or "").strip()
+    # 自动探测端口表：界面可编辑，手改配置里混进字符串/超范围端口也不能让探测崩掉。
+    # 空列表是合法值（等于自动模式下不探测任何端口）。
+    raw_ports = cfg.get("proxy_ports")
+    if not isinstance(raw_ports, list):
+        raw_ports = list(DEFAULT_PROXY_PORTS)
+    ports, seen_ports = [], set()
+    for p in raw_ports:
+        try:
+            n = int(p)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= 65535 and n not in seen_ports:
+            seen_ports.add(n)
+            ports.append(n)
+    cfg["proxy_ports"] = ports
     if not isinstance(cfg.get("manual_versions"), dict):
         cfg["manual_versions"] = {}
     else:
@@ -470,9 +485,12 @@ def _normalize(cfg: dict) -> dict:
         entries, seen = [], set()
         for e in (raw if isinstance(raw, list) else []):
             v = normalize_exclude(e, base)
-            if v and v not in seen:
-                seen.add(v)
-                entries.append(str(e).strip())
+            # 隐藏目录（.git 等）本来就从不扫描，写进排除表只会让校验提示
+            # 「没匹配到文件夹」。老配置里的这一项统一清掉，行为不变。
+            if not v or v == ".git" or v.endswith("\\.git") or v in seen:
+                continue
+            seen.add(v)
+            entries.append(str(e).strip())
         try:
             depth = int(r.get("depth") or 4)
         except Exception:
@@ -730,7 +748,7 @@ def load_config() -> dict:
                                             "secret": old["dingtalk"].get("secret", "")})
                 if old.get("root"):
                     cfg["roots"] = [{"path": old["root"].replace("/", "\\"),
-                                     "exclude": ["My-maawork", "Cache", "_updater", "_backup", ".git"],
+                                     "exclude": ["My-maawork", "Cache", "_updater", "_backup"],
                                      "depth": int(old.get("git_scan_max_depth", 4)), "enabled": True}]
             except Exception:
                 pass
@@ -1801,9 +1819,9 @@ class Engine:
         low = normalize_exclude(entry, base)
         excl = root.setdefault("exclude", [])
         olds = [normalize_exclude(e, base) for e in excl]
-        if low in olds or os.path.basename(low) in olds:
+        if low in olds:
             return False, f"「{entry}」已经在排除列表里了"
-        # 已经被上级（或同名规则）覆盖：再单独排一次子文件夹没有意义
+        # 已经被上级排除项覆盖：再单独排一次子文件夹没有意义
         if Excludes(base, excl).hit(path):
             return False, f"「{entry}」已被上级排除项覆盖（排除本来就含全部子文件夹）"
         excl.append(entry)
@@ -1820,10 +1838,9 @@ class Engine:
             return False
         base = root.get("path", "")
         low = normalize_exclude(self.exclude_entry(path), base)
-        name = low.rsplit("\\", 1)[-1]
         before = len(root.get("exclude", []))
         root["exclude"] = [e for e in root.get("exclude", [])
-                           if normalize_exclude(e, base) not in (low, name)]
+                           if normalize_exclude(e, base) != low]
         if len(root["exclude"]) != before:
             try:
                 save_config(self.cfg)
@@ -2522,18 +2539,17 @@ def send_dingtalk_raw(ding_cfg: dict, text: str, title: str = APP_NAME) -> bool:
 
 # ==================================================================== 目录/文件工具
 
-# 排除规则：一个检查根目录一份。排除项既可以是「文件夹名」，也可以是
-# 「相对根目录的路径」，三种写法都接受：
-#   1. 文件夹名        Cache                  → 任意层级同名目录都排除
-#   2. 相对路径        BetterGI\Repos         → 该目录**及其全部子目录**
-#   3. 绝对路径        D:\Automate\Cache      → 落在根目录内就折算成相对路径
-# 正斜杠/反斜杠、首尾多余分隔符与空格都做归一化。以前写成 A/B、带尾斜杠、
-# 或者贴了完整路径时会静默匹配不上（排除了却还在扫），也只在偶数层级生效。
+# 排除规则：一个检查根目录一份，一律按**指定位置**（相对根目录的路径）匹配。
+#   Cache                 → 只排除根目录下那个 Cache（不再误伤别的同名目录）
+#   BetterGI\Repos         → 排除该目录及其全部子目录
+#   D:\Automate\Cache      → 落在根目录内就折算成相对路径
+# 正斜杠/反斜杠、首尾多余分隔符与空格都做归一化。要排除深层同名目录就写完整
+# 相对路径（如 MAA\Cache），不再靠「同名」到处匹配。
 _DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 def normalize_exclude(entry: str, root: str = "") -> str:
-    """把排除项整理成小写名称或相对路径；不在 root 之下的绝对路径返回空串。"""
+    """把排除项整理成小写相对路径；不在 root 之下的绝对路径返回空串。"""
     s = str(entry or "").strip().strip('"').strip("'").replace("/", "\\")
     s = re.sub(r"\\{2,}", r"\\", s).strip("\\")
     if not s or s in (".", ".."):
@@ -2555,39 +2571,34 @@ def normalize_exclude(entry: str, root: str = "") -> str:
 
 
 class Excludes:
-    """一个根目录的排除规则；判定「自身或任一祖先被排除」。
+    """一个根目录的排除规则：只按**指定位置**（相对路径）匹配，不按同名到处匹配。
 
+    条目一律折叠成相对根目录的路径（写 `Cache` 就是根目录下的 `Cache`），
+    `hit()` 检查自身或任一祖先是否在名单里——所以排除一个文件夹仍然含它的
+    全部子文件夹，但不会误伤别处的同名目录。
     祖先匹配很关键：os.walk 会剪枝，但 dir_size / 版本探测 / 以后新增的枚举
-    入口不一定从根目录开始走，只要路径里有任何一层在排除名单里，就整支跳过。
+    入口不一定从根目录开始走，必须按路径判定。
     """
 
-    __slots__ = ("root", "names", "paths")
+    __slots__ = ("root", "paths")
 
     def __init__(self, root: str = "", entries=None):
         self.root = os.path.abspath(root) if root else ""
-        self.names: set[str] = set()
         self.paths: set[str] = set()
         for e in entries or ():
             v = normalize_exclude(e, self.root)
-            if not v:
-                continue
-            if "\\" in v:
+            if v:
                 self.paths.add(v)
-            else:
-                self.names.add(v)
 
     def __bool__(self) -> bool:
-        return bool(self.names or self.paths)
+        return bool(self.paths)
 
     def __len__(self) -> int:
-        return len(self.names) + len(self.paths)
+        return len(self.paths)
 
     def hit(self, path: str, name: str = "") -> bool:
-        if not (self.names or self.paths):
+        if not self.paths or not self.root:
             return False
-        if not self.root:
-            base = name or os.path.basename(str(path).rstrip("\\/"))
-            return bool(base) and base.lower() in self.names
         try:
             rel = os.path.relpath(os.path.abspath(path), self.root)
         except Exception:
@@ -2596,10 +2607,8 @@ class Excludes:
         if rel.startswith(".."):
             return False                       # 不在这个根目录下，跟它无关
         parts = [p for p in rel.split("\\") if p and p != "."]
-        for i, part in enumerate(parts, 1):
-            if part in self.names:             # 祖先目录同名 → 整支排除
-                return True
-            if self.paths and "\\".join(parts[:i]) in self.paths:
+        for i in range(1, len(parts) + 1):
+            if "\\".join(parts[:i]) in self.paths:
                 return True
         return False
 
@@ -2659,52 +2668,19 @@ def find_program_dirs(root: str, exclude) -> list[str]:
     return out
 
 
-def excluded_hits(root: str, entries, max_depth: int = 5,
-                  max_dirs: int = 8000) -> tuple[list[str], list[str]]:
-    """校验排除项：返回 (确实匹配到文件夹的项, 一个都没匹配上的项)。
+def excluded_hits(root: str, entries) -> tuple[list[str], list[str]]:
+    """校验排除项：返回 (确实存在这个文件夹的项, 找不到对应文件夹的项)。
 
-    设置页用它提示「排除了但没生效」——写错名字、贴了别的盘符的路径、
-    或者填了根本不存在的目录时，用户以前完全看不出来，只会在扫描结果里
-    发现「怎么还在检查」。这里直接按文件系统验证，不依赖扫描剪枝。
+    匹配语义是「只按指定位置」，所以这里只要对 `root\条目` 做一次 stat 即可，
+    不再遍历整棵目录树（更快，也和扫描时的判定完全一致）。
     """
-    want = [(str(raw), normalize_exclude(raw, root)) for raw in (entries or [])]
-    want = [(raw, v) for raw, v in want if v]
-    if not root or not want:
-        return [], []
-    names_need = {v for _, v in want if "\\" not in v}
-    paths_need = {v for _, v in want if "\\" in v}
-    found_names, found_paths = set(), set()
-    for v in list(paths_need):
-        if os.path.isdir(os.path.join(root, *v.split("\\"))):
-            found_paths.add(v)
-    if names_need or (paths_need - found_paths):
-        base = os.path.abspath(root).rstrip(os.sep).count(os.sep)
-        seen = 0
-        try:
-            for dirpath, dirnames, _ in os.walk(root):
-                depth = dirpath.rstrip(os.sep).count(os.sep) - base
-                for d in dirnames:
-                    seen += 1
-                    low = d.lower()
-                    if low in names_need:
-                        found_names.add(low)
-                    if paths_need:
-                        try:
-                            rel = os.path.relpath(os.path.join(dirpath, d), root)
-                        except Exception:
-                            continue
-                        found_paths.add(rel.replace("/", "\\").lower())
-                if depth >= max_depth or seen > max_dirs:
-                    dirnames[:] = []
-                else:
-                    dirnames[:] = [x for x in dirnames
-                                   if x not in (".git", "__pycache__")]
-        except Exception:
-            pass
     hit, miss = [], []
-    for raw, v in want:
-        ok = (v in found_paths) if "\\" in v else (v in found_names)
-        (hit if ok else miss).append(raw)
+    for raw in entries or []:
+        v = normalize_exclude(raw, root)
+        if not v:
+            continue
+        target = os.path.join(root, *v.split("\\"))
+        (hit if os.path.isdir(target) else miss).append(str(raw))
     return hit, miss
 
 

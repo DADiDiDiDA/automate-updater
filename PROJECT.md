@@ -231,7 +231,7 @@ python app.py --tray          # 后台静默启动（开机自启用这个）
 
 ## 12. v1.6.19 补记
 
-**排除文件夹（语义：排除即含全部子文件夹）**
+**排除文件夹（语义：排除即含全部子文件夹；v1.6.20 起只按指定位置匹配）**
 - `core.normalize_exclude(entry, root)` 是唯一入口：统一正/反斜杠、压缩重复分隔符、去首尾分隔符与引号空格、绝对路径（且在本根目录内）折算成相对路径、`..` 之外一律丢弃。配置加载时 `_normalize()` 用它批量归一化并去重，`depth` 夹到 1–8。
 - `core.Excludes(root, entries)` 是唯一的匹配器：条目按「有没有分隔符」分成 `names` / `paths`，`hit()` 做**祖先链判定**（路径上任意一层命中即整支排除）。`find_git_repos` / `find_program_dirs` 走 `prune()`，`dir_size()` 也接 `excl=` 参数——凡是从根目录之外起步的枚举（体积、以后新增的入口）都必须显式传入，否则会出现「排除了但在统计里还在」。
 - 别再用「`rel in excl` 精确比对」：写成 `A/B`、带尾斜杠、贴绝对路径都会静默失效，这正是 v1.6.19 修的主诉。
@@ -242,3 +242,12 @@ python app.py --tray          # 后台静默启动（开机自启用这个）
 - `Item.mode` / `Item.mode_over` 由 `Engine.collect()` 写入（`install_mode_for()` + `install_mode_map` 命中判断），`SNAP_FIELDS` 不含它们，因为策略是配置而不是检查结果，每次 `collect()` 都重算。
 - `widgets.ModeChip` 继承 `Badge`，自绘 hover 底色；`ProgramRow.refresh()` 里 Git 行 `setText("")` 直接隐藏。
 - 改全局默认策略时 `StrategyPage.config_changed` 连着 `_sync_item_modes()`，否则所有「跟随全局」的徽章会停在旧文案。
+
+## 13. v1.6.20 补记
+
+- **排除项不再按名称到处匹配**：§12 的 `names` 集合已删除。`normalize_exclude()` 一律折叠成小写相对路径，`Excludes.paths` 只存路径，`hit()` 沿祖先链比前缀——写 `Cache` 只匹配 `root\Cache`，写 `MAA\Cache` 才匹配深处同名。别再恢复「basename in names」那套逻辑。
+- `excluded_hits()` 因此简化成一次 `os.path.isdir(root\条目)`，不再遍历目录树；扫描判定与界面校验天然一致。
+- `.git` 之类的隐藏目录本来就由 `Excludes.prune()` 的 `d.startswith(".")` 跳过，配置里不需要也不该再写；`_normalize()` 会把老配置里的 `.git` / `xxx\.git` 项清掉。
+- `proxy_ports` 的权威位置是**配置顶层**（`resolve_proxy()` 读 `cfg["proxy_ports"]`），不是 `cfg["proxy"]["proxy_ports"]`。设置页输入框在「本地代理 = auto」时才显示；`_save_proxy()` 负责解析去重、夹 1–65535，并把规范化文本回填输入框。
+- `mirrors.probe_before` 现在由设置页「下载前补测速」开关写入；它只影响下载前是否 `ensure_mirror()`，不动 `mirrors.daily` 的每日流程标记，切它不需要清当天闸门。
+- 回归：新语义与两个新选项都收在 `_test/verify_au_v1620.py`（38 项）；v1.6.19 的两条旧断言已改写。
