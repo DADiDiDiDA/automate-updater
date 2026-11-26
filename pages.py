@@ -2386,14 +2386,25 @@ class StrategyPage(QWidget):
         g_mode = self._global_mode()
         g_lbl = core.INSTALL_MODE_LABELS[g_mode]
         rel = [it for it in self._items if getattr(it, "kind", "") == "release"]
+        n_git = sum(1 for it in self._items if getattr(it, "kind", "") == "git")
+        n_unk = max(0, len(self._items) - len(rel) - n_git)
         if not rel:
             self.prog_hint.setText(
                 "还没有可设置的程序：先在「设置 → 检查文件夹」里添加目录并检查一次")
             return
         overrides = self.cfg.get("install_mode_map") or {}
         n_over = sum(1 for it in rel if (overrides.get((it.name or "").lower()) in core.INSTALL_MODES))
+        # 说明要和「程序」页的总数对得上：那边是全部扫描结果，这里只有需要
+        # 替换文件的 Release 程序，Git 仓库走 clone/pull，不吃这些策略。
+        extra = []
+        if n_git:
+            extra.append(f"{n_git} 个 Git 仓库按 clone/pull 更新")
+        if n_unk:
+            extra.append(f"{n_unk} 个待检查的程序确认后自动归类")
+        tail = ("（另外 " + "，".join(extra) + "，不受这些策略影响）") if extra else ""
         self.prog_hint.setText(
-            f"共 {len(rel)} 个程序，其中 {n_over} 个单独设过策略，其余跟随默认（{g_lbl}）；"
+            f"共 {len(rel)} 个 Release 程序按这里的默认策略（{g_lbl}）替换文件{tail}，"
+            f"其中 {n_over} 个单独设过策略；"
             "在「程序」页点策略徽章或右键「更新策略…」修改。")
 
     def _on_prog_mode(self, name: str, mode: str, combo=None) -> None:
